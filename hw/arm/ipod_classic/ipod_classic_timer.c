@@ -137,7 +137,21 @@ static uint32_t chan_freq(IPodClassicTimerChannel *c)
         break;
     }
 
-    return base / div / (c->pre + 1);
+    /*
+     * Compute in 64 bits and never hand ptimer_set_freq() a zero: a guest
+     * write of PRE = 0xffffffff (or any PRE >= base / div) used to divide
+     * by zero, or set a 0 Hz period, and crash the process on the next
+     * reload (Q14).
+     */
+    uint64_t freq = (uint64_t)base / div / ((uint64_t)c->pre + 1);
+
+    if (freq == 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "s5l8702 timer: prescaler 0x%x gives 0 Hz, clamping\n",
+                      c->pre);
+        return 1;
+    }
+    return (uint32_t)MIN(freq, (uint64_t)UINT32_MAX);
 }
 
 /*
