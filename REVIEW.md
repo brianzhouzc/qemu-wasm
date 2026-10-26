@@ -56,7 +56,7 @@ Severity:
 
 ### Q1. Wheel: the browser fields sit before `parent_obj` and overwrite the QOM header
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `include/hw/arm/ipod_classic/ipod_classic_wheel.h:298-308`; used by
 `hw/arm/ipod_classic/ipod_classic_wheel.c:142-147`, `:261-268` and `:591-631`.
@@ -97,7 +97,7 @@ end of the struct.
 
 ### Q2. SHA-1 model: guest-controlled heap overflow
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `hw/arm/ipod_touch_sha1.c:129-135` (`flush_hw_buffer`), `:297-311`
 (memory mode), `:325-327` (`SHA_INSIZE`), `:170` and `:277` (digest reads).
@@ -129,7 +129,7 @@ parentheses.
 
 ### Q3. PL192: the priority stack overflows into the struct
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `hw/intc/pl192.c:144-157` (`pl192_mask_priority`), `:173-193`
 (`pl192_irq_ack`); `include/hw/intc/pl192.h:60-61`.
@@ -155,7 +155,7 @@ default vector without pushing.
 
 ### Q4. Wasm backend: the `add2_i32` fix breaks `add2_i64`
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `tcg/wasm32/tcg-target.c.inc:1387-1432` (`tcg_wasm_out_add2`),
 called for both opcodes from `:3309-3314` and `:3727-3730`.
@@ -179,7 +179,7 @@ masked sequence for `TCG_TYPE_I32` and restore the previous 64-bit sequence for
 
 ### Q5. Wasm backend: `sextract_i32` emits an invalid module
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `tcg/wasm32/tcg-target.c.inc:1591-1601` (`tcg_wasm_out_extract`).
 
@@ -212,7 +212,7 @@ v7 guest.
 
 ### Q6. ATA vmstate leaves out the IDE drive state
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `hw/arm/ipod_classic/ipod_classic_ata.c:534-549`.
 
@@ -234,7 +234,7 @@ different disk after a restore.
 
 ### Q7. PL192 vmstate drops `rawintr`, so pending interrupts are lost on restore
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `hw/intc/pl192.c:389-436`.
 
@@ -256,7 +256,7 @@ fix that device rather than the controller.
 
 ### Q8. The JIT can never run under `-icount`; `wasm-instantiate` is dead
 
-- [ ] Fixed (or documented)
+- [x] Fixed (or documented)
 
 **Where:** `tcg/wasm32.c:274-287`; `hw/arm/ipod_classic/ipod_classic.c:772-775`.
 
@@ -281,7 +281,7 @@ yet", while the docs say the JIT is fixed and merely slower.
 
 ### Q9. The vCPU wake-up fix is not on the `-icount` (RR) path
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `system/cpus.c:435-448`; `accel/tcg/tcg-accel-ops-rr.c:118-125`.
 
@@ -302,7 +302,7 @@ behaviour that is not what fixed the boot.
 
 ### Q10. Main-loop futex: lost-wakeup window
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `util/main-loop.c:55-72` (`qemu_em_notify_wait`), `:349-355`.
 
@@ -326,7 +326,7 @@ too.
 
 ### Q11. Browser keys run QEMU code and arm timers on the page thread
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `hw/arm/ipod_classic/ipod_classic_wheel.c:571-648`.
 
@@ -350,7 +350,7 @@ call `wheel_key_event()` from the main loop with the BQL held normally.
 
 ### Q12. Key ack is never set for the wheel and clears itself for buttons
 
-- [ ] Fixed (with iPodWasm W4)
+- [x] Fixed (with iPodWasm W4)
 
 **Where:** `hw/arm/ipod_classic/ipod_classic_wheel.c:142-147` (pop),
 `:261-268` (tick), `:606-616` (press), `:631-634` (`ipod_wasm_key_ack`).
@@ -376,7 +376,7 @@ the counter before the press and waits for it to change.
 
 ### Q13. A failed snapshot load exits QEMU; dead `qemu_loadvm_state_from_file`
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `hw/arm/ipod_classic/ipod_classic.c:671-690` and `:700-714`;
 `migration/migration.c:712-721`; `migration/savevm.c:1794-1816`.
@@ -407,7 +407,7 @@ dereferences NULL in the NDEBUG wasm build.
 
 ### Q14. Timer: guest-controlled divide by zero
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `hw/arm/ipod_classic/ipod_classic_timer.c:140` (`chan_freq`) and
 `:199` (`ptimer_set_freq`).
@@ -426,7 +426,7 @@ clamp to 1 Hz (or stop the ptimer).
 
 ### Q15. Exynos UART `post_load` change affects every Exynos board
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `hw/char/exynos4210_uart.c:619-633`.
 
@@ -449,7 +449,7 @@ the upstream behaviour and still avoids the empty-FIFO storm on the iPod.
 
 ### Q16. Snapshot request handoff is not atomic
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `hw/arm/ipod_classic/ipod_classic.c:660-665` and `:730-746`.
 
@@ -466,7 +466,7 @@ from success.
 
 ### Q17. LCD export: the frame number advances when nothing changed; torn reads
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `hw/arm/ipod_classic/ipod_classic_lcd.c:648-663`; comments at
 `:637-640` and `:756-759`.
@@ -487,7 +487,7 @@ store.
 
 ### Q18. `getenv()` in interrupt and MMIO hot paths
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `hw/intc/pl192.c:179` and `:360`; `hw/arm/ipod_touch_sha1.c:235`
 and `:274`; `hw/arm/ipod_classic/ipod_classic_ata.c:140` and `:248`;
@@ -502,7 +502,7 @@ bound.
 
 ### Q19. `WHEELTRACE` now prints every edge, against the file's own rule
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `hw/arm/ipod_classic/ipod_classic_wheel.c:101-104` and `:362-364`;
 the rule at `:24-27` and `:41-46`.
@@ -515,7 +515,7 @@ example `WHEELTRACE=2` for the verbose form).
 
 ### Q20. Browser key state, `iicds_new` and `paced_pending` are not migrated
 
-- [ ] Fixed (or accepted)
+- [x] Fixed (or accepted)
 
 - The wheel's `wasm_*` release state is not in its vmstate (`:705-735`). A
   snapshot taken while a browser press is held restores with the button bit
@@ -533,7 +533,7 @@ subsections.
 
 ### Q21. Semihosting is on by default
 
-- [ ] Fixed (or accepted)
+- [x] Fixed (or accepted)
 
 **Where:** `hw/arm/ipod_classic/ipod_classic.c:368-389`.
 
@@ -547,7 +547,7 @@ defaulting it on only for Emscripten, or leaving it on but documenting
 
 ### Q22. Guest-triggerable `hw_error()`/`assert()` aborts
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `hw/intc/pl192.c:147`, `:285-291`, `:309-312`;
 `hw/dma/pl080.c:202-205`; `hw/arm/ipod_touch_sha1.c:326`.
@@ -560,7 +560,7 @@ upstream code; the others came in with this branch.
 
 ### Q23. Build files: unchecked downloads, `wasm32`-only fiber
 
-- [ ] Fixed
+- [x] Fixed
 
 - `Dockerfile:39`: `curl -Ls ... | tar xJ` has no `-f`, so a 404 page is piped
   into `tar` and the error is confusing; and nothing verifies the tarball.
@@ -573,7 +573,7 @@ upstream code; the others came in with this branch.
 
 ### Q24. Dead code, debug leftovers, small inconsistencies
 
-- [ ] Fixed
+- [x] Fixed
 
 - `hw/dma/pl080.c:602-605`: a second MMIO region (`iomem2`) is registered on
   every PL080 in the tree (Versatile, RealView and the rest), but the iPod
