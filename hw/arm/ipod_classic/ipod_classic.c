@@ -344,8 +344,9 @@ static void ipod_classic_set_bootrom_path(Object *obj, const char *value,
     IPodClassicMachineState *nms = IPOD_CLASSIC_MACHINE(obj);
 
     if (!g_file_test(value, G_FILE_TEST_EXISTS)) {
-        error_report("bootrom at path \"%s\" must exist", value);
-        exit(1);
+        /* A property setter reports through errp, it does not exit (Q24). */
+        error_setg(errp, "bootrom at path \"%s\" must exist", value);
+        return;
     }
     g_strlcpy(nms->bootrom_path, value, sizeof(nms->bootrom_path));
 }
@@ -611,7 +612,10 @@ static int ipod_heartbeat_ms;
 static ARMCPU *ipod_heartbeat_cpu;
 
 /*
- * IPOD_HEARTBEAT_MS=5000: say where the boot is, on the real-time clock.
+ * heartbeat=5000 (machine property; node-run.js reads IPOD_HEARTBEAT_MS and
+ * passes it as this property): say where the boot is, on the real-time clock.
+ * The property is uint32 but the timer uses a signed int, so a value of
+ * 2^31 or more arrives negative and turns the heartbeat off (Q24).
  * The browser build can take minutes before the first display write, and
  * without this there is no way to tell a slow emulator from a stuck one.
  * It also gives the Wasm build's JIT count, the number of translation blocks
