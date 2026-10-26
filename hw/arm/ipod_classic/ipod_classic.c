@@ -377,6 +377,12 @@ static void ipod_classic_instance_init(Object *obj)
      * firmware may not have installed and the machine dies quietly; with it on
      * the firmware tells us what it thinks is wrong. Costs nothing when
      * nothing is printed, so it is on by default.
+     *
+     * NOTE: semihosting is the whole ARM interface, not just SYS_WRITE0:
+     * a guest can open, write, remove and rename host files and (SYS_SYSTEM)
+     * run a shell command.  In the browser that is Emscripten's MEMFS; a
+     * native run of firmware from someone else is a real trust boundary.
+     * Set semihosting=off (or -semihosting-config) when that matters (Q21).
      */
     IPOD_CLASSIC_MACHINE(obj)->semihosting = true;
     object_property_add_bool(obj, "semihosting", ipod_classic_get_semihosting,
@@ -384,7 +390,8 @@ static void ipod_classic_instance_init(Object *obj)
     object_property_set_description(obj, "semihosting",
         "Answer ARM semihosting calls (SVC 0x123456). Apple's retailOS prints "
         "its diagnostics through them. Turn it off to see the firmware take "
-        "the SVC vector instead.");
+        "the SVC vector instead. Note: semihosting is the whole ARM interface, "
+        "including file access and SYS_SYSTEM; only run firmware you trust.");
 
     IPOD_CLASSIC_MACHINE(obj)->hw_id = S5L8702_HW_ID;
     object_property_add_uint32_ptr(obj, "hw-id",

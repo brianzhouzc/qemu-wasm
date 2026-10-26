@@ -36,7 +36,13 @@ ARG ZLIB_VERSION
 RUN mkdir -p /zlib
 # zlib.net no longer serves the release tarballs at the old URL (404 as of
 # 2026-10-25); the GitHub release is the same file.
-RUN curl -Ls https://github.com/madler/zlib/releases/download/v$ZLIB_VERSION/zlib-$ZLIB_VERSION.tar.xz | tar xJC /zlib --strip-components=1
+# -f so an HTTP error is an error, and verify the tarball before unpacking it
+# (Q23).  The hash is for 1.3.1, the pinned ZLIB_VERSION above.
+RUN curl -fsSL -o /tmp/zlib.tar.xz \
+        https://github.com/madler/zlib/releases/download/v$ZLIB_VERSION/zlib-$ZLIB_VERSION.tar.xz \
+ && echo "38ef96b8dfe510d42707d9c781877914792541133e1870841463bfa73f883e32  /tmp/zlib.tar.xz" \
+    | sha256sum -c - \
+ && tar xJC /zlib --strip-components=1 -f /tmp/zlib.tar.xz
 WORKDIR /zlib
 RUN emconfigure ./configure --prefix=$TARGET --static
 RUN make install
