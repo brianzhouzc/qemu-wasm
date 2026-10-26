@@ -142,7 +142,11 @@ static uint32_t wheel_fifo_pop(IPodClassicWheelState *s)
 #ifdef EMSCRIPTEN
     if (s->wasm_release_at &&
         ((word >> S5L8702_WHEEL_BTN_SHIFT) & s->wasm_press_mask)) {
-        s->wasm_ack = 1;
+        /*
+         * A monotonic counter, not a flag: a flag can be missed between two
+         * polls and is cleared again by the release (Q12).
+         */
+        s->wasm_consumed = qatomic_read(&s->wasm_consumed) + 1;
     }
 #endif
     wheel_update_irq(s);
@@ -260,9 +264,9 @@ static void wheel_tick(void *opaque)
 
 #ifdef EMSCRIPTEN
     if (s->wasm_release_at && now >= s->wasm_release_at &&
-        (s->wasm_ack || now >= s->wasm_release_cap)) {
+        (qatomic_read(&s->wasm_consumed) != s->wasm_consumed0 ||
+         now >= s->wasm_release_cap)) {
         s->wasm_release_at = 0;
-        s->wasm_ack = 0;
         wheel_key_event(s, s->wasm_keycode | 0x80);
     }
 #endif
@@ -297,6 +301,15 @@ static void wheel_tick(void *opaque)
                       % S5L8702_WHEEL_POSITIONS;
         s->pending_steps -= step;
         wheel_send_event(s);
+        /*
+         * The wheel keys do not change the button state, so the packet that
+         * pays out the last pending step is what "consumes" a detent (Q12).
+         */
+        if (s->wasm_release_at && s->pending_steps == 0 &&
+            ((s->wasm_keycode & 0x7f) == KEY_E ||
+             (s->wasm_keycode & 0x7f) == KEY_Q)) {
+            s->wasm_consumed = qatomic_read(&s->wasm_consumed) + 1;
+        }
     } else if (s->touched && now >= s->untouch_at) {
         /*
          * The finger comes off. This is not cosmetic: the ISR uses an
@@ -606,7 +619,8 @@ EMSCRIPTEN_KEEPALIVE void ipod_wasm_key_press(int keycode, int hold_ms)
         wheel_key_event(wasm_wheel_state, keycode);
         wasm_wheel_state->wasm_keycode = keycode;
         wasm_wheel_state->wasm_press_mask = wasm_wheel_state->buttons;
-        wasm_wheel_state->wasm_ack = 0;
+        wasm_wheel_state->wasm_consumed0 =
+            qatomic_read(&wasm_wheel_state->wasm_consumed);
         wasm_wheel_state->wasm_release_at =
             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
             (int64_t)hold_ms * 1000000;
@@ -630,7 +644,8 @@ EMSCRIPTEN_KEEPALIVE void ipod_wasm_key_press(int keycode, int hold_ms)
 
 EMSCRIPTEN_KEEPALIVE int ipod_wasm_key_ack(void)
 {
-    return wasm_wheel_state ? wasm_wheel_state->wasm_ack : 0;
+    return wasm_wheel_state ?
+        (int)qatomic_read(&wasm_wheel_state->wasm_consumed) : 0;
 }
 
 EMSCRIPTEN_KEEPALIVE void ipod_wasm_key(int keycode)

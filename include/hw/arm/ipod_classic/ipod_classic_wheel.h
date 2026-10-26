@@ -303,7 +303,8 @@ struct IPodClassicWheelState {
     int64_t wasm_release_at;
     int64_t wasm_release_cap;
     uint32_t wasm_press_mask;
-    int wasm_ack;
+    uint32_t wasm_consumed;      /* presses the guest has consumed */
+    uint32_t wasm_consumed0;     /* counter value when the press started */
 #endif
     SysBusDevice parent_obj;
 
