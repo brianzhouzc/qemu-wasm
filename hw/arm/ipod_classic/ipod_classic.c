@@ -648,6 +648,23 @@ static void ipod_heartbeat_start(int ms)
 
 #if defined(EMSCRIPTEN)
 /*
+ * Snapshots for the browser build.
+ *
+ * The page calls ipod_snapshot_request() from the browser thread; it only
+ * records what to do, schedules a bottom half and wakes the main loop. The
+ * bottom half runs on QEMU's main-loop thread with the BQL, stops the VM,
+ * writes or reads the whole VM state in one file in the Emscripten FS, and
+ * starts the VM again. ipod_snapshot_status() lets the page poll:
+ *   0 idle, 1 working, 2 finished, 3 failed.
+ */
+static QEMUBH *ipod_snapshot_bh;
+static QEMUTimer *ipod_snapshot_timer;
+static int64_t ipod_snapshot_deadline;
+static int ipod_snapshot_op;            /* 1 save, 2 load */
+static volatile int ipod_snapshot_state;
+static char ipod_snapshot_path[512];
+
+/*
  * The snapshot is QEMU's vmstate, which is only valid for the build that
  * wrote it (a new field or a bumped version_id makes an old file
  * unloadable, and QEMU 8.2 exits the process on a failed load).  The build
@@ -698,22 +715,6 @@ static bool ipod_snapshot_id_ok(const char *path)
     return strcmp(buf, QEMU_WASM_BUILD_ID) == 0;
 }
 
-/*
- * Snapshots for the browser build.
- *
- * The page calls ipod_snapshot_request() from the browser thread; it only
- * records what to do, schedules a bottom half and wakes the main loop. The
- * bottom half runs on QEMU's main-loop thread with the BQL, stops the VM,
- * writes or reads the whole VM state in one file in the Emscripten FS, and
- * starts the VM again. ipod_snapshot_status() lets the page poll:
- *   0 idle, 1 working, 2 finished, 3 failed.
- */
-static QEMUBH *ipod_snapshot_bh;
-static QEMUTimer *ipod_snapshot_timer;
-static int64_t ipod_snapshot_deadline;
-static int ipod_snapshot_op;            /* 1 save, 2 load */
-static volatile int ipod_snapshot_state;
-static char ipod_snapshot_path[512];
 
 /*
  * A load runs through the incoming migration machinery, which finishes
