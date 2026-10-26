@@ -1791,30 +1791,6 @@ int qemu_savevm_state_to_file(const char *path, Error **errp)
     return ret;
 }
 
-int qemu_loadvm_state_from_file(const char *path, Error **errp)
-{
-    QIOChannelFile *ioc;
-    QEMUFile *f;
-    int ret;
-
-    ioc = qio_channel_file_new_path(path, O_RDONLY | O_BINARY, 0, errp);
-    if (!ioc) {
-        return -1;
-    }
-    qio_channel_set_name(QIO_CHANNEL(ioc), "ipod-loadvm");
-    f = qemu_file_new_input(QIO_CHANNEL(ioc));
-    object_unref(OBJECT(ioc));
-
-    ret = qemu_loadvm_state(f);
-    qemu_fclose(f);
-    migration_incoming_state_destroy();
-
-    if (ret < 0) {
-        error_setg(errp, "loading the VM state failed: %d", ret);
-    }
-    return ret;
-}
-
 int qemu_save_device_state(QEMUFile *f)
 {
     SaveStateEntry *se;

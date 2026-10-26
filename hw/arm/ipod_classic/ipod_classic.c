@@ -648,6 +648,57 @@ static void ipod_heartbeat_start(int ms)
 
 #if defined(EMSCRIPTEN)
 /*
+ * The snapshot is QEMU's vmstate, which is only valid for the build that
+ * wrote it (a new field or a bumped version_id makes an old file
+ * unloadable, and QEMU 8.2 exits the process on a failed load).  The build
+ * id is generated into qemu-wasm-build-id.h by build.sh; a sidecar next to
+ * the state file records it, and a mismatch is refused before the load
+ * starts (Q13).
+ */
+#if defined(__has_include)
+# if __has_include("qemu-wasm-build-id.h")
+#  include "qemu-wasm-build-id.h"
+# endif
+#endif
+#ifndef QEMU_WASM_BUILD_ID
+#define QEMU_WASM_BUILD_ID "unknown"
+#endif
+
+static void ipod_snapshot_write_id(const char *path)
+{
+    char idpath[sizeof(ipod_snapshot_path) + 4];
+    FILE *f;
+
+    snprintf(idpath, sizeof(idpath), "%s.id", path);
+    f = fopen(idpath, "w");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "%s\n", QEMU_WASM_BUILD_ID);
+    fclose(f);
+}
+
+static bool ipod_snapshot_id_ok(const char *path)
+{
+    char idpath[sizeof(ipod_snapshot_path) + 4];
+    char buf[256];
+    FILE *f;
+
+    snprintf(idpath, sizeof(idpath), "%s.id", path);
+    f = fopen(idpath, "r");
+    if (!f) {
+        return false;
+    }
+    if (!fgets(buf, sizeof(buf), f)) {
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+    buf[strcspn(buf, "\r\n")] = 0;
+    return strcmp(buf, QEMU_WASM_BUILD_ID) == 0;
+}
+
+/*
  * Snapshots for the browser build.
  *
  * The page calls ipod_snapshot_request() from the browser thread; it only
@@ -698,6 +749,13 @@ static void ipod_snapshot_bh_fn(void *opaque)
     if (!ipod_snapshot_op) {
         return;
     }
+    if (ipod_snapshot_op == 2 && !ipod_snapshot_id_ok(ipod_snapshot_path)) {
+        error_report("snapshot was written by a different emulator build; "
+                     "not loading it");
+        ipod_snapshot_op = 0;
+        ipod_snapshot_state = 3;
+        return;
+    }
     if (ipod_snapshot_op == 2) {
         char uri[sizeof(ipod_snapshot_path) + 8];
         snprintf(uri, sizeof(uri), "file:%s", ipod_snapshot_path);
@@ -725,6 +783,9 @@ static void ipod_snapshot_bh_fn(void *opaque)
     }
     ipod_snapshot_op = 0;
     ipod_snapshot_state = ret == 0 ? 2 : 3;
+    if (ret == 0) {
+        ipod_snapshot_write_id(ipod_snapshot_path);
+    }
 }
 
 EMSCRIPTEN_KEEPALIVE void ipod_snapshot_request(int op, const char *path)
