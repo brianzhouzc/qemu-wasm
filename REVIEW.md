@@ -155,7 +155,7 @@ default vector without pushing.
 
 ### Q4. Wasm backend: the `add2_i32` fix breaks `add2_i64`
 
-- [x] Fixed
+- [ ] Fixed (reopened in the second pass)
 
 **Where:** `tcg/wasm32/tcg-target.c.inc:1387-1432` (`tcg_wasm_out_add2`),
 called for both opcodes from `:3309-3314` and `:3727-3730`.
@@ -212,7 +212,7 @@ v7 guest.
 
 ### Q6. ATA vmstate leaves out the IDE drive state
 
-- [x] Fixed
+- [ ] Fixed (reopened in the second pass)
 
 **Where:** `hw/arm/ipod_classic/ipod_classic_ata.c:534-549`.
 
@@ -547,7 +547,7 @@ defaulting it on only for Emscripten, or leaving it on but documenting
 
 ### Q22. Guest-triggerable `hw_error()`/`assert()` aborts
 
-- [x] Fixed
+- [ ] Fixed (reopened in the second pass)
 
 **Where:** `hw/intc/pl192.c:147`, `:285-291`, `:309-312`;
 `hw/dma/pl080.c:202-205`; `hw/arm/ipod_touch_sha1.c:326`.
@@ -592,3 +592,185 @@ upstream code; the others came in with this branch.
   can be torn.
 - `hw/arm/ipod_classic/ipod_classic.c:341-351`: the `bootrom` setter calls
   `exit(1)` instead of setting `errp`.
+
+---
+
+# Second pass: review of the fixes
+
+Scope: the 25 commits from `2ff5cc8` to `2e153d4`. Most fixes are right
+(Q1, Q2, Q3, Q5, Q7's intent, Q10, Q11, Q12, Q14, Q15, Q16, Q17). Three fixes
+do not do what they say, and Q4, Q6 and Q22 are reopened above. The front
+end's second pass is in the iPodWasm `REVIEW.md` (items `R1`-`R12`). Its R2
+matters here: the page passes `wasm-instantiate=100`, so after `5824acb` the
+JIT is on under icount by default.
+
+| ID | Sev | Summary | Reopens |
+|---|---|---|---|
+| S1 | High | The IDE drives are still not migrated: the field is version-gated out | Q6 |
+| S2 | Medium | `add2_i64` reads `al` after writing `retl`, which may be the same register | Q4 |
+| S3 | Medium | The PL080 flow-control `return` wedges the controller for good | Q22 |
+| S4 | Medium | New vmstate fields are not version-gated; PL080 changes upstream's wire format | Q7, Q20 |
+| S5 | Medium | The snapshot sidecar is written after "done" is published | Q13, Q16 |
+| S6 | Low | The key mailbox has one slot | Q11 |
+| S7 | Low | The SHA-1 block now rejects every non-word access | Q2 |
+| S8 | Low | `static char mode = -1` turns the ATALBA trace on for Arm hosts | Q18 |
+| S9 | Low | The browser-only wheel fields change the stream layout at the same version | Q20 |
+| S10 | Low | The "unknown" build id matches every other "unknown" | Q13 |
+
+## High
+
+### S1. The IDE drives are still not migrated: the field is version-gated out
+
+- [ ] Fixed
+
+**Where:** `hw/arm/ipod_classic/ipod_classic_ata.c:546` and `:556`;
+`include/hw/ide/internal.h:588-589`; `migration/vmstate.c:31-49`.
+
+`VMSTATE_IDE_DRIVES` expands to `VMSTATE_STRUCT_ARRAY(..., 2, 3, ...)`: its
+field `version_id` is 3. `vmstate_field_exists()` saves and loads a field only
+when `field->version_id <= version_id`, and the ATA description is version 2.
+So the drives are skipped on save and on load, exactly as before the fix.
+This is why the ISA, MMIO and PCI IDE descriptions are all at version 3.
+
+**Fix.** Set `.version_id = 3` (keep `.minimum_version_id = 1`: older streams
+then simply lack the drives, which is what they contain). Then check with a
+save, a load and `info qtree` (or a trace of `vmstate_load_field`) that the
+`ifs` section is actually in the stream.
+
+## Medium
+
+### S2. `add2_i64` reads `al` after writing `retl`, which may be the same register
+
+- [ ] Fixed
+
+**Where:** `tcg/wasm32/tcg-target.c.inc:1404-1429`; constraint at `:148-152`.
+
+The new i64 path stores the low sum into `retl` (`:1417`) and then compares
+it against `al` (`:1420-1422`) for the carry. `add2` is constrained
+`C_O2_I4(r, r, r, r, r, r)` with no early clobber, so the register allocator
+may give `retl` the same register as `al`. The compare then reads `low < low`
+and the carry is always 0. The old code handled exactly this case
+(`al == retl`).
+
+**Fix.** Compute the carry from the locals before any global is written:
+`TMP1 < al` while `al` is intact, keep it on the stack or in `TMP64_2`, then
+store `retl` and `reth`.
+
+### S3. The PL080 flow-control `return` wedges the controller for good
+
+- [ ] Fixed
+
+**Where:** `hw/dma/pl080.c:200-209`; the `running` handshake at `:174-180`
+and `:333-335`.
+
+`pl080_run()` sets `s->running = 1` and clears it only at the bottom of its
+loop. The new `return` leaves `running` at 1. Every later call sees
+`running != 0`, increments it and returns, so no channel on that DMAC moves
+again until reset, and `pl080_update()` is skipped too. That is worse than the
+abort it replaced, and silent after the first log line.
+
+**Fix.** `continue` (skip that channel) instead of `return`, and log once per
+channel configuration rather than on every pass.
+
+### S4. New vmstate fields are not version-gated; PL080 changes upstream's wire format
+
+- [ ] Fixed
+
+**Where:** `hw/intc/pl192.c:463` (description still version 1);
+`hw/arm/ipod_classic/ipod_classic_i2c.c:301` and `:312` (version 2, minimum
+1); `hw/dma/pl080.c:54-71` (version 2, minimum 1).
+
+Each description gained a field without a field version, while still
+accepting older streams (or, for PL192, without a version bump at all). A
+stream in the old layout is then read with every later field shifted, instead
+of being refused. With the sidecar fallback accepting id-less files (S10),
+that is reachable.
+- PL080 also drops the three duplicate `tc_int` entries. They are upstream's
+  wire format, shared by every PL080 board (Versatile, RealView, ...), and
+  removing them breaks migration from any upstream build while still claiming
+  version 1 compatibility.
+
+**Fix.** Use `VMSTATE_UINT32_V(rawintr, PL192State, 2)` with PL192 at version
+2, `VMSTATE_BOOL_V(iicds_new, ..., 2)`, and
+`VMSTATE_UINT32_V(paced_pending, ..., 2)`. Keep PL080's duplicate entries (or
+put `paced_pending` in a subsection). Alternatively, raise
+`minimum_version_id` to the new version wherever old streams are not worth
+reading.
+
+### S5. The snapshot sidecar is written after "done" is published
+
+- [ ] Fixed
+
+**Where:** `hw/arm/ipod_classic/ipod_classic.c:806-810`.
+
+The save path sets `ipod_snapshot_state = 2` and only then writes
+`state.bin.id`. The page and `node-steps.js` poll the state and read the files
+as soon as they see 2. `node-steps.js:369-377` swallows a missing sidecar
+("older build"), so a save can silently lose its build id. The store is also a
+plain one, while everything else now uses atomics.
+
+**Fix.** Write the sidecar first, then `qatomic_store_release(&ipod_snapshot_state, ret == 0 ? 2 : 3)`.
+
+## Low
+
+### S6. The key mailbox has one slot
+
+- [ ] Fixed
+
+**Where:** `hw/arm/ipod_classic/ipod_classic_wheel.c:623-678`.
+
+`wasm_key_queue()` overwrites `op`/`arg`/`hold`. Two calls before the BH runs
+lose the first, for example quick clicks on the page's buttons (which call
+`tapKey` without awaiting), or `ipod_wasm_key()` press-then-release. The three
+fields can also be read torn if a new request arrives while the BH reads
+them. A small ring (eight entries, atomic head/tail) fixes both. Separately,
+for buttons the counter also advances on trailing packets of the previous,
+still-held press, so a back-to-back press can be "acknowledged" early.
+Returning a press id from `ipod_wasm_key_press()`, and reporting the last
+consumed id, would make the acknowledgement exact.
+
+### S7. The SHA-1 block now rejects every non-word access
+
+- [ ] Fixed (or accepted)
+
+**Where:** `hw/arm/ipod_touch_sha1.c:380-387`.
+
+`.valid.min_access_size = 4` applies to the whole 0x100-byte region,
+including the 0x40-0x7c input buffer. A byte or halfword access is now a
+decode error, which the guest takes as a data abort; before, it was accepted.
+If the firmware ever does a `strb` there (a `memcpy` tail, say), this changes
+behaviour. Checking `size == 4` in the digest case alone keeps Q2's fix
+without that risk.
+
+### S8. `static char mode = -1` turns the ATALBA trace on for Arm hosts
+
+- [ ] Fixed
+
+**Where:** `hw/arm/ipod_classic/ipod_classic_ata.c:29-37`.
+
+`char` is unsigned on Arm hosts, so `mode == -1` is never true. `mode` stays
+255 and `ata_lba_mode()` is truthy, so a native build on an arm64 machine
+prints the ATALBA trace for every DMA read. Use `int`.
+
+### S9. The browser-only wheel fields change the stream layout at the same version
+
+- [ ] Fixed (or accepted)
+
+**Where:** `hw/arm/ipod_classic/ipod_classic_wheel.c:792-803`.
+
+The `#ifdef EMSCRIPTEN` fields sit in the main field list, so native and wasm
+streams differ at version 3. Put them in a subsection that is only compiled
+(and `needed`) in the wasm build. A cross load then fails on an unknown
+subsection instead of misparsing.
+
+### S10. The "unknown" build id matches every other "unknown"
+
+- [ ] Fixed (or accepted)
+
+**Where:** `hw/arm/ipod_classic/ipod_classic.c:686-693` and `:708-733`.
+
+A build without the generated header writes "unknown", and so does every
+other such build. A sidecar saying "unknown" therefore passes the check
+against any other unknown build, and a missing sidecar is accepted outright.
+Refusing (or at least warning on) "unknown" on either side would keep the
+check meaningful. The dirty-tree id collision is iPodWasm R11.
