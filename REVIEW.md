@@ -754,7 +754,7 @@ prints the ATALBA trace for every DMA read. Use `int`.
 
 ### S9. The browser-only wheel fields change the stream layout at the same version
 
-- [ ] Fixed (or accepted) (reopened in the second pass)
+- [x] Fixed (or accepted) (reopened in the second pass)
 
 **Where:** `hw/arm/ipod_classic/ipod_classic_wheel.c:792-803`.
 
@@ -792,7 +792,7 @@ ticked). S9 is reopened above.
 
 ### T1. The wheel's wasm subsection is attached to itself, so it is never saved
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `hw/arm/ipod_classic/ipod_classic_wheel.c:785-811` and `:813-845`.
 
@@ -810,7 +810,7 @@ which is what you want in the wasm build).
 
 ### T2. `ipod_snapshot_resume()` runs `vm_start()` on the page thread without the BQL
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `hw/arm/ipod_classic/ipod_classic.c:840-854`; the caller is
 `harness.js:129` and `:133`.
@@ -829,7 +829,7 @@ bottom half with the BQL held. The page keeps polling until state 2.
 
 ### T3. A request while paused (state 4) loses the "was running" flag
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `hw/arm/ipod_classic/ipod_classic.c:856-868`.
 
@@ -840,7 +840,7 @@ VM. Refuse requests in state 4 as well (the caller has to resume first).
 
 ### T4. The "unknown" build-id warning is logged as a guest error
 
-- [ ] Fixed
+- [x] Fixed
 
 **Where:** `hw/arm/ipod_classic/ipod_classic.c:742-744`.
 
