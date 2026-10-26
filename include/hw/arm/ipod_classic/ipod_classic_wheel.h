@@ -296,6 +296,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicWheelState, IPOD_CLASSIC_WHEEL)
 #define S5L8702_WHEEL_FIFO_LEN      16
 
 struct IPodClassicWheelState {
+    /*
+     * QOM requires the parent to be the first member: OBJECT()/DEVICE() are
+     * plain casts and object_initialize() writes the header at offset 0.
+     * The browser-only fields therefore come after it (Q1).
+     */
+    SysBusDevice parent_obj;
+
 #ifdef EMSCRIPTEN
     /* Browser input: releases a held key at a virtual deadline, or as soon
      * as the guest has consumed a packet carrying the button. */
@@ -306,7 +313,6 @@ struct IPodClassicWheelState {
     uint32_t wasm_consumed;      /* presses the guest has consumed */
     uint32_t wasm_consumed0;     /* counter value when the press started */
 #endif
-    SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     qemu_irq irq;
