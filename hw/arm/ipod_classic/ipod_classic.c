@@ -673,6 +673,7 @@ static QEMUTimer *ipod_snapshot_timer;
 static int64_t ipod_snapshot_deadline;
 static int ipod_snapshot_op;            /* 1 save, 2 load */
 static bool ipod_snapshot_was_running;  /* state 4: paused until resume */
+static bool ipod_snapshot_resume_pending;
 static int ipod_snapshot_state;
 static char ipod_snapshot_path[512];
 
@@ -739,9 +740,8 @@ static bool ipod_snapshot_id_ok(const char *path)
          * id cannot tie the state to a build; warn instead of pretending the
          * check passed (S10).
          */
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "snapshot: build id is \"unknown\"; the state cannot be "
-                      "tied to a build\n");
+        warn_report("snapshot: build id is \"unknown\"; the state cannot be "
+                    "tied to a build");
     }
     return true;
 }
@@ -777,6 +777,21 @@ static void ipod_snapshot_bh_fn(void *opaque)
     Error *err = NULL;
     bool was_running;
     int ret = 0;
+
+    if (qatomic_read(&ipod_snapshot_resume_pending)) {
+        /*
+         * The page asked for the VM to continue after reading the paused
+         * disk.  Starting it here, in the main loop with the BQL held, keeps
+         * the runstate and vCPU work on QEMU's own thread (T2).
+         */
+        qatomic_set(&ipod_snapshot_resume_pending, false);
+        if (ipod_snapshot_was_running) {
+            vm_start();
+        }
+        qatomic_set(&ipod_snapshot_op, 0);
+        qatomic_store_release(&ipod_snapshot_state, 2);
+        return;
+    }
 
     if (qatomic_load_acquire(&ipod_snapshot_state) != 1) {
         return;
@@ -846,16 +861,19 @@ EMSCRIPTEN_KEEPALIVE void ipod_snapshot_resume(void)
     if (qatomic_read(&ipod_snapshot_state) != 4) {
         return;
     }
-    if (ipod_snapshot_was_running) {
-        vm_start();
-    }
-    qatomic_set(&ipod_snapshot_op, 0);
-    qatomic_store_release(&ipod_snapshot_state, 2);
+    /*
+     * Only signal: the bottom half starts the VM with the BQL held (T2).
+     */
+    qatomic_store_release(&ipod_snapshot_resume_pending, true);
+    qemu_bh_schedule(ipod_snapshot_bh);
+    qemu_notify_event();
 }
 
 EMSCRIPTEN_KEEPALIVE void ipod_snapshot_request(int op, const char *path)
 {
-    if (qatomic_read(&ipod_snapshot_state) == 1) {
+    if (qatomic_read(&ipod_snapshot_state) == 1 ||
+        qatomic_read(&ipod_snapshot_state) == 4) {
+        /* Working, or paused for the caller to read the disk (T3). */
         return;
     }
     snprintf(ipod_snapshot_path, sizeof(ipod_snapshot_path), "%s",
