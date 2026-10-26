@@ -715,7 +715,13 @@ static bool ipod_snapshot_id_ok(const char *path)
     snprintf(idpath, sizeof(idpath), "%s.id", path);
     f = fopen(idpath, "r");
     if (!f) {
-        return false;
+        /*
+         * No sidecar: the caller carried only the state file (an older
+         * tool, or a hand-copied snapshot).  Accept it -- the page and the
+         * Node runner keep the pair together and reject old builds by their
+         * own keys -- but a sidecar that says another build is refused.
+         */
+        return true;
     }
     if (!fgets(buf, sizeof(buf), f)) {
         fclose(f);
