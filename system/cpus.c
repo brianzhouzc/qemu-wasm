@@ -434,11 +434,12 @@ void qemu_wait_io_event(CPUState *cpu)
         }
 #ifdef EMSCRIPTEN
         /*
-         * A pthread condition variable does not reliably wake the vCPU from
-         * the main loop in this build: the guest was seen halted with
-         * exit_request already set, with the wakeup lost, so it never
-         * resumed. Poll with a short sleep instead; the cost only falls on
-         * an idle vCPU.
+         * A pthread condition variable did not reliably wake the vCPU from
+         * the main loop in this build (the guest was seen halted with
+         * exit_request set and the wakeup lost).  The -icount build actually
+         * runs the single-threaded RR accel, whose own wait path kept the
+         * condition variable and booted; this bounded poll covers the
+         * multi-threaded/KVM-style vCPU threads.  See Q9.
          */
         qemu_mutex_unlock(&qemu_global_mutex);
         emscripten_thread_sleep(1.0);
