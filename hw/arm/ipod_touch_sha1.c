@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_sha1.h"
+#include "qemu/log.h"
 
 /*
  * SHA-1 (FIPS 180-4), so the device model does not depend on OpenSSL, which
