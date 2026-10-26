@@ -26,9 +26,10 @@
 #include "hw/arm/ipod_classic/ipod_classic_ata.h"
 
 /* Cached: checked on the data and command paths (Q18). */
-static char ata_lba_mode(void)
+static int ata_lba_mode(void)
 {
-    static char mode = -1;
+    /* int, not char: char is unsigned on Arm hosts, so -1 never matches (S8). */
+    static int mode = -1;
     if (mode == -1) {
         const char *e = getenv("ATALBA");
         mode = e ? e[0] : 0;
@@ -543,7 +544,8 @@ static int ipod_classic_ata_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_ipod_classic_ata = {
     .name = "ipod_classic.ata",
-    .version_id = 2,
+    /* VMSTATE_IDE_DRIVES is a version-3 field (S1). */
+    .version_id = 3,
     .minimum_version_id = 1,
     .post_load = ipod_classic_ata_post_load,
     .fields = (VMStateField[]) {

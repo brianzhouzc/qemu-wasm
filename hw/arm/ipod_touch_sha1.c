@@ -196,6 +196,14 @@ static uint64_t ipod_touch_sha1_read(void *opaque, hwaddr offset, unsigned size)
 			return s->insize;
 		/* Hash result ouput */
 		case 0x20 ... 0x33:
+			if (size != 4) {
+				/* A partial digest read cannot be served from the
+				 * 20-byte hashout without running past it (S7). */
+				qemu_log_mask(LOG_GUEST_ERROR,
+				              "sha1: %u-byte digest read at 0x%x\n",
+				              size, (unsigned)offset);
+				return 0;
+			}
 			//fprintf(stderr, "Hash out %08x\n",  *(uint32_t *)&s->hashout[offset - 0x20]);
             if(!s->hash_computed) {
                 /*
@@ -378,12 +386,10 @@ static const MemoryRegionOps sha1_ops = {
     .write = ipod_touch_sha1_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
     /*
-     * The digest registers are four-byte words (0x20 .. 0x33); the handler
-     * reads a uint32_t, so refuse unaligned or partial accesses that would
-     * run past the 20-byte hashout (Q2).
+     * The access sizes stay unrestricted: the 0x40..0x7c input buffer takes
+     * byte and halfword stores, and a global 4-byte minimum turned those into
+     * guest data aborts (S7).  The digest case checks its own size instead.
      */
-    .valid.min_access_size = 4,
-    .valid.max_access_size = 4,
 };
 
 static void ipod_touch_sha1_init(Object *obj)

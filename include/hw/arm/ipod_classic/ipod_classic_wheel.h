@@ -314,9 +314,18 @@ struct IPodClassicWheelState {
     uint32_t wasm_consumed0;     /* counter value when the press started */
     /* Mailbox: the page queues a key, the main loop's BH performs it (Q11). */
     QEMUBH *wasm_key_bh;
-    int32_t wasm_key_op;         /* 1 = press with hold, 2 = raw key */
-    int32_t wasm_key_arg;
-    int32_t wasm_key_hold;
+    /*
+     * Single-producer/single-consumer ring: the page enqueues and the bottom
+     * half drains (S6).  A single slot lost the first of two quick presses
+     * and let the three fields be read torn.
+     */
+    struct {
+        int32_t op;              /* 1 = press with hold, 2 = raw key */
+        int32_t arg;
+        int32_t hold;
+    } wasm_key_ring[8];
+    uint32_t wasm_key_head;      /* written by the page thread */
+    uint32_t wasm_key_tail;      /* written by the bottom half */
 #endif
 
     MemoryRegion iomem;

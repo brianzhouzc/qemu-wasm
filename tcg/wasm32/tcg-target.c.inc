@@ -1413,10 +1413,11 @@ static void tcg_wasm_out_add2(TCGContext *s, TCGType type,
         tcg_wasm_out_op_global_get_r(s, bl);
         tcg_wasm_out_op_i64_add(s);
         tcg_wasm_out_op_local_set(s, TMP64_1_IDX);
-        tcg_wasm_out_op_local_get(s, TMP64_1_IDX);
-        tcg_wasm_out_op_global_set_r(s, retl);
 
-        /* carry out of the low sum: low < al, unsigned */
+        /*
+         * Carry first: reth may alias al, so reading al after a global store
+         * would compare the low sum with itself and lose the carry (S2).
+         */
         tcg_wasm_out_op_local_get(s, TMP64_1_IDX);
         tcg_wasm_out_op_global_get_r(s, al);
         tcg_wasm_out_op_i64_lt_u(s);
@@ -1426,6 +1427,10 @@ static void tcg_wasm_out_add2(TCGContext *s, TCGType type,
         tcg_wasm_out_op_local_get(s, TMP64_0_IDX);
         tcg_wasm_out_op_i64_add(s);
         tcg_wasm_out_op_global_set_r(s, reth);
+
+        /* low sum to its destination, after al has been consumed */
+        tcg_wasm_out_op_local_get(s, TMP64_1_IDX);
+        tcg_wasm_out_op_global_set_r(s, retl);
         return;
     }
     /* high sum: (ah & 0xffffffff) + (bh & 0xffffffff) */

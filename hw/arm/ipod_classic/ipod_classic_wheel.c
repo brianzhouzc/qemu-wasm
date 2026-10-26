@@ -620,21 +620,9 @@ static IPodClassicWheelState *wasm_wheel_state;
  * main loop; the bottom half does the work with the BQL held, exactly like
  * ipod_snapshot_request().
  */
-static void wasm_key_bh_fn(void *opaque)
+static void wasm_key_do_press(IPodClassicWheelState *s, int keycode,
+                              int hold_ms)
 {
-    IPodClassicWheelState *s = opaque;
-    int op = qatomic_read(&s->wasm_key_op);
-    int keycode = qatomic_read(&s->wasm_key_arg);
-    int hold_ms = qatomic_read(&s->wasm_key_hold);
-
-    if (!op) {
-        return;
-    }
-    if (op == 2) {
-        wheel_key_event(s, keycode);
-        return;
-    }
-
     /*
      * A wall-clock wait between two presses can be shorter than the previous
      * press's guest-time hold, and a new deadline would overwrite the pending
@@ -664,16 +652,44 @@ static void wasm_key_bh_fn(void *opaque)
     }
 }
 
+static void wasm_key_bh_fn(void *opaque)
+{
+    IPodClassicWheelState *s = opaque;
+    uint32_t tail = qatomic_read(&s->wasm_key_tail);
+
+    while (tail != qatomic_load_acquire(&s->wasm_key_head)) {
+        uint32_t slot = tail % 8;
+        int op = s->wasm_key_ring[slot].op;
+        int arg = s->wasm_key_ring[slot].arg;
+        int hold = s->wasm_key_ring[slot].hold;
+
+        qatomic_store_release(&s->wasm_key_tail, tail + 1);
+        if (op == 2) {
+            wheel_key_event(s, arg);
+        } else if (op == 1) {
+            wasm_key_do_press(s, arg, hold);
+        }
+        tail++;
+    }
+}
+
 static void wasm_key_queue(int op, int keycode, int hold_ms)
 {
     IPodClassicWheelState *s = wasm_wheel_state;
+    uint32_t head, tail;
 
     if (!s || !s->wasm_key_bh) {
         return;
     }
-    qatomic_set(&s->wasm_key_op, op);
-    qatomic_set(&s->wasm_key_arg, keycode);
-    qatomic_set(&s->wasm_key_hold, hold_ms);
+    head = qatomic_read(&s->wasm_key_head);
+    tail = qatomic_read(&s->wasm_key_tail);
+    if (head - tail >= 8) {
+        return;              /* full: drop, like a lost click */
+    }
+    s->wasm_key_ring[head % 8].op = op;
+    s->wasm_key_ring[head % 8].arg = keycode;
+    s->wasm_key_ring[head % 8].hold = hold_ms;
+    qatomic_store_release(&s->wasm_key_head, head + 1);
     qemu_bh_schedule(s->wasm_key_bh);
     qemu_notify_event();
 }

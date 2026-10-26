@@ -449,7 +449,7 @@ static int pl192_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_pl192 = {
     .name = "pl192",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = pl192_post_load,
     .fields = (VMStateField[]) {
@@ -460,7 +460,7 @@ static const VMStateDescription vmstate_pl192 = {
          * to be restored (Q7).  Devices that can change a line are expected
          * to re-drive it from their own post_load.
          */
-        VMSTATE_UINT32(rawintr, PL192State),
+        VMSTATE_UINT32_V(rawintr, PL192State, 2),
         VMSTATE_UINT32(intselect, PL192State),
         VMSTATE_UINT32(intenable, PL192State),
         VMSTATE_UINT32(softint, PL192State),

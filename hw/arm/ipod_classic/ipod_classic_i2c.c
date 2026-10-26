@@ -309,7 +309,7 @@ static const VMStateDescription vmstate_ipod_classic_i2c = {
         VMSTATE_UINT32(iicunk18, IPodClassicI2CState),
         VMSTATE_UINT32(iicstat2, IPodClassicI2CState),
         /* A save between the IICDS write and the go bit (Q20). */
-        VMSTATE_BOOL(iicds_new, IPodClassicI2CState),
+        VMSTATE_BOOL_V(iicds_new, IPodClassicI2CState, 2),
         VMSTATE_BOOL(byte_done, IPodClassicI2CState),
         VMSTATE_BOOL(in_address, IPodClassicI2CState),
         VMSTATE_TIMER_PTR(byte_timer, IPodClassicI2CState),

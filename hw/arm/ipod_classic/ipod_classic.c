@@ -692,6 +692,45 @@ static char ipod_snapshot_path[512];
 #define QEMU_WASM_BUILD_ID "unknown"
 #endif
 
+/*
+ * Copy the disk image next to the state while the VM is still stopped (R6):
+ * block devices are not in the vmstate, and reading disk.img later from the
+ * page thread would catch writes the saved RAM never saw.
+ */
+static void ipod_snapshot_copy_disk(const char *path)
+{
+    char dir[sizeof(ipod_snapshot_path)];
+    char src[sizeof(ipod_snapshot_path) + 16];
+    char dst[sizeof(ipod_snapshot_path) + 4];
+    const char *slash = strrchr(path, '/');
+    FILE *in, *out;
+    char buf[65536];
+    size_t n;
+
+    if (!slash) {
+        return;
+    }
+    snprintf(dir, sizeof(dir), "%.*s", (int)(slash - path), path);
+    snprintf(src, sizeof(src), "%s/disk.img", dir);
+    snprintf(dst, sizeof(dst), "%s.disk", path);
+    in = fopen(src, "rb");
+    if (!in) {
+        return;
+    }
+    out = fopen(dst, "wb");
+    if (!out) {
+        fclose(in);
+        return;
+    }
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            break;
+        }
+    }
+    fclose(out);
+    fclose(in);
+}
+
 static void ipod_snapshot_write_id(const char *path)
 {
     char idpath[sizeof(ipod_snapshot_path) + 4];
@@ -797,6 +836,9 @@ static void ipod_snapshot_bh_fn(void *opaque)
     global_state_store();
     vm_stop(RUN_STATE_SAVE_VM);
     ret = qemu_savevm_state_to_file(ipod_snapshot_path, &err);
+    if (ret == 0) {
+        ipod_snapshot_copy_disk(ipod_snapshot_path);
+    }
     if (was_running) {
         vm_start();
     }
@@ -804,10 +846,16 @@ static void ipod_snapshot_bh_fn(void *opaque)
         error_report_err(err);
     }
     qatomic_set(&ipod_snapshot_op, 0);
-    ipod_snapshot_state = ret == 0 ? 2 : 3;
+    /* The sidecar has to exist before the state says "done" (S5). */
     if (ret == 0) {
         ipod_snapshot_write_id(ipod_snapshot_path);
     }
+    qatomic_store_release(&ipod_snapshot_state, ret == 0 ? 2 : 3);
+}
+
+EMSCRIPTEN_KEEPALIVE const char *ipod_wasm_build_id(void)
+{
+    return QEMU_WASM_BUILD_ID;
 }
 
 EMSCRIPTEN_KEEPALIVE void ipod_snapshot_request(int op, const char *path)

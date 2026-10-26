@@ -62,13 +62,18 @@ static const VMStateDescription vmstate_pl080 = {
         VMSTATE_UINT32(sync, PL080State),
         VMSTATE_UINT32(req_single, PL080State),
         VMSTATE_UINT32(req_burst, PL080State),
-        /* (The three duplicate tc_int entries that used to be here are
-         * gone; version 2 covers the format.) */
+        /*
+         * These duplicates are upstream's wire format for every PL080 board;
+         * removing them would change it.  Keep all three (S4).
+         */
+        VMSTATE_UINT8(tc_int, PL080State),
+        VMSTATE_UINT8(tc_int, PL080State),
+        VMSTATE_UINT8(tc_int, PL080State),
         VMSTATE_STRUCT_ARRAY(chan, PL080State, PL080_MAX_CHANNELS,
                              1, vmstate_pl080_channel, pl080_channel),
         VMSTATE_INT32(running, PL080State),
-        /* A paced channel saved with a completion pending (Q20). */
-        VMSTATE_UINT32(paced_pending, PL080State),
+        /* A paced channel saved with a completion pending (Q20, version 2). */
+        VMSTATE_UINT32_V(paced_pending, PL080State, 2),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -200,12 +205,20 @@ again:
             }
             flow = (ch->conf >> 11) & 7;
             if (flow >= 4) {
-                /* Guest data reached an unimplemented mode: ignore, do not
-                 * abort the emulator (Q22). */
-                qemu_log_mask(LOG_GUEST_ERROR,
-                              "pl080_run: peripheral flow control %u not "
-                              "implemented\n", flow);
-                return;
+                static bool warned;
+                /*
+                 * Guest data reached an unimplemented mode.  Do not abort
+                 * (Q22), and do not return either: that leaves s->running
+                 * set and every later pl080_run() just increments it (S3).
+                 * Skip this channel and say so once.
+                 */
+                if (!warned) {
+                    warned = true;
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "pl080_run: peripheral flow control %u not "
+                                  "implemented, skipping the channel\n", flow);
+                }
+                continue;
             }
             src_id = (ch->conf >> 1) & 0x1f;
             dest_id = (ch->conf >> 6) & 0x1f;
