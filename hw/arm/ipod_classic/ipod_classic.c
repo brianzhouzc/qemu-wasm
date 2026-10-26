@@ -672,6 +672,7 @@ static QEMUBH *ipod_snapshot_bh;
 static QEMUTimer *ipod_snapshot_timer;
 static int64_t ipod_snapshot_deadline;
 static int ipod_snapshot_op;            /* 1 save, 2 load */
+static bool ipod_snapshot_was_running;  /* state 4: paused until resume */
 static int ipod_snapshot_state;
 static char ipod_snapshot_path[512];
 
@@ -691,45 +692,6 @@ static char ipod_snapshot_path[512];
 #ifndef QEMU_WASM_BUILD_ID
 #define QEMU_WASM_BUILD_ID "unknown"
 #endif
-
-/*
- * Copy the disk image next to the state while the VM is still stopped (R6):
- * block devices are not in the vmstate, and reading disk.img later from the
- * page thread would catch writes the saved RAM never saw.
- */
-static void ipod_snapshot_copy_disk(const char *path)
-{
-    char dir[sizeof(ipod_snapshot_path)];
-    char src[sizeof(ipod_snapshot_path) + 16];
-    char dst[sizeof(ipod_snapshot_path) + 4];
-    const char *slash = strrchr(path, '/');
-    FILE *in, *out;
-    char buf[65536];
-    size_t n;
-
-    if (!slash) {
-        return;
-    }
-    snprintf(dir, sizeof(dir), "%.*s", (int)(slash - path), path);
-    snprintf(src, sizeof(src), "%s/disk.img", dir);
-    snprintf(dst, sizeof(dst), "%s.disk", path);
-    in = fopen(src, "rb");
-    if (!in) {
-        return;
-    }
-    out = fopen(dst, "wb");
-    if (!out) {
-        fclose(in);
-        return;
-    }
-    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
-        if (fwrite(buf, 1, n, out) != n) {
-            break;
-        }
-    }
-    fclose(out);
-    fclose(in);
-}
 
 static void ipod_snapshot_write_id(const char *path)
 {
@@ -846,29 +808,49 @@ static void ipod_snapshot_bh_fn(void *opaque)
         return;
     }
     was_running = runstate_is_running();
+    ipod_snapshot_was_running = was_running;
     global_state_store();
     vm_stop(RUN_STATE_SAVE_VM);
     ret = qemu_savevm_state_to_file(ipod_snapshot_path, &err);
+    if (err) {
+        error_report_err(err);
+    }
     if (ret == 0) {
-        ipod_snapshot_copy_disk(ipod_snapshot_path);
+        /*
+         * Leave the VM stopped.  The caller reads disk.img now -- block
+         * devices are not in the vmstate, and copying 162 MB inside MEMFS
+         * exhausted the wasm heap (R6) -- then calls ipod_snapshot_resume().
+         */
+        ipod_snapshot_write_id(ipod_snapshot_path);
+        qatomic_store_release(&ipod_snapshot_state, 4);
+        return;
     }
     if (was_running) {
         vm_start();
     }
-    if (err) {
-        error_report_err(err);
-    }
     qatomic_set(&ipod_snapshot_op, 0);
-    /* The sidecar has to exist before the state says "done" (S5). */
-    if (ret == 0) {
-        ipod_snapshot_write_id(ipod_snapshot_path);
-    }
-    qatomic_store_release(&ipod_snapshot_state, ret == 0 ? 2 : 3);
+    qatomic_store_release(&ipod_snapshot_state, 3);
 }
 
 EMSCRIPTEN_KEEPALIVE const char *ipod_wasm_build_id(void)
 {
     return QEMU_WASM_BUILD_ID;
+}
+
+/*
+ * The save leaves the VM stopped (state 4) so the caller can read a disk that
+ * matches the saved RAM.  It must call this when it is done.
+ */
+EMSCRIPTEN_KEEPALIVE void ipod_snapshot_resume(void)
+{
+    if (qatomic_read(&ipod_snapshot_state) != 4) {
+        return;
+    }
+    if (ipod_snapshot_was_running) {
+        vm_start();
+    }
+    qatomic_set(&ipod_snapshot_op, 0);
+    qatomic_store_release(&ipod_snapshot_state, 2);
 }
 
 EMSCRIPTEN_KEEPALIVE void ipod_snapshot_request(int op, const char *path)
