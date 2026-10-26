@@ -754,7 +754,7 @@ prints the ATALBA trace for every DMA read. Use `int`.
 
 ### S9. The browser-only wheel fields change the stream layout at the same version
 
-- [x] Fixed (or accepted)
+- [ ] Fixed (or accepted) (reopened in the second pass)
 
 **Where:** `hw/arm/ipod_classic/ipod_classic_wheel.c:792-803`.
 
@@ -774,3 +774,76 @@ other such build. A sidecar saying "unknown" therefore passes the check
 against any other unknown build, and a missing sidecar is accepted outright.
 Refusing (or at least warning on) "unknown" on either side would keep the
 check meaningful. The dirty-tree id collision is iPodWasm R11.
+
+---
+
+# Third pass: review of the second-pass fixes
+
+Scope: `0b084af..40bfd57`. S1-S8 and S10 are fixed, and so are the earlier
+fixes they touched (Q4, Q6 and Q22 are fixed now; their boxes stay as
+ticked). S9 is reopened above.
+
+| ID | Sev | Summary | Reopens |
+|---|---|---|---|
+| T1 | Medium | The wheel's wasm subsection is attached to itself, so it is never saved | S9, Q20 |
+| T2 | Medium | `ipod_snapshot_resume()` runs `vm_start()` on the page thread without the BQL | Q11 |
+| T3 | Low | A request while paused (state 4) loses the "was running" flag | — |
+| T4 | Nit | The "unknown" build-id warning is logged as a guest error | S10 |
+
+### T1. The wheel's wasm subsection is attached to itself, so it is never saved
+
+- [ ] Fixed
+
+**Where:** `hw/arm/ipod_classic/ipod_classic_wheel.c:785-811` and `:813-845`.
+
+The `.subsections` list was put inside `vmstate_ipod_classic_wheel_wasm`
+(pointing at itself), not in `vmstate_ipod_classic_wheel`. The main
+description has no subsections, so the browser key fields are no longer
+migrated at all: Q20 for the wheel is undone. The self-reference is a trap as
+well: if the main description ever lists this subsection while the inner list
+is still there, saving it recurses into itself until the stack overflows.
+
+**Fix.** Move the `#ifdef EMSCRIPTEN` `.subsections = { &vmstate_ipod_classic_wheel_wasm, NULL }`
+into `vmstate_ipod_classic_wheel` and delete it from the wasm description. A
+`.needed` callback is optional (without one the subsection is always sent,
+which is what you want in the wasm build).
+
+### T2. `ipod_snapshot_resume()` runs `vm_start()` on the page thread without the BQL
+
+- [ ] Fixed
+
+**Where:** `hw/arm/ipod_classic/ipod_classic.c:840-854`; the caller is
+`harness.js:129` and `:133`.
+
+The harness calls `ipod_snapshot_resume()` through `ccall` on the browser (or
+Node) main thread, and it calls `vm_start()` directly: runstate changes,
+`vm_state_notify()` handlers, `cpu_enable_ticks()` and `resume_all_vcpus()`,
+all on a thread QEMU did not create and without the BQL, while the main loop
+keeps running. That is the class of problem Q11 removed for keys. It worked in
+your test, but nothing guarantees it, and with asserts back in the debug
+builds (W23) a BQL assertion anywhere on that path aborts the emulator.
+
+**Fix.** Do it like the request: set a flag with `qatomic_store_release()`,
+schedule `ipod_snapshot_bh` (or a second BH), and call `vm_start()` from the
+bottom half with the BQL held. The page keeps polling until state 2.
+
+### T3. A request while paused (state 4) loses the "was running" flag
+
+- [ ] Fixed
+
+**Where:** `hw/arm/ipod_classic/ipod_classic.c:856-868`.
+
+`ipod_snapshot_request()` refuses only state 1. A second save requested while
+the first is paused in state 4 runs with `runstate_is_running()` false and
+overwrites `ipod_snapshot_was_running`, so the final resume never restarts the
+VM. Refuse requests in state 4 as well (the caller has to resume first).
+
+### T4. The "unknown" build-id warning is logged as a guest error
+
+- [ ] Fixed
+
+**Where:** `hw/arm/ipod_classic/ipod_classic.c:742-744`.
+
+`qemu_log_mask(LOG_GUEST_ERROR, ...)` is shown only with
+`-d guest_errors`, and this is not something the guest did. `warn_report()`
+makes it visible in the default log, which is the point of S10.
