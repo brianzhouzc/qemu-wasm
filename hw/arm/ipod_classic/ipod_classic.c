@@ -661,7 +661,7 @@ static QEMUBH *ipod_snapshot_bh;
 static QEMUTimer *ipod_snapshot_timer;
 static int64_t ipod_snapshot_deadline;
 static int ipod_snapshot_op;            /* 1 save, 2 load */
-static volatile int ipod_snapshot_state;
+static int ipod_snapshot_state;
 static char ipod_snapshot_path[512];
 
 /*
@@ -728,14 +728,14 @@ static void ipod_snapshot_poll(void *opaque)
         return;
     }
     if (runstate_is_running()) {
-        ipod_snapshot_state = 2;
-        ipod_snapshot_op = 0;
+        qatomic_set(&ipod_snapshot_state, 2);
+        qatomic_set(&ipod_snapshot_op, 0);
         return;
     }
     now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     if (migration_is_idle() && now > ipod_snapshot_deadline) {
-        ipod_snapshot_state = 3;
-        ipod_snapshot_op = 0;
+        qatomic_set(&ipod_snapshot_state, 3);
+        qatomic_set(&ipod_snapshot_op, 0);
         return;
     }
     timer_mod(ipod_snapshot_timer, now + 100);
@@ -747,24 +747,28 @@ static void ipod_snapshot_bh_fn(void *opaque)
     bool was_running;
     int ret = 0;
 
-    if (!ipod_snapshot_op) {
+    if (qatomic_load_acquire(&ipod_snapshot_state) != 1) {
         return;
     }
-    if (ipod_snapshot_op == 2 && !ipod_snapshot_id_ok(ipod_snapshot_path)) {
+    if (!qatomic_read(&ipod_snapshot_op)) {
+        return;
+    }
+    if (qatomic_read(&ipod_snapshot_op) == 2 &&
+        !ipod_snapshot_id_ok(ipod_snapshot_path)) {
         error_report("snapshot was written by a different emulator build; "
                      "not loading it");
-        ipod_snapshot_op = 0;
-        ipod_snapshot_state = 3;
+        qatomic_set(&ipod_snapshot_op, 0);
+        qatomic_set(&ipod_snapshot_state, 3);
         return;
     }
-    if (ipod_snapshot_op == 2) {
+    if (qatomic_read(&ipod_snapshot_op) == 2) {
         char uri[sizeof(ipod_snapshot_path) + 8];
         snprintf(uri, sizeof(uri), "file:%s", ipod_snapshot_path);
         qmp_migrate_incoming(uri, false, NULL, &err);
         if (err) {
             error_report_err(err);
-            ipod_snapshot_op = 0;
-            ipod_snapshot_state = 3;
+            qatomic_set(&ipod_snapshot_op, 0);
+            qatomic_set(&ipod_snapshot_state, 3);
             return;
         }
         ipod_snapshot_deadline = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 8000;
@@ -782,7 +786,7 @@ static void ipod_snapshot_bh_fn(void *opaque)
     if (err) {
         error_report_err(err);
     }
-    ipod_snapshot_op = 0;
+    qatomic_set(&ipod_snapshot_op, 0);
     ipod_snapshot_state = ret == 0 ? 2 : 3;
     if (ret == 0) {
         ipod_snapshot_write_id(ipod_snapshot_path);
@@ -791,20 +795,20 @@ static void ipod_snapshot_bh_fn(void *opaque)
 
 EMSCRIPTEN_KEEPALIVE void ipod_snapshot_request(int op, const char *path)
 {
-    if (ipod_snapshot_state == 1) {
+    if (qatomic_read(&ipod_snapshot_state) == 1) {
         return;
     }
     snprintf(ipod_snapshot_path, sizeof(ipod_snapshot_path), "%s",
              path ? path : "");
-    ipod_snapshot_op = op;
-    ipod_snapshot_state = 1;
+    qatomic_set(&ipod_snapshot_op, op);
+    qatomic_store_release(&ipod_snapshot_state, 1);
     qemu_bh_schedule(ipod_snapshot_bh);
     qemu_notify_event();
 }
 
 EMSCRIPTEN_KEEPALIVE int ipod_snapshot_status(void)
 {
-    return ipod_snapshot_state;
+    return qatomic_read(&ipod_snapshot_state);
 }
 #endif
 
