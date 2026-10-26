@@ -636,27 +636,42 @@ static const GraphicHwOps ipod_classic_lcd_gfx_ops = {
  * The browser build runs with -display none, so no UI frontend drives the
  * console's refresh and the composed frame would never be made (the panel's
  * framebuffer is filled by ipod_classic_lcd_gfx_update, which the refresh
- * loop calls).  Compose at 60 Hz from a real-time timer instead -- it runs
- * with the BQL held, like the vCPU's device accesses -- and expose the
- * 320x240 RGB565 framebuffer to the page, which polls the sequence number.
+ * loop calls).  Compose at 30 Hz from a real-time timer instead -- it runs
+ * with the BQL held, like the vCPU's device accesses -- and publish the
+ * 320x240 RGB565 frame to the page, which polls the sequence number.
+ *
+ * The compose target (s->fb) is not what the page reads: two published
+ * buffers are compared with the new frame and one is only replaced when the
+ * picture really changed (Q17).  That keeps the sequence number still on a
+ * still screen -- the page then skips the conversion entirely -- and stops the
+ * page from reading a frame while it is being drawn.
  *
  * This is display-only: the model's behaviour and the guest's view of the
  * panel are unchanged.
  */
 static IPodClassicLCDState *wasm_lcd_state;
+static uint16_t *wasm_lcd_pub[2];
+static int wasm_lcd_pub_idx;
 
 static void wasm_lcd_frame_tick(void *opaque)
 {
     IPodClassicLCDState *s = opaque;
+    const size_t bytes = S5L8702_PANEL_WIDTH * S5L8702_PANEL_HEIGHT * 2;
+    int cur = qatomic_read(&wasm_lcd_pub_idx);
 
     /*
      * 30 Hz is enough for a 320x240 panel and halves the time the compose
      * spends holding the BQL against the vCPU; skipping dpy_gfx_update_full
      * keeps the timer off the console, which has no frontend here anyway.
      */
-    s->dirty = true;
-    if (ipod_classic_lcd_compose(s)) {
-        s->wasm_seq++;
+    ipod_classic_lcd_compose(s);
+
+    if (memcmp(s->fb, wasm_lcd_pub[cur], bytes) != 0) {
+        int next = cur ^ 1;
+        memcpy(wasm_lcd_pub[next], s->fb, bytes);
+        qatomic_set(&wasm_lcd_pub_idx, next);
+        qatomic_store_release(&s->wasm_seq,
+                              qatomic_read(&s->wasm_seq) + 1);
     }
     timer_mod(s->wasm_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
                              NANOSECONDS_PER_SECOND / 30);
@@ -679,12 +694,17 @@ EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_lcd_stride(void)
 
 EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_lcd_seq(void)
 {
-    return wasm_lcd_state ? wasm_lcd_state->wasm_seq : 0;
+    return wasm_lcd_state ? qatomic_read(&wasm_lcd_state->wasm_seq) : 0;
 }
 
 EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_lcd_ptr(void)
 {
-    return wasm_lcd_state ? (uint32_t)(uintptr_t)wasm_lcd_state->fb : 0;
+    int idx;
+    if (!wasm_lcd_state) {
+        return 0;
+    }
+    idx = qatomic_read(&wasm_lcd_pub_idx);
+    return (uint32_t)(uintptr_t)wasm_lcd_pub[idx];
 }
 #endif
 
@@ -754,9 +774,14 @@ static void ipod_classic_lcd_realize(DeviceState *dev, Error **errp)
 
 #ifdef EMSCRIPTEN
     wasm_lcd_state = s;
+    wasm_lcd_pub[0] = g_malloc0(S5L8702_PANEL_WIDTH *
+                                S5L8702_PANEL_HEIGHT * 2);
+    wasm_lcd_pub[1] = g_malloc0(S5L8702_PANEL_WIDTH *
+                                S5L8702_PANEL_HEIGHT * 2);
+    wasm_lcd_pub_idx = 0;
     s->wasm_timer = timer_new_ns(QEMU_CLOCK_REALTIME, wasm_lcd_frame_tick, s);
     timer_mod(s->wasm_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
-                             NANOSECONDS_PER_SECOND / 60);
+                             NANOSECONDS_PER_SECOND / 30);
 #endif
 }
 
