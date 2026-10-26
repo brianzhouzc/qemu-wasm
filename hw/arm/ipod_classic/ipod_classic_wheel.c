@@ -21,10 +21,11 @@
  *    both before the wheel task runs once, in which case the task sees only
  *    the second, decides it is a first touch, and throws the movement away.
  *
- * WHEELTRACE=1 announces the first command, the first packet and the first
- * time the line is raised, and prints totals at exit -- announcing the first
- * of each rather than every one, because stderr is where the firmware's own
- * semihosting output goes and it has to stay readable.
+ * WHEELTRACE=1 announces the first command, the first packet, the first key
+ * and the first time the line is raised, and prints totals at exit --
+ * announcing the first of each rather than every one, because stderr is where
+ * the firmware's own semihosting output goes and it has to stay readable.
+ * WHEELTRACE=2 is the verbose form: every line change and every key.
  */
 
 #include "qemu/osdep.h"
@@ -51,6 +52,17 @@ static uint64_t wheel_packets;      /* event and reply words queued */
 static uint64_t wheel_dropped;      /* words lost because the FIFO was full */
 static uint64_t wheel_commands;     /* WHEELGO kicks */
 static uint64_t wheel_irq_raises;   /* rising edges on IRQ 23 */
+
+static bool wheel_trace_verbose(void)
+{
+    static int verbose = -1;
+
+    if (verbose < 0) {
+        const char *e = getenv("WHEELTRACE");
+        verbose = e && e[0] == '2';
+    }
+    return verbose;
+}
 
 static bool wheel_trace_on(void)
 {
@@ -98,9 +110,15 @@ static void wheel_update_irq(IPodClassicWheelState *s)
 {
     bool level = (wheel_pend_value(s) & s->mask & S5L8702_WHEEL_PEND_ALL) != 0;
 
-    if (level != s->irq_level && wheel_trace_on()) {
-        fprintf(stderr, "WHEELTRACE irq 23 -> %d (pend 0x%x, mask 0x%x)\n",
-                level, wheel_pend_value(s), s->mask);
+    if (level != s->irq_level) {
+        static bool irq_traced;
+
+        if (wheel_trace_verbose() ||
+            (level && !irq_traced && wheel_trace_on())) {
+            fprintf(stderr, "WHEELTRACE irq 23 -> %d (pend 0x%x, mask 0x%x)\n",
+                    level, wheel_pend_value(s), s->mask);
+            irq_traced = true;
+        }
     }
     if (level && !s->irq_level) {
         wheel_irq_raises++;
@@ -368,12 +386,15 @@ static void wheel_tick(void *opaque)
 
 static void wheel_key_event(void *opaque, int keycode)
 {
+    static bool key_traced;
     IPodClassicWheelState *s = opaque;
     bool released = (keycode & 0x80) != 0;
     uint32_t bit;
 
-    if (wheel_trace_on()) {
+    if (wheel_trace_verbose() ||
+        (!key_traced && wheel_trace_on())) {
         fprintf(stderr, "WHEELTRACE key 0x%02x\n", keycode);
+        key_traced = true;
     }
 
     /*
