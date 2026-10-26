@@ -766,8 +766,8 @@ static const VMStateDescription vmstate_ipod_classic_wheel = {
      * Bumped to 2 when button_repeat_until joined the field list. Nothing
      * migrates this machine today, so the old format is not kept alive.
      */
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .post_load = wheel_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(con, IPodClassicWheelState),
@@ -789,6 +789,18 @@ static const VMStateDescription vmstate_ipod_classic_wheel = {
         VMSTATE_INT64(untouch_at, IPodClassicWheelState),
         VMSTATE_INT64(button_repeat_until, IPodClassicWheelState),
         VMSTATE_TIMER_PTR(tick, IPodClassicWheelState),
+#ifdef EMSCRIPTEN
+        /*
+         * A snapshot taken while a browser key is held would otherwise come
+         * back with the button bit set and no release scheduled (Q20).
+         */
+        VMSTATE_INT32(wasm_keycode, IPodClassicWheelState),
+        VMSTATE_INT64(wasm_release_at, IPodClassicWheelState),
+        VMSTATE_INT64(wasm_release_cap, IPodClassicWheelState),
+        VMSTATE_UINT32(wasm_press_mask, IPodClassicWheelState),
+        VMSTATE_UINT32(wasm_consumed, IPodClassicWheelState),
+        VMSTATE_UINT32(wasm_consumed0, IPodClassicWheelState),
+#endif
         VMSTATE_END_OF_LIST()
     },
 };

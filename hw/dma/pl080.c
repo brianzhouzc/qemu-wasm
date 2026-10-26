@@ -51,7 +51,7 @@ static const VMStateDescription vmstate_pl080_channel = {
 
 static const VMStateDescription vmstate_pl080 = {
     .name = "pl080",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (VMStateField[]) {
         VMSTATE_UINT8(tc_int, PL080State),
@@ -62,12 +62,13 @@ static const VMStateDescription vmstate_pl080 = {
         VMSTATE_UINT32(sync, PL080State),
         VMSTATE_UINT32(req_single, PL080State),
         VMSTATE_UINT32(req_burst, PL080State),
-        VMSTATE_UINT8(tc_int, PL080State),
-        VMSTATE_UINT8(tc_int, PL080State),
-        VMSTATE_UINT8(tc_int, PL080State),
+        /* (The three duplicate tc_int entries that used to be here are
+         * gone; version 2 covers the format.) */
         VMSTATE_STRUCT_ARRAY(chan, PL080State, PL080_MAX_CHANNELS,
                              1, vmstate_pl080_channel, pl080_channel),
         VMSTATE_INT32(running, PL080State),
+        /* A paced channel saved with a completion pending (Q20). */
+        VMSTATE_UINT32(paced_pending, PL080State),
         VMSTATE_END_OF_LIST()
     }
 };
