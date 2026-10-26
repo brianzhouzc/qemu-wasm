@@ -783,7 +783,12 @@ static int wheel_post_load(void *opaque, int version_id)
  * these fields, so they are a subsection of their own (S9).
  */
 static const VMStateDescription vmstate_ipod_classic_wheel_wasm = {
-    .name = "ipod_classic.wheel.wasm",
+    /*
+     * QEMU only accepts a subsection whose name starts with the parent
+     * description name (the wheel's is "s5l8702.wheel"); anything else is
+     * left unconsumed and the parent footer check fails.
+     */
+    .name = "s5l8702.wheel.wasm",
     .version_id = 1,
     .minimum_version_id = 1,
     .fields = (VMStateField[]) {
