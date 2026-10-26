@@ -15,6 +15,16 @@
 #include "migration/vmstate.h"
 #include "hw/arm/ipod_classic/ipod_classic_timer.h"
 
+/* Cached: this is checked on every channel reload (Q18). */
+static bool timer_trace_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("TIMERTRACE") != NULL;
+    }
+    return on;
+}
+
 static bool chan_is_32bit(const IPodClassicTimerChannel *c)
 {
     return c->index >= S5L8702_NUM_TIMERS_16;
@@ -195,7 +205,7 @@ static void chan_reload(IPodClassicTimerChannel *c)
      * -- chan_freq substitutes ECLK for it -- so a channel the guest programmed
      * against PCLK comes out at the wrong rate, and this says by how much.
      */
-    if (getenv("TIMERTRACE")) {
+    if (timer_trace_on()) {
         uint32_t f = chan_freq(c);
         fprintf(stderr, "TIMERTRACE: chan %c  freq=%u Hz  data0=%u  pre=%u  "
                         "con=%08x cmd=%08x  -> period %.3f ms\n",

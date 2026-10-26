@@ -14,6 +14,25 @@
 #include "hw/intc/pl192.h"
 #include "migration/vmstate.h"
 
+/* getenv() scans the environment: keep it out of the interrupt path (Q18). */
+static bool pl192_vicack_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("VICACK") != NULL;
+    }
+    return on;
+}
+
+static bool pl192_victrace_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("VICTRACE") != NULL;
+    }
+    return on;
+}
+
 extern CPUState *getMainCpuEnv(void);
 
 
@@ -189,8 +208,8 @@ static uint32_t pl192_irq_ack(PL192State *s)
     int is_daisy = (s->current_highest == PL192_DAISY_IRQ);
     uint32_t res = s->address;
 
-    if (getenv("VICACK")) {
-        static int dbg_n;
+    if (pl192_vicack_on()) {
+        static uint64_t dbg_n;
         if (dbg_n < 40 || (dbg_n % 20000) == 0) {
             fprintf(stderr, "VICACK %s src=%u addr=0x%08x status=0x%08x "
                     "prio=0x%x stack_i=%d\n", s->iomem.name,
@@ -378,7 +397,7 @@ static void pl192_irq_handler(void *opaque, int irq, int level)
 {
     PL192State *s = (PL192State *) opaque;
 
-    if (getenv("VICTRACE")) {
+    if (pl192_victrace_on()) {
         fprintf(stderr, "VICTRACE %s src %d -> %d\n",
                 s->iomem.name, irq, level);
     }

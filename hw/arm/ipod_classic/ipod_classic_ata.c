@@ -24,6 +24,17 @@
 #include "hw/qdev-properties.h"
 #include "sysemu/blockdev.h"
 #include "hw/arm/ipod_classic/ipod_classic_ata.h"
+
+/* Cached: checked on the data and command paths (Q18). */
+static char ata_lba_mode(void)
+{
+    static char mode = -1;
+    if (mode == -1) {
+        const char *e = getenv("ATALBA");
+        mode = e ? e[0] : 0;
+    }
+    return mode;
+}
 #include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
 
 /* Which IDE core port a device-register offset corresponds to. */
@@ -137,7 +148,7 @@ static int32_t ipod_classic_ata_dma_prepare_buf(const IDEDMA *dma,
          * matters. ATATRACE only ever printed register offsets, so this could
          * not be seen before. Doubling schedule plus a running total.
          */
-        if (getenv("ATALBA") &&
+        if (ata_lba_mode() &&
             !(s->reg[S5L8702_ATA_CFG / 4] & S5L8702_ATA_CFG_WRITE)) {
             static uint64_t rd_ops, rd_bytes;
             /*
@@ -245,7 +256,7 @@ static int32_t ipod_classic_ata_dma_prepare_buf(const IDEDMA *dma,
              * answer "is the song being read WHILE it plays", which is the
              * question that separates a starved decoder from a broken one.
              */
-            bool all = getenv("ATALBA")[0] == '2';
+            bool all = ata_lba_mode() == '2';
 
             rd_bytes += len;
             if (all || (n & (n - 1)) == 0 || n % 2000 == 0) {

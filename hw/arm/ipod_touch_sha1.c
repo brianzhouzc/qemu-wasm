@@ -1,6 +1,25 @@
 #include "hw/arm/ipod_touch_sha1.h"
 #include "qemu/log.h"
 
+/* getenv() on the digest read path is measurable under TCI (Q18). */
+static bool sha1_trace_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("SHA1TRACE") != NULL;
+    }
+    return on;
+}
+
+static bool sha1_zero_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("SHA1_ZERO") != NULL;
+    }
+    return on;
+}
+
 /*
  * SHA-1 (FIPS 180-4), so the device model does not depend on OpenSSL, which
  * the WebAssembly build cannot carry. The digests are identical to the
@@ -241,7 +260,7 @@ static uint64_t ipod_touch_sha1_read(void *opaque, hwaddr offset, unsigned size)
                  * which of the two is happening, and whether the input is even
                  * the database (an mhbd magic would be unmistakable).
                  */
-                if (getenv("SHA1TRACE")) {
+                if (sha1_trace_on()) {
                     static int n;
                     if (n++ < 12) {
                         fprintf(stderr,
@@ -280,7 +299,7 @@ static uint64_t ipod_touch_sha1_read(void *opaque, hwaddr offset, unsigned size)
 			 * is a verdict, not a side effect. If it does not, the difference is
 			 * in another register and the digest is a red herring.
 			 */
-			if (getenv("SHA1_ZERO")) {
+			if (sha1_zero_on()) {
 				return 0;
 			}
 			return *(uint32_t *)&s->hashout[offset - 0x20];
