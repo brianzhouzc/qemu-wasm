@@ -533,11 +533,17 @@ static int ipod_classic_ata_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_ipod_classic_ata = {
     .name = "ipod_classic.ata",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = ipod_classic_ata_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_IDE_BUS(bus, IPodClassicATAState),
+        /*
+         * The bus holds cmd/unit/error only; the drive's task-file
+         * registers, SET MULTIPLE and SET FEATURES state and PIO position
+         * live in ide_drive_t and have to be migrated with it (Q6).
+         */
+        VMSTATE_IDE_DRIVES(bus.ifs, IPodClassicATAState),
         VMSTATE_UINT32_ARRAY(reg, IPodClassicATAState,
                              S5L8702_ATA_MEM_SIZE / 4),
         VMSTATE_UINT32(rdata, IPodClassicATAState),

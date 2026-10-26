@@ -427,13 +427,13 @@ static const VMStateDescription vmstate_pl192 = {
     .post_load = pl192_post_load,
     .fields = (VMStateField[]) {
         /*
-         * rawintr, irq_status and fiq_status are derived from the input line
-         * levels and the registers below; they are not state. Restoring
-         * rawintr keeps a bit whose device no longer asserts (a UART whose
-         * line is not re-driven, for example) and the guest then takes an
-         * interrupt it can never clear. Devices re-assert their lines from
-         * their own post_load and pl192_post_load recomputes the rest.
+         * irq_status and fiq_status are derived and recomputed in post_load,
+         * but the input line levels are not migrated by QEMU: rawintr is the
+         * only record of an interrupt asserted at the save point, so it has
+         * to be restored (Q7).  Devices that can change a line are expected
+         * to re-drive it from their own post_load.
          */
+        VMSTATE_UINT32(rawintr, PL192State),
         VMSTATE_UINT32(intselect, PL192State),
         VMSTATE_UINT32(intenable, PL192State),
         VMSTATE_UINT32(softint, PL192State),
