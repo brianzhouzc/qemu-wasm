@@ -35,6 +35,10 @@
 #include "tcg/startup.h"
 #include "tcg-accel-ops.h"
 #include "tcg-accel-ops-rr.h"
+
+#ifdef EMSCRIPTEN
+#include <emscripten/threading.h>
+#endif
 #include "tcg-accel-ops-icount.h"
 
 /*
@@ -121,7 +125,19 @@ static void rr_wait_io_event(void)
 
     while (all_cpu_threads_idle()) {
         rr_stop_kick_timer();
+#ifdef EMSCRIPTEN
+        /*
+         * Same bounded poll as qemu_wait_io_event(): a condition variable
+         * does not reliably wake the vCPU from the main loop in this build,
+         * and -icount uses the RR thread, so the fix has to be here too
+         * (Q9).  The cost only falls on an idle vCPU.
+         */
+        qemu_mutex_unlock_iothread();
+        emscripten_thread_sleep(1.0);
+        qemu_mutex_lock_iothread();
+#else
         qemu_cond_wait_iothread(first_cpu->halt_cond);
+#endif
     }
 
     rr_start_kick_timer();

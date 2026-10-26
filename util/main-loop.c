@@ -52,9 +52,8 @@
  */
 static int qemu_em_notify;
 
-static void qemu_em_notify_wait(int64_t timeout_ns)
+static void qemu_em_notify_wait(int64_t timeout_ns, int expected)
 {
-    int expected = qatomic_read(&qemu_em_notify);
     double ms;
 
     if (timeout_ns < 0) {
@@ -347,9 +346,15 @@ static int os_host_main_loop_wait(int64_t timeout)
     replay_mutex_unlock();
 
 #ifdef EMSCRIPTEN
+    /*
+     * Sample the counter before the poll: a qemu_notify_event() between the
+     * poll and a later read used to be lost and the loop slept the whole
+     * bound (Q10).
+     */
+    int seen = qatomic_read(&qemu_em_notify);
     ret = qemu_poll_ns((GPollFD *)gpollfds->data, gpollfds->len, 0);
     if (ret == 0 && timeout != 0) {
-        qemu_em_notify_wait(timeout);
+        qemu_em_notify_wait(timeout, seen);
     }
 #else
     ret = qemu_poll_ns((GPollFD *)gpollfds->data, gpollfds->len, timeout);
