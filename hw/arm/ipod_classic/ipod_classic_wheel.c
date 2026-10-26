@@ -306,8 +306,8 @@ static void wheel_tick(void *opaque)
          * pays out the last pending step is what "consumes" a detent (Q12).
          */
         if (s->wasm_release_at && s->pending_steps == 0 &&
-            ((s->wasm_keycode & 0x7f) == KEY_E ||
-             (s->wasm_keycode & 0x7f) == KEY_Q)) {
+            ((s->wasm_keycode & 0x7f) == 0x12 ||   /* cw */
+             (s->wasm_keycode & 0x7f) == 0x10)) {  /* ccw */
             s->wasm_consumed = qatomic_read(&s->wasm_consumed) + 1;
         }
     } else if (s->touched && now >= s->untouch_at) {
