@@ -1,4 +1,24 @@
 #include "hw/arm/ipod_touch_sha1.h"
+#include "qemu/log.h"
+
+/* getenv() on the digest read path is measurable under TCI (Q18). */
+static bool sha1_trace_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("SHA1TRACE") != NULL;
+    }
+    return on;
+}
+
+static bool sha1_zero_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("SHA1_ZERO") != NULL;
+    }
+    return on;
+}
 
 /*
  * SHA-1 (FIPS 180-4), so the device model does not depend on OpenSSL, which
@@ -128,6 +148,14 @@ static uint64_t swapLong(uint64_t x) {
 
 static void flush_hw_buffer(IPodTouchSHA1State *s) {
     // Flush the hardware buffer to the state buffer and clear the buffer.
+    if (s->buffer_ind + 0x40 > SHA1_BUFFER_SIZE) {
+        /* The guest kept hashing without a reset: drop, never overflow (Q2). */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sha1: buffer full, dropping a block\n");
+        memset(s->hw_buffer, 0, 0x40);
+        s->hw_buffer_dirty = false;
+        return;
+    }
     memcpy(s->buffer + s->buffer_ind, (uint8_t *)s->hw_buffer, 0x40);
     memset(s->hw_buffer, 0, 0x40);
     s->hw_buffer_dirty = false;
@@ -167,7 +195,15 @@ static uint64_t ipod_touch_sha1_read(void *opaque, hwaddr offset, unsigned size)
 		case SHA_INSIZE:
 			return s->insize;
 		/* Hash result ouput */
-		case 0x20 ... 0x34:
+		case 0x20 ... 0x33:
+			if (size != 4) {
+				/* A partial digest read cannot be served from the
+				 * 20-byte hashout without running past it (S7). */
+				qemu_log_mask(LOG_GUEST_ERROR,
+				              "sha1: %u-byte digest read at 0x%x\n",
+				              size, (unsigned)offset);
+				return 0;
+			}
 			//fprintf(stderr, "Hash out %08x\n",  *(uint32_t *)&s->hashout[offset - 0x20]);
             if(!s->hash_computed) {
                 /*
@@ -232,7 +268,7 @@ static uint64_t ipod_touch_sha1_read(void *opaque, hwaddr offset, unsigned size)
                  * which of the two is happening, and whether the input is even
                  * the database (an mhbd magic would be unmistakable).
                  */
-                if (getenv("SHA1TRACE")) {
+                if (sha1_trace_on()) {
                     static int n;
                     if (n++ < 12) {
                         fprintf(stderr,
@@ -271,7 +307,7 @@ static uint64_t ipod_touch_sha1_read(void *opaque, hwaddr offset, unsigned size)
 			 * is a verdict, not a side effect. If it does not, the difference is
 			 * in another register and the digest is a red herring.
 			 */
-			if (getenv("SHA1_ZERO")) {
+			if (sha1_zero_on()) {
 				return 0;
 			}
 			return *(uint32_t *)&s->hashout[offset - 0x20];
@@ -298,6 +334,11 @@ static void ipod_touch_sha1_write(void *opaque, hwaddr offset, uint64_t value, u
 				{
 					// we are in memory mode - gradually add the memory to the buffer
 					for(int i = 0; i < s->insize / 0x40; i++) {
+						if (s->buffer_ind + 0x40 > SHA1_BUFFER_SIZE) {
+							qemu_log_mask(LOG_GUEST_ERROR,
+							              "sha1: buffer full, dropping input\n");
+							break;
+						}
 						cpu_physical_memory_read(s->memory_start + i * 0x40, s->buffer + s->buffer_ind, 0x40);
 						s->buffer_ind += 0x40;
 					}
@@ -323,7 +364,13 @@ static void ipod_touch_sha1_write(void *opaque, hwaddr offset, uint64_t value, u
 			s->memory_mode = value;
 			break;
 		case SHA_INSIZE:
-            assert(value <= SHA1_BUFFER_SIZE);
+            if (value > SHA1_BUFFER_SIZE) {
+                /* An assert would let the guest abort QEMU; refuse instead (Q2). */
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "sha1: insize 0x%" PRIx64 " is over the buffer\n",
+                              value);
+                break;
+            }
 			s->insize = value;
 			break;
 		case 0x40 ... 0x7c:
@@ -338,6 +385,11 @@ static const MemoryRegionOps sha1_ops = {
     .read = ipod_touch_sha1_read,
     .write = ipod_touch_sha1_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
+    /*
+     * The access sizes stay unrestricted: the 0x40..0x7c input buffer takes
+     * byte and halfword stores, and a global 4-byte minimum turned those into
+     * guest data aborts (S7).  The digest case checks its own size instead.
+     */
 };
 
 static void ipod_touch_sha1_init(Object *obj)

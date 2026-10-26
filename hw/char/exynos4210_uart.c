@@ -621,14 +621,18 @@ static int exynos4210_uart_post_load(void *opaque, int version_id)
     exynos4210_uart_update_parameters(s);
 
     /*
-     * Do not re-arm the receive-timeout timer here. The timer itself is not
-     * migrated, and rx_timeout_set() would start a fresh timeout from the
-     * restored UCON; it fired immediately, raised the receive interrupt, and
-     * the guest (which has no UART handler behind its single vector) never
-     * cleared it, so the restored machine stormed. The guest re-arms the
-     * timeout on its next receive or UCON write, exactly as it does live.
+     * The timer itself is not migrated.  Re-arm it only when the restored RX
+     * FIFO actually holds data: that is the case the upstream re-arm exists
+     * for, and it keeps every Exynos board working.  On the iPod the FIFO is
+     * empty and rx_timeout_set() fired immediately, raising a receive
+     * interrupt the guest (which has no UART handler behind its single
+     * vector) never cleared, so the restored machine stormed (Q15).
      */
-    timer_del(s->fifo_timeout_timer);
+    if (fifo_elements_number(&s->rx) > 0) {
+        exynos4210_uart_rx_timeout_set(s);
+    } else {
+        timer_del(s->fifo_timeout_timer);
+    }
 
     return 0;
 }

@@ -344,8 +344,9 @@ static void ipod_classic_set_bootrom_path(Object *obj, const char *value,
     IPodClassicMachineState *nms = IPOD_CLASSIC_MACHINE(obj);
 
     if (!g_file_test(value, G_FILE_TEST_EXISTS)) {
-        error_report("bootrom at path \"%s\" must exist", value);
-        exit(1);
+        /* A property setter reports through errp, it does not exit (Q24). */
+        error_setg(errp, "bootrom at path \"%s\" must exist", value);
+        return;
     }
     g_strlcpy(nms->bootrom_path, value, sizeof(nms->bootrom_path));
 }
@@ -377,6 +378,12 @@ static void ipod_classic_instance_init(Object *obj)
      * firmware may not have installed and the machine dies quietly; with it on
      * the firmware tells us what it thinks is wrong. Costs nothing when
      * nothing is printed, so it is on by default.
+     *
+     * NOTE: semihosting is the whole ARM interface, not just SYS_WRITE0:
+     * a guest can open, write, remove and rename host files and (SYS_SYSTEM)
+     * run a shell command.  In the browser that is Emscripten's MEMFS; a
+     * native run of firmware from someone else is a real trust boundary.
+     * Set semihosting=off (or -semihosting-config) when that matters (Q21).
      */
     IPOD_CLASSIC_MACHINE(obj)->semihosting = true;
     object_property_add_bool(obj, "semihosting", ipod_classic_get_semihosting,
@@ -384,7 +391,8 @@ static void ipod_classic_instance_init(Object *obj)
     object_property_set_description(obj, "semihosting",
         "Answer ARM semihosting calls (SVC 0x123456). Apple's retailOS prints "
         "its diagnostics through them. Turn it off to see the firmware take "
-        "the SVC vector instead.");
+        "the SVC vector instead. Note: semihosting is the whole ARM interface, "
+        "including file access and SYS_SYSTEM; only run firmware you trust.");
 
     IPOD_CLASSIC_MACHINE(obj)->hw_id = S5L8702_HW_ID;
     object_property_add_uint32_ptr(obj, "hw-id",
@@ -604,7 +612,10 @@ static int ipod_heartbeat_ms;
 static ARMCPU *ipod_heartbeat_cpu;
 
 /*
- * IPOD_HEARTBEAT_MS=5000: say where the boot is, on the real-time clock.
+ * heartbeat=5000 (machine property; node-run.js reads IPOD_HEARTBEAT_MS and
+ * passes it as this property): say where the boot is, on the real-time clock.
+ * The property is uint32 but the timer uses a signed int, so a value of
+ * 2^31 or more arrives negative and turns the heartbeat off (Q24).
  * The browser build can take minutes before the first display write, and
  * without this there is no way to tell a slow emulator from a stuck one.
  * It also gives the Wasm build's JIT count, the number of translation blocks
@@ -661,8 +672,80 @@ static QEMUBH *ipod_snapshot_bh;
 static QEMUTimer *ipod_snapshot_timer;
 static int64_t ipod_snapshot_deadline;
 static int ipod_snapshot_op;            /* 1 save, 2 load */
-static volatile int ipod_snapshot_state;
+static bool ipod_snapshot_was_running;  /* state 4: paused until resume */
+static bool ipod_snapshot_resume_pending;
+static int ipod_snapshot_state;
 static char ipod_snapshot_path[512];
+
+/*
+ * The snapshot is QEMU's vmstate, which is only valid for the build that
+ * wrote it (a new field or a bumped version_id makes an old file
+ * unloadable, and QEMU 8.2 exits the process on a failed load).  The build
+ * id is generated into qemu-wasm-build-id.h by build.sh; a sidecar next to
+ * the state file records it, and a mismatch is refused before the load
+ * starts (Q13).
+ */
+#if defined(__has_include)
+# if __has_include("qemu-wasm-build-id.h")
+#  include "qemu-wasm-build-id.h"
+# endif
+#endif
+#ifndef QEMU_WASM_BUILD_ID
+#define QEMU_WASM_BUILD_ID "unknown"
+#endif
+
+static void ipod_snapshot_write_id(const char *path)
+{
+    char idpath[sizeof(ipod_snapshot_path) + 4];
+    FILE *f;
+
+    snprintf(idpath, sizeof(idpath), "%s.id", path);
+    f = fopen(idpath, "w");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "%s\n", QEMU_WASM_BUILD_ID);
+    fclose(f);
+}
+
+static bool ipod_snapshot_id_ok(const char *path)
+{
+    char idpath[sizeof(ipod_snapshot_path) + 4];
+    char buf[256];
+    FILE *f;
+
+    snprintf(idpath, sizeof(idpath), "%s.id", path);
+    f = fopen(idpath, "r");
+    if (!f) {
+        /*
+         * No sidecar: the caller carried only the state file (an older
+         * tool, or a hand-copied snapshot).  Accept it -- the page and the
+         * Node runner keep the pair together and reject old builds by their
+         * own keys -- but a sidecar that says another build is refused.
+         */
+        return true;
+    }
+    if (!fgets(buf, sizeof(buf), f)) {
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+    buf[strcspn(buf, "\r\n")] = 0;
+    if (strcmp(buf, QEMU_WASM_BUILD_ID) != 0) {
+        return false;
+    }
+    if (strcmp(buf, "unknown") == 0) {
+        /*
+         * Two builds without the generated header both say "unknown", so the
+         * id cannot tie the state to a build; warn instead of pretending the
+         * check passed (S10).
+         */
+        warn_report("snapshot: build id is \"unknown\"; the state cannot be "
+                    "tied to a build");
+    }
+    return true;
+}
+
 
 /*
  * A load runs through the incoming migration machinery, which finishes
@@ -676,14 +759,14 @@ static void ipod_snapshot_poll(void *opaque)
         return;
     }
     if (runstate_is_running()) {
-        ipod_snapshot_state = 2;
-        ipod_snapshot_op = 0;
+        qatomic_set(&ipod_snapshot_state, 2);
+        qatomic_set(&ipod_snapshot_op, 0);
         return;
     }
     now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     if (migration_is_idle() && now > ipod_snapshot_deadline) {
-        ipod_snapshot_state = 3;
-        ipod_snapshot_op = 0;
+        qatomic_set(&ipod_snapshot_state, 3);
+        qatomic_set(&ipod_snapshot_op, 0);
         return;
     }
     timer_mod(ipod_snapshot_timer, now + 100);
@@ -695,17 +778,43 @@ static void ipod_snapshot_bh_fn(void *opaque)
     bool was_running;
     int ret = 0;
 
-    if (!ipod_snapshot_op) {
+    if (qatomic_read(&ipod_snapshot_resume_pending)) {
+        /*
+         * The page asked for the VM to continue after reading the paused
+         * disk.  Starting it here, in the main loop with the BQL held, keeps
+         * the runstate and vCPU work on QEMU's own thread (T2).
+         */
+        qatomic_set(&ipod_snapshot_resume_pending, false);
+        if (ipod_snapshot_was_running) {
+            vm_start();
+        }
+        qatomic_set(&ipod_snapshot_op, 0);
+        qatomic_store_release(&ipod_snapshot_state, 2);
         return;
     }
-    if (ipod_snapshot_op == 2) {
+
+    if (qatomic_load_acquire(&ipod_snapshot_state) != 1) {
+        return;
+    }
+    if (!qatomic_read(&ipod_snapshot_op)) {
+        return;
+    }
+    if (qatomic_read(&ipod_snapshot_op) == 2 &&
+        !ipod_snapshot_id_ok(ipod_snapshot_path)) {
+        error_report("snapshot was written by a different emulator build; "
+                     "not loading it");
+        qatomic_set(&ipod_snapshot_op, 0);
+        qatomic_set(&ipod_snapshot_state, 3);
+        return;
+    }
+    if (qatomic_read(&ipod_snapshot_op) == 2) {
         char uri[sizeof(ipod_snapshot_path) + 8];
         snprintf(uri, sizeof(uri), "file:%s", ipod_snapshot_path);
         qmp_migrate_incoming(uri, false, NULL, &err);
         if (err) {
             error_report_err(err);
-            ipod_snapshot_op = 0;
-            ipod_snapshot_state = 3;
+            qatomic_set(&ipod_snapshot_op, 0);
+            qatomic_set(&ipod_snapshot_state, 3);
             return;
         }
         ipod_snapshot_deadline = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 8000;
@@ -714,35 +823,70 @@ static void ipod_snapshot_bh_fn(void *opaque)
         return;
     }
     was_running = runstate_is_running();
+    ipod_snapshot_was_running = was_running;
     global_state_store();
     vm_stop(RUN_STATE_SAVE_VM);
     ret = qemu_savevm_state_to_file(ipod_snapshot_path, &err);
-    if (was_running) {
-        vm_start();
-    }
     if (err) {
         error_report_err(err);
     }
-    ipod_snapshot_op = 0;
-    ipod_snapshot_state = ret == 0 ? 2 : 3;
+    if (ret == 0) {
+        /*
+         * Leave the VM stopped.  The caller reads disk.img now -- block
+         * devices are not in the vmstate, and copying 162 MB inside MEMFS
+         * exhausted the wasm heap (R6) -- then calls ipod_snapshot_resume().
+         */
+        ipod_snapshot_write_id(ipod_snapshot_path);
+        qatomic_store_release(&ipod_snapshot_state, 4);
+        return;
+    }
+    if (was_running) {
+        vm_start();
+    }
+    qatomic_set(&ipod_snapshot_op, 0);
+    qatomic_store_release(&ipod_snapshot_state, 3);
+}
+
+EMSCRIPTEN_KEEPALIVE const char *ipod_wasm_build_id(void)
+{
+    return QEMU_WASM_BUILD_ID;
+}
+
+/*
+ * The save leaves the VM stopped (state 4) so the caller can read a disk that
+ * matches the saved RAM.  It must call this when it is done.
+ */
+EMSCRIPTEN_KEEPALIVE void ipod_snapshot_resume(void)
+{
+    if (qatomic_read(&ipod_snapshot_state) != 4) {
+        return;
+    }
+    /*
+     * Only signal: the bottom half starts the VM with the BQL held (T2).
+     */
+    qatomic_store_release(&ipod_snapshot_resume_pending, true);
+    qemu_bh_schedule(ipod_snapshot_bh);
+    qemu_notify_event();
 }
 
 EMSCRIPTEN_KEEPALIVE void ipod_snapshot_request(int op, const char *path)
 {
-    if (ipod_snapshot_state == 1) {
+    if (qatomic_read(&ipod_snapshot_state) == 1 ||
+        qatomic_read(&ipod_snapshot_state) == 4) {
+        /* Working, or paused for the caller to read the disk (T3). */
         return;
     }
     snprintf(ipod_snapshot_path, sizeof(ipod_snapshot_path), "%s",
              path ? path : "");
-    ipod_snapshot_op = op;
-    ipod_snapshot_state = 1;
+    qatomic_set(&ipod_snapshot_op, op);
+    qatomic_store_release(&ipod_snapshot_state, 1);
     qemu_bh_schedule(ipod_snapshot_bh);
     qemu_notify_event();
 }
 
 EMSCRIPTEN_KEEPALIVE int ipod_snapshot_status(void)
 {
-    return ipod_snapshot_state;
+    return qatomic_read(&ipod_snapshot_state);
 }
 #endif
 

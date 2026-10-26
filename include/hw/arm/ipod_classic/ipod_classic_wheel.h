@@ -296,6 +296,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicWheelState, IPOD_CLASSIC_WHEEL)
 #define S5L8702_WHEEL_FIFO_LEN      16
 
 struct IPodClassicWheelState {
+    /*
+     * QOM requires the parent to be the first member: OBJECT()/DEVICE() are
+     * plain casts and object_initialize() writes the header at offset 0.
+     * The browser-only fields therefore come after it (Q1).
+     */
+    SysBusDevice parent_obj;
+
 #ifdef EMSCRIPTEN
     /* Browser input: releases a held key at a virtual deadline, or as soon
      * as the guest has consumed a packet carrying the button. */
@@ -303,9 +310,23 @@ struct IPodClassicWheelState {
     int64_t wasm_release_at;
     int64_t wasm_release_cap;
     uint32_t wasm_press_mask;
-    int wasm_ack;
+    uint32_t wasm_consumed;      /* presses the guest has consumed */
+    uint32_t wasm_consumed0;     /* counter value when the press started */
+    /* Mailbox: the page queues a key, the main loop's BH performs it (Q11). */
+    QEMUBH *wasm_key_bh;
+    /*
+     * Single-producer/single-consumer ring: the page enqueues and the bottom
+     * half drains (S6).  A single slot lost the first of two quick presses
+     * and let the three fields be read torn.
+     */
+    struct {
+        int32_t op;              /* 1 = press with hold, 2 = raw key */
+        int32_t arg;
+        int32_t hold;
+    } wasm_key_ring[8];
+    uint32_t wasm_key_head;      /* written by the page thread */
+    uint32_t wasm_key_tail;      /* written by the bottom half */
 #endif
-    SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     qemu_irq irq;

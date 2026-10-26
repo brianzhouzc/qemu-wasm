@@ -51,7 +51,7 @@ static const VMStateDescription vmstate_pl080_channel = {
 
 static const VMStateDescription vmstate_pl080 = {
     .name = "pl080",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (VMStateField[]) {
         VMSTATE_UINT8(tc_int, PL080State),
@@ -62,12 +62,18 @@ static const VMStateDescription vmstate_pl080 = {
         VMSTATE_UINT32(sync, PL080State),
         VMSTATE_UINT32(req_single, PL080State),
         VMSTATE_UINT32(req_burst, PL080State),
+        /*
+         * These duplicates are upstream's wire format for every PL080 board;
+         * removing them would change it.  Keep all three (S4).
+         */
         VMSTATE_UINT8(tc_int, PL080State),
         VMSTATE_UINT8(tc_int, PL080State),
         VMSTATE_UINT8(tc_int, PL080State),
         VMSTATE_STRUCT_ARRAY(chan, PL080State, PL080_MAX_CHANNELS,
                              1, vmstate_pl080_channel, pl080_channel),
         VMSTATE_INT32(running, PL080State),
+        /* A paced channel saved with a completion pending (Q20, version 2). */
+        VMSTATE_UINT32_V(paced_pending, PL080State, 2),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -199,8 +205,20 @@ again:
             }
             flow = (ch->conf >> 11) & 7;
             if (flow >= 4) {
-                hw_error(
-                    "pl080_run: Peripheral flow control not implemented\n");
+                static bool warned;
+                /*
+                 * Guest data reached an unimplemented mode.  Do not abort
+                 * (Q22), and do not return either: that leaves s->running
+                 * set and every later pl080_run() just increments it (S3).
+                 * Skip this channel and say so once.
+                 */
+                if (!warned) {
+                    warned = true;
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "pl080_run: peripheral flow control %u not "
+                                  "implemented, skipping the channel\n", flow);
+                }
+                continue;
             }
             src_id = (ch->conf >> 1) & 0x1f;
             dest_id = (ch->conf >> 6) & 0x1f;
@@ -261,7 +279,6 @@ again:
                     ch->dest += swidth;
             }
 
-            //printf("Transfer size: %d, destination: 0x%08x\n", size, ch->dest);
             size--;
             ch->ctrl = (ch->ctrl & 0xfffff000) | size;
             if (size == 0) {
@@ -295,7 +312,6 @@ again:
                     ch->conf &= ~PL080_CCONF_E;
                 }
                 if (ch->ctrl & PL080_CCTRL_I) {
-                    //printf("Setting interrupt status of channel %d\n", c);
                     s->tc_int |= 1 << c;
                     if (pl080_trace_on()) {
                         s->tc_count[c]++;
@@ -468,7 +484,6 @@ static void pl080_write(void *opaque, hwaddr offset,
     PL080State *s = (PL080State *)opaque;
     int i;
 
-    //fprintf(stderr, "%s: writing 0x%08x to 0x%08x\n", __func__, value, offset);
 
     if (offset >= 0x100 && offset < 0x200) {
         i = (offset & 0xe0) >> 5;
@@ -476,11 +491,9 @@ static void pl080_write(void *opaque, hwaddr offset,
             goto bad_offset;
         switch ((offset >> 2) & 7) {
         case 0: /* SrcAddr */
-            //printf("%s: setting source address of channel %d to 0x%08x\n", __func__, i, value);
             s->chan[i].src = value;
             break;
         case 1: /* DestAddr */
-            //printf("%s: setting destination address of channel %d to 0x%08x\n", __func__, i, value);
             s->chan[i].dest = value;
             break;
         case 2: /* LLI */
@@ -499,7 +512,6 @@ static void pl080_write(void *opaque, hwaddr offset,
              */
             break;
         case 3: /* Control */
-            //printf("%s: setting control of channel %d to 0x%08x (transfer size: %d)\n", __func__, i, value, value & 0xfff);
             s->chan[i].ctrl = value;
             /* A fresh descriptor with real work clears any completed-pending
                state (e.g. dmac_ch_run starting a new task). */
@@ -508,7 +520,6 @@ static void pl080_write(void *opaque, hwaddr offset,
             }
             break;
         case 4: /* Configuration */
-            //printf("%s: setting configuration of channel %d to 0x%08x\n", __func__, i, value);
             if (!(value & PL080_CCONF_E)) {
                 /* Explicit disable/abort resolves the completed-pending state. */
                 s->paced_pending &= ~(1u << i);
@@ -601,6 +612,11 @@ static void pl080_init(Object *obj)
 
     memory_region_init_io(&s->iomem1, OBJECT(s), &pl080_ops, s, "pl080", 0x1000);
     sysbus_init_mmio(sbd, &s->iomem1);
+    /*
+     * Second window: kept for the boards that use it.  The iPod Classic
+     * machine maps only iomem1, and the model serves both from the same
+     * state, so nothing here is iPod-specific (Q24).
+     */
     memory_region_init_io(&s->iomem2, OBJECT(s), &pl080_ops, s, "pl080", 0x1000);
     sysbus_init_mmio(sbd, &s->iomem2);
     sysbus_init_irq(sbd, &s->irq);

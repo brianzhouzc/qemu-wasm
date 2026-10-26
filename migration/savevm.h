@@ -43,7 +43,6 @@ int qemu_savevm_state_complete_precopy(QEMUFile *f, bool iterable_only,
                                        bool inactivate_disks);
 /* Write/read the whole VM state as one file; caller stops/starts the VM. */
 int qemu_savevm_state_to_file(const char *path, Error **errp);
-int qemu_loadvm_state_from_file(const char *path, Error **errp);
 void qemu_savevm_state_pending_exact(uint64_t *must_precopy,
                                      uint64_t *can_postcopy);
 void qemu_savevm_state_pending_estimate(uint64_t *must_precopy,

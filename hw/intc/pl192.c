@@ -6,12 +6,32 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "hw/sysbus.h"
 #include "hw/irq.h"
 #include "hw/hw.h"
 #include "qapi/error.h"
 #include "hw/intc/pl192.h"
 #include "migration/vmstate.h"
+
+/* getenv() scans the environment: keep it out of the interrupt path (Q18). */
+static bool pl192_vicack_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("VICACK") != NULL;
+    }
+    return on;
+}
+
+static bool pl192_victrace_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("VICTRACE") != NULL;
+    }
+    return on;
+}
 
 extern CPUState *getMainCpuEnv(void);
 
@@ -144,14 +164,26 @@ static void pl192_update(PL192State *s)
    lately. */
 static inline void pl192_mask_priority(PL192State *s)
 {
-    if (s->stack_i >= PL192_INT_SOURCES) {
-        hw_error("pl192: internal error (trying to mask when there are no more sources)\n");
+    /*
+     * The stack holds PL192_PRIO_LEVELS + 1 entries; the old guard compared
+     * against PL192_INT_SOURCES (32) and let a guest that read VECTADDR more
+     * than 16 times without an EOI write past both arrays into priority,
+     * daisy_vectaddr and the qemu_irq pointers (Q3).
+     */
+    if (s->stack_i >= PL192_PRIO_LEVELS) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "pl192: priority stack full (%d levels)\n",
+                      PL192_PRIO_LEVELS);
+        return;
     }
     s->stack_i++;
     if (s->current == PL192_DAISY_IRQ) {
         s->priority = s->daisy_priority;
-    } else {
+    } else if (s->current < PL192_INT_SOURCES) {
         s->priority = s->vect_priority[s->current];
+    } else {
+        /* Nothing pending (PL192_NO_IRQ): never index past the array. */
+        s->priority = 0;
     }
     s->priority_stack[s->stack_i] = s->priority;
     s->irq_stack[s->stack_i] = s->current;
@@ -176,8 +208,8 @@ static uint32_t pl192_irq_ack(PL192State *s)
     int is_daisy = (s->current_highest == PL192_DAISY_IRQ);
     uint32_t res = s->address;
 
-    if (getenv("VICACK")) {
-        static int dbg_n;
+    if (pl192_vicack_on()) {
+        static uint64_t dbg_n;
         if (dbg_n < 40 || (dbg_n % 20000) == 0) {
             fprintf(stderr, "VICACK %s src=%u addr=0x%08x status=0x%08x "
                     "prio=0x%x stack_i=%d\n", s->iomem.name,
@@ -185,6 +217,14 @@ static uint32_t pl192_irq_ack(PL192State *s)
                     s->stack_i);
         }
         dbg_n++;
+    }
+    if (!is_daisy && s->current_highest >= PL192_INT_SOURCES) {
+        /*
+         * A read with no interrupt pending (VECTADDR or SOFTINTCLEAR
+         * falling through here) must return the default vector without
+         * pushing the stack (Q3).
+         */
+        return res;
     }
     s->current = s->current_highest;
     pl192_mask_priority(s);
@@ -283,12 +323,18 @@ static void pl192_write(void *opaque, hwaddr offset, uint64_t value, unsigned si
     PL192State *s = (PL192State *) opaque;
 
     if (offset & 3) {
-        hw_error("pl192: bad write offset (1) " HWADDR_FMT_plx "\n", offset);
+        /* A guest register write must not abort QEMU (Q22). */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "pl192: unaligned write at 0x" HWADDR_FMT_plx "\n",
+                      offset);
+        return;
     }
 
     if (offset >= 0xfe0 && offset < 0x1000) {
-        hw_error("pl192: attempt to write to a read-only register (offset = "
-                 HWADDR_FMT_plx ")\n", offset);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "pl192: write to a read-only register at 0x"
+                      HWADDR_FMT_plx "\n", offset);
+        return;
     }
     if (offset >= 0x100 && offset < 0x180) {
         s->vect_addr[(offset - 0x100) >> 2] = value;
@@ -308,8 +354,9 @@ static void pl192_write(void *opaque, hwaddr offset, uint64_t value, unsigned si
             return;
         case PL192_FIQSTATUS:
         case PL192_RAWINTR:
-            hw_error("pl192: attempt to write to a read-only register (offset = "
-                     HWADDR_FMT_plx ")\n", offset);
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "pl192: write to a read-only register at 0x"
+                          HWADDR_FMT_plx "\n", offset);
             break;
         case PL192_INTSELECT:
             s->intselect = value;
@@ -357,7 +404,7 @@ static void pl192_irq_handler(void *opaque, int irq, int level)
 {
     PL192State *s = (PL192State *) opaque;
 
-    if (getenv("VICTRACE")) {
+    if (pl192_victrace_on()) {
         fprintf(stderr, "VICTRACE %s src %d -> %d\n",
                 s->iomem.name, irq, level);
     }
@@ -402,18 +449,18 @@ static int pl192_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_pl192 = {
     .name = "pl192",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = pl192_post_load,
     .fields = (VMStateField[]) {
         /*
-         * rawintr, irq_status and fiq_status are derived from the input line
-         * levels and the registers below; they are not state. Restoring
-         * rawintr keeps a bit whose device no longer asserts (a UART whose
-         * line is not re-driven, for example) and the guest then takes an
-         * interrupt it can never clear. Devices re-assert their lines from
-         * their own post_load and pl192_post_load recomputes the rest.
+         * irq_status and fiq_status are derived and recomputed in post_load,
+         * but the input line levels are not migrated by QEMU: rawintr is the
+         * only record of an interrupt asserted at the save point, so it has
+         * to be restored (Q7).  Devices that can change a line are expected
+         * to re-drive it from their own post_load.
          */
+        VMSTATE_UINT32_V(rawintr, PL192State, 2),
         VMSTATE_UINT32(intselect, PL192State),
         VMSTATE_UINT32(intenable, PL192State),
         VMSTATE_UINT32(softint, PL192State),

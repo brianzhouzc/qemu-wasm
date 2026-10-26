@@ -34,9 +34,16 @@
 unsigned long wasm_tb_compiled_count;
 
 static int instantiate_num = INSTANTIATE_NUM;
+/*
+ * Set when the machine explicitly asked for a JIT threshold (the
+ * wasm-instantiate property).  An explicit value wins over the icount
+ * default below (Q8).
+ */
+static bool instantiate_set;
 
 void wasm_set_instantiate_num(int n)
 {
+    instantiate_set = true;
     if (n > 0) {
         instantiate_num = n;
     }
@@ -273,17 +280,14 @@ void init_wasm32()
         initdone = true;
 
         /*
-         * The Wasm JIT and -icount do not mix yet.
-         *
-         * With -icount and the JIT on, the emulated iPod Classic sometimes
-         * branches into kernel data a few million instructions into the
-         * boot (a prefetch abort that our CFW turns into its panic screen),
-         * while the same guest under the TCI interpreter keeps running.
-         * The JIT is only exercised without icount until that is fixed;
-         * icount is what makes the click wheel and the timers usable, so
-         * correctness wins over speed here.
+         * Under -icount the JIT is off by default: an audit of the JIT under
+         * icount never happened (the earlier failures may or may not be
+         * fixed by a6bd842 and 9893dbf), and icount is what makes the wheel
+         * and the timers usable, so correctness wins over speed.  An
+         * explicit wasm-instantiate=N still wins, so the JIT can be tried
+         * without patching the tree (Q8).
          */
-        if (icount_enabled()) {
+        if (icount_enabled() && !instantiate_set) {
             instantiate_num = INT32_MAX;
         }
     }

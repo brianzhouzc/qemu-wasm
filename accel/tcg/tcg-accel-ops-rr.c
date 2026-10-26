@@ -121,6 +121,14 @@ static void rr_wait_io_event(void)
 
     while (all_cpu_threads_idle()) {
         rr_stop_kick_timer();
+        /*
+         * Q9: the bounded emscripten_thread_sleep() poll used by
+         * qemu_wait_io_event() was tried here as well, and it stalls the
+         * icount boot: the guest halts in its idle loop at about 38 M
+         * instructions and never wakes (the virtual clock keeps advancing).
+         * The condition variable works on this path, so it stays; the
+         * bounded poll is only for the non-RR vCPU threads.
+         */
         qemu_cond_wait_iothread(first_cpu->halt_cond);
     }
 

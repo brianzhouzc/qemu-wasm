@@ -21,10 +21,11 @@
  *    both before the wheel task runs once, in which case the task sees only
  *    the second, decides it is a first touch, and throws the movement away.
  *
- * WHEELTRACE=1 announces the first command, the first packet and the first
- * time the line is raised, and prints totals at exit -- announcing the first
- * of each rather than every one, because stderr is where the firmware's own
- * semihosting output goes and it has to stay readable.
+ * WHEELTRACE=1 announces the first command, the first packet, the first key
+ * and the first time the line is raised, and prints totals at exit --
+ * announcing the first of each rather than every one, because stderr is where
+ * the firmware's own semihosting output goes and it has to stay readable.
+ * WHEELTRACE=2 is the verbose form: every line change and every key.
  */
 
 #include "qemu/osdep.h"
@@ -51,6 +52,17 @@ static uint64_t wheel_packets;      /* event and reply words queued */
 static uint64_t wheel_dropped;      /* words lost because the FIFO was full */
 static uint64_t wheel_commands;     /* WHEELGO kicks */
 static uint64_t wheel_irq_raises;   /* rising edges on IRQ 23 */
+
+static bool wheel_trace_verbose(void)
+{
+    static int verbose = -1;
+
+    if (verbose < 0) {
+        const char *e = getenv("WHEELTRACE");
+        verbose = e && e[0] == '2';
+    }
+    return verbose;
+}
 
 static bool wheel_trace_on(void)
 {
@@ -98,9 +110,15 @@ static void wheel_update_irq(IPodClassicWheelState *s)
 {
     bool level = (wheel_pend_value(s) & s->mask & S5L8702_WHEEL_PEND_ALL) != 0;
 
-    if (level != s->irq_level && wheel_trace_on()) {
-        fprintf(stderr, "WHEELTRACE irq 23 -> %d (pend 0x%x, mask 0x%x)\n",
-                level, wheel_pend_value(s), s->mask);
+    if (level != s->irq_level) {
+        static bool irq_traced;
+
+        if (wheel_trace_verbose() ||
+            (level && !irq_traced && wheel_trace_on())) {
+            fprintf(stderr, "WHEELTRACE irq 23 -> %d (pend 0x%x, mask 0x%x)\n",
+                    level, wheel_pend_value(s), s->mask);
+            irq_traced = true;
+        }
     }
     if (level && !s->irq_level) {
         wheel_irq_raises++;
@@ -142,7 +160,11 @@ static uint32_t wheel_fifo_pop(IPodClassicWheelState *s)
 #ifdef EMSCRIPTEN
     if (s->wasm_release_at &&
         ((word >> S5L8702_WHEEL_BTN_SHIFT) & s->wasm_press_mask)) {
-        s->wasm_ack = 1;
+        /*
+         * A monotonic counter, not a flag: a flag can be missed between two
+         * polls and is cleared again by the release (Q12).
+         */
+        s->wasm_consumed = qatomic_read(&s->wasm_consumed) + 1;
     }
 #endif
     wheel_update_irq(s);
@@ -260,9 +282,9 @@ static void wheel_tick(void *opaque)
 
 #ifdef EMSCRIPTEN
     if (s->wasm_release_at && now >= s->wasm_release_at &&
-        (s->wasm_ack || now >= s->wasm_release_cap)) {
+        (qatomic_read(&s->wasm_consumed) != s->wasm_consumed0 ||
+         now >= s->wasm_release_cap)) {
         s->wasm_release_at = 0;
-        s->wasm_ack = 0;
         wheel_key_event(s, s->wasm_keycode | 0x80);
     }
 #endif
@@ -297,6 +319,15 @@ static void wheel_tick(void *opaque)
                       % S5L8702_WHEEL_POSITIONS;
         s->pending_steps -= step;
         wheel_send_event(s);
+        /*
+         * The wheel keys do not change the button state, so the packet that
+         * pays out the last pending step is what "consumes" a detent (Q12).
+         */
+        if (s->wasm_release_at && s->pending_steps == 0 &&
+            ((s->wasm_keycode & 0x7f) == 0x12 ||   /* cw */
+             (s->wasm_keycode & 0x7f) == 0x10)) {  /* ccw */
+            s->wasm_consumed = qatomic_read(&s->wasm_consumed) + 1;
+        }
     } else if (s->touched && now >= s->untouch_at) {
         /*
          * The finger comes off. This is not cosmetic: the ISR uses an
@@ -355,12 +386,15 @@ static void wheel_tick(void *opaque)
 
 static void wheel_key_event(void *opaque, int keycode)
 {
+    static bool key_traced;
     IPodClassicWheelState *s = opaque;
     bool released = (keycode & 0x80) != 0;
     uint32_t bit;
 
-    if (wheel_trace_on()) {
+    if (wheel_trace_verbose() ||
+        (!key_traced && wheel_trace_on())) {
         fprintf(stderr, "WHEELTRACE key 0x%02x\n", keycode);
+        key_traced = true;
     }
 
     /*
@@ -581,70 +615,109 @@ static int wheel_env_int(const char *name, int def, int lo, int hi)
 static IPodClassicWheelState *wasm_wheel_state;
 
 /*
+ * The page runs on its own thread and must not execute QEMU code, take the
+ * BQL or arm timers there (Q11).  It only fills this mailbox and wakes the
+ * main loop; the bottom half does the work with the BQL held, exactly like
+ * ipod_snapshot_request().
+ */
+static void wasm_key_do_press(IPodClassicWheelState *s, int keycode,
+                              int hold_ms)
+{
+    /*
+     * A wall-clock wait between two presses can be shorter than the previous
+     * press's guest-time hold, and a new deadline would overwrite the pending
+     * release and leave the button down. Release the previous key first, so
+     * every press has a down and an up.
+     */
+    if (s->wasm_release_at) {
+        s->wasm_release_at = 0;
+        wheel_key_event(s, s->wasm_keycode | 0x80);
+    }
+    wheel_key_event(s, keycode);
+    s->wasm_keycode = keycode;
+    s->wasm_press_mask = s->buttons;
+    s->wasm_consumed0 = qatomic_read(&s->wasm_consumed);
+    s->wasm_release_at = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                         (int64_t)hold_ms * 1000000;
+    s->wasm_release_cap = s->wasm_release_at + 1000 * 1000000;
+
+    /*
+     * Keep the wheel ticking until the release deadline.  The tick only
+     * reschedules while there is something to send, so if its repeat window
+     * ends first the release never happens and the button stays down for the
+     * guest -- which drops every later press.
+     */
+    if (s->button_repeat_until < s->wasm_release_at) {
+        s->button_repeat_until = s->wasm_release_at;
+    }
+}
+
+static void wasm_key_bh_fn(void *opaque)
+{
+    IPodClassicWheelState *s = opaque;
+    uint32_t tail = qatomic_read(&s->wasm_key_tail);
+
+    while (tail != qatomic_load_acquire(&s->wasm_key_head)) {
+        uint32_t slot = tail % 8;
+        int op = s->wasm_key_ring[slot].op;
+        int arg = s->wasm_key_ring[slot].arg;
+        int hold = s->wasm_key_ring[slot].hold;
+
+        qatomic_store_release(&s->wasm_key_tail, tail + 1);
+        if (op == 2) {
+            wheel_key_event(s, arg);
+        } else if (op == 1) {
+            wasm_key_do_press(s, arg, hold);
+        }
+        tail++;
+    }
+}
+
+static void wasm_key_queue(int op, int keycode, int hold_ms)
+{
+    IPodClassicWheelState *s = wasm_wheel_state;
+    uint32_t head, tail;
+
+    if (!s || !s->wasm_key_bh) {
+        return;
+    }
+    head = qatomic_read(&s->wasm_key_head);
+    tail = qatomic_read(&s->wasm_key_tail);
+    if (head - tail >= 8) {
+        return;              /* full: drop, like a lost click */
+    }
+    s->wasm_key_ring[head % 8].op = op;
+    s->wasm_key_ring[head % 8].arg = keycode;
+    s->wasm_key_ring[head % 8].hold = hold_ms;
+    qatomic_store_release(&s->wasm_key_head, head + 1);
+    qemu_bh_schedule(s->wasm_key_bh);
+    qemu_notify_event();
+}
+
+/*
  * Press a key and release it after hold_ms of *guest* time.  A wall-clock
  * hold is unreliable under -icount sleep=off: the virtual clock can outrun
  * the host while the guest is idle, so a 150 ms wall hold may span almost no
  * guest time and the guest never samples the button.  The release is done by
- * the wheel's own tick timer, because the page thread must not create or
- * arm QEMU timers (Emscripten pthread atomics trap there).
+ * the wheel's own tick timer, in guest time.
  */
 EMSCRIPTEN_KEEPALIVE void ipod_wasm_key_press(int keycode, int hold_ms)
 {
-    qemu_mutex_lock_iothread();
-    if (wasm_wheel_state) {
-        /*
-         * A wall-clock wait between two presses can be shorter than the
-         * previous press's guest-time hold, and a new deadline would
-         * overwrite the pending release and leave the button down. Release
-         * the previous key first, so every press has a down and an up.
-         */
-        if (wasm_wheel_state->wasm_release_at) {
-            wasm_wheel_state->wasm_release_at = 0;
-            wheel_key_event(wasm_wheel_state,
-                            wasm_wheel_state->wasm_keycode | 0x80);
-        }
-        wheel_key_event(wasm_wheel_state, keycode);
-        wasm_wheel_state->wasm_keycode = keycode;
-        wasm_wheel_state->wasm_press_mask = wasm_wheel_state->buttons;
-        wasm_wheel_state->wasm_ack = 0;
-        wasm_wheel_state->wasm_release_at =
-            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-            (int64_t)hold_ms * 1000000;
-        wasm_wheel_state->wasm_release_cap =
-            wasm_wheel_state->wasm_release_at + 1000 * 1000000;
-
-        /*
-         * Keep the wheel ticking until the release deadline.  The tick only
-         * reschedules while there is something to send, so if its repeat
-         * window ends first the release never happens and the button stays
-         * down for the guest -- which drops every later press.
-         */
-        if (wasm_wheel_state->button_repeat_until <
-            wasm_wheel_state->wasm_release_at) {
-            wasm_wheel_state->button_repeat_until =
-                wasm_wheel_state->wasm_release_at;
-        }
-    }
-    qemu_mutex_unlock_iothread();
+    wasm_key_queue(1, keycode, hold_ms);
 }
 
 EMSCRIPTEN_KEEPALIVE int ipod_wasm_key_ack(void)
 {
-    return wasm_wheel_state ? wasm_wheel_state->wasm_ack : 0;
+    return wasm_wheel_state ?
+        (int)qatomic_read(&wasm_wheel_state->wasm_consumed) : 0;
 }
 
 EMSCRIPTEN_KEEPALIVE void ipod_wasm_key(int keycode)
 {
-    /*
-     * Called from the page's main thread: the handler touches the FIFO and
-     * raises an IRQ, so it must hold the BQL like any main-loop input.
-     */
-    qemu_mutex_lock_iothread();
-    if (wasm_wheel_state) {
-        wheel_key_event(wasm_wheel_state, keycode);
-    }
-    qemu_mutex_unlock_iothread();
+    /* Raw press/release event; queued like any other browser key (Q11). */
+    wasm_key_queue(2, keycode, 0);
 }
+
 #endif
 
 static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
@@ -682,6 +755,7 @@ static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
     qemu_add_kbd_event_handler(wheel_key_event, s);
 #ifdef EMSCRIPTEN
     wasm_wheel_state = s;
+    s->wasm_key_bh = qemu_bh_new(wasm_key_bh_fn, s);
 #endif
 }
 
@@ -702,15 +776,54 @@ static int wheel_post_load(void *opaque, int version_id)
     return 0;
 }
 
+#ifdef EMSCRIPTEN
+/*
+ * A snapshot taken while a browser key is held would otherwise come back with
+ * the button bit set and no release scheduled (Q20).  Only the wasm build has
+ * these fields, so they are a subsection of their own (S9).
+ */
+static const VMStateDescription vmstate_ipod_classic_wheel_wasm = {
+    /*
+     * QEMU only accepts a subsection whose name starts with the parent
+     * description name (the wheel's is "s5l8702.wheel"); anything else is
+     * left unconsumed and the parent footer check fails.
+     */
+    .name = "s5l8702.wheel.wasm",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_INT32(wasm_keycode, IPodClassicWheelState),
+        VMSTATE_INT64(wasm_release_at, IPodClassicWheelState),
+        VMSTATE_INT64(wasm_release_cap, IPodClassicWheelState),
+        VMSTATE_UINT32(wasm_press_mask, IPodClassicWheelState),
+        VMSTATE_UINT32(wasm_consumed, IPodClassicWheelState),
+        VMSTATE_UINT32(wasm_consumed0, IPodClassicWheelState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+#endif
+
 static const VMStateDescription vmstate_ipod_classic_wheel = {
     .name = TYPE_IPOD_CLASSIC_WHEEL,
     /*
      * Bumped to 2 when button_repeat_until joined the field list. Nothing
      * migrates this machine today, so the old format is not kept alive.
      */
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .post_load = wheel_post_load,
+#ifdef EMSCRIPTEN
+    /*
+     * The browser-only fields are a wasm-only subsection (T1): sending them
+     * from the main description keeps native and wasm version-3 streams
+     * compatible, and a cross load fails on an unknown subsection instead of
+     * misparsing.
+     */
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_ipod_classic_wheel_wasm,
+        NULL,
+    },
+#endif
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(con, IPodClassicWheelState),
         VMSTATE_UINT32(go, IPodClassicWheelState),

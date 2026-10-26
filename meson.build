@@ -323,7 +323,7 @@ ucontext_probe = '''
 # The discriminator is the CPU family: QEMU's own Emscripten cross file leaves
 # the system name as "linux".
 supported_backends = []
-if host_machine.cpu_family() == 'wasm32'
+if host_machine.cpu_family().startswith('wasm')
   supported_backends += ['fiber']
 endif
 if targetos == 'windows'

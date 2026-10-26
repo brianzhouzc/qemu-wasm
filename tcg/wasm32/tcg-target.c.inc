@@ -1384,7 +1384,8 @@ static void tcg_wasm_out_movcond_i64(TCGContext *s, TCGCond cond, TCGReg ret,
     tcg_wasm_out_op_global_set_r(s, ret);
 }
 
-static void tcg_wasm_out_add2(TCGContext *s, TCGReg retl, TCGReg reth,
+static void tcg_wasm_out_add2(TCGContext *s, TCGType type,
+                             TCGReg retl, TCGReg reth,
                              TCGReg al, TCGReg ah, TCGReg bl, TCGReg bh)
 {
     /*
@@ -1393,7 +1394,45 @@ static void tcg_wasm_out_add2(TCGContext *s, TCGReg retl, TCGReg reth,
      * mask every input and output: the previous version left the low sum
      * untruncated (up to 33 bits), which made the ADCS carry -- and every
      * flag derived from it -- wrong.
+     *
+     * The same helper serves add2_i64 (TCG_TARGET_REG_BITS is 64), where the
+     * halves are full 64-bit values and the masking above is wrong: those
+     * get the plain 64-bit sequence and a carry from an unsigned compare
+     * (Q4).  The 32-bit ARM guest never emits add2_i64, but the backend is
+     * shared with 64-bit guests.
      */
+    if (type == TCG_TYPE_I64) {
+        /* high sum */
+        tcg_wasm_out_op_global_get_r(s, ah);
+        tcg_wasm_out_op_global_get_r(s, bh);
+        tcg_wasm_out_op_i64_add(s);
+        tcg_wasm_out_op_local_set(s, TMP64_0_IDX);
+
+        /* low sum */
+        tcg_wasm_out_op_global_get_r(s, al);
+        tcg_wasm_out_op_global_get_r(s, bl);
+        tcg_wasm_out_op_i64_add(s);
+        tcg_wasm_out_op_local_set(s, TMP64_1_IDX);
+
+        /*
+         * Carry first: reth may alias al, so reading al after a global store
+         * would compare the low sum with itself and lose the carry (S2).
+         */
+        tcg_wasm_out_op_local_get(s, TMP64_1_IDX);
+        tcg_wasm_out_op_global_get_r(s, al);
+        tcg_wasm_out_op_i64_lt_u(s);
+        tcg_wasm_out_op_i64_extend_i32_u(s);
+
+        /* reth = high sum + carry */
+        tcg_wasm_out_op_local_get(s, TMP64_0_IDX);
+        tcg_wasm_out_op_i64_add(s);
+        tcg_wasm_out_op_global_set_r(s, reth);
+
+        /* low sum to its destination, after al has been consumed */
+        tcg_wasm_out_op_local_get(s, TMP64_1_IDX);
+        tcg_wasm_out_op_global_set_r(s, retl);
+        return;
+    }
     /* high sum: (ah & 0xffffffff) + (bh & 0xffffffff) */
     tcg_wasm_out_op_global_get_r(s, ah);
     tcg_wasm_out_op_i64_const(s, 0xffffffffu);
@@ -1588,16 +1627,18 @@ static void tcg_wasm_out_extract(TCGContext *s, TCGReg dest, TCGReg arg1, int po
         tcg_wasm_out_op_i64_const(s, 0xffffffffu);
         tcg_wasm_out_op_i64_and(s);
     }
+    if (sign && type == TCG_TYPE_I32) {
+        /*
+         * After the 32-bit wrap the field's sign bit is bit 31, not bit 63,
+         * so sign-extend it to 64 bits before the arithmetic shift.  This
+         * has to happen before the shift amount is pushed: i64.extend_i32_s
+         * consumes the top of the stack, which used to be rs (Q5).
+         */
+        tcg_wasm_out_op_i32_wrap_i64(s);
+        tcg_wasm_out_op_i64_extend_i32_s(s);
+    }
     tcg_wasm_out_op_i64_const(s, rs);
     if (sign) {
-        if (type == TCG_TYPE_I32) {
-            /*
-             * After the 32-bit wrap the field's sign bit is bit 31, not bit
-             * 63, so sign-extend it to 64 bits before the arithmetic shift;
-             * otherwise the result is zero-extended.
-             */
-            tcg_wasm_out_op_i64_extend_i32_s(s);
-        }
         tcg_wasm_out_op_i64_shr_s(s);
     } else {
         tcg_wasm_out_op_i64_shr_u(s);
@@ -3310,7 +3351,8 @@ static void tcg_out_add2(TCGContext *s, TCGOpcode opc, TCGReg retl, TCGReg reth,
                          TCGReg al, TCGReg ah, TCGReg bl, TCGReg bh)
 {
     tcg_tci_out_op_rrrrrr(s, opc, retl, reth, al, ah, bl, bh);
-    tcg_wasm_out_add2(s, retl, reth, al, ah, bl, bh);
+    tcg_wasm_out_add2(s, opc == INDEX_op_add2_i32 ? TCG_TYPE_I32 : TCG_TYPE_I64,
+                      retl, reth, al, ah, bl, bh);
 }
 static void tcg_out_sub2(TCGContext *s, TCGOpcode opc, TCGReg retl, TCGReg reth,
                          TCGReg al, TCGReg ah, TCGReg bl, TCGReg bh)

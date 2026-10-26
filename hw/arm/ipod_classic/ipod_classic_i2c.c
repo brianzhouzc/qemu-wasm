@@ -298,7 +298,7 @@ static void ipod_classic_i2c_init(Object *obj)
 
 static const VMStateDescription vmstate_ipod_classic_i2c = {
     .name = TYPE_IPOD_CLASSIC_I2C,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(iiccon, IPodClassicI2CState),
@@ -308,6 +308,8 @@ static const VMStateDescription vmstate_ipod_classic_i2c = {
         VMSTATE_UINT32(iicunk14, IPodClassicI2CState),
         VMSTATE_UINT32(iicunk18, IPodClassicI2CState),
         VMSTATE_UINT32(iicstat2, IPodClassicI2CState),
+        /* A save between the IICDS write and the go bit (Q20). */
+        VMSTATE_BOOL_V(iicds_new, IPodClassicI2CState, 2),
         VMSTATE_BOOL(byte_done, IPodClassicI2CState),
         VMSTATE_BOOL(in_address, IPodClassicI2CState),
         VMSTATE_TIMER_PTR(byte_timer, IPodClassicI2CState),
