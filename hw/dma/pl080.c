@@ -199,8 +199,12 @@ again:
             }
             flow = (ch->conf >> 11) & 7;
             if (flow >= 4) {
-                hw_error(
-                    "pl080_run: Peripheral flow control not implemented\n");
+                /* Guest data reached an unimplemented mode: ignore, do not
+                 * abort the emulator (Q22). */
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "pl080_run: peripheral flow control %u not "
+                              "implemented\n", flow);
+                return;
             }
             src_id = (ch->conf >> 1) & 0x1f;
             dest_id = (ch->conf >> 6) & 0x1f;

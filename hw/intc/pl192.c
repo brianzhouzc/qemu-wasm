@@ -323,12 +323,18 @@ static void pl192_write(void *opaque, hwaddr offset, uint64_t value, unsigned si
     PL192State *s = (PL192State *) opaque;
 
     if (offset & 3) {
-        hw_error("pl192: bad write offset (1) " HWADDR_FMT_plx "\n", offset);
+        /* A guest register write must not abort QEMU (Q22). */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "pl192: unaligned write at 0x" HWADDR_FMT_plx "\n",
+                      offset);
+        return;
     }
 
     if (offset >= 0xfe0 && offset < 0x1000) {
-        hw_error("pl192: attempt to write to a read-only register (offset = "
-                 HWADDR_FMT_plx ")\n", offset);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "pl192: write to a read-only register at 0x"
+                      HWADDR_FMT_plx "\n", offset);
+        return;
     }
     if (offset >= 0x100 && offset < 0x180) {
         s->vect_addr[(offset - 0x100) >> 2] = value;
@@ -348,8 +354,9 @@ static void pl192_write(void *opaque, hwaddr offset, uint64_t value, unsigned si
             return;
         case PL192_FIQSTATUS:
         case PL192_RAWINTR:
-            hw_error("pl192: attempt to write to a read-only register (offset = "
-                     HWADDR_FMT_plx ")\n", offset);
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "pl192: write to a read-only register at 0x"
+                          HWADDR_FMT_plx "\n", offset);
             break;
         case PL192_INTSELECT:
             s->intselect = value;
