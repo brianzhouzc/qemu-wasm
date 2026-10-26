@@ -312,6 +312,11 @@ struct IPodClassicWheelState {
     uint32_t wasm_press_mask;
     uint32_t wasm_consumed;      /* presses the guest has consumed */
     uint32_t wasm_consumed0;     /* counter value when the press started */
+    /* Mailbox: the page queues a key, the main loop's BH performs it (Q11). */
+    QEMUBH *wasm_key_bh;
+    int32_t wasm_key_op;         /* 1 = press with hold, 2 = raw key */
+    int32_t wasm_key_arg;
+    int32_t wasm_key_hold;
 #endif
 
     MemoryRegion iomem;

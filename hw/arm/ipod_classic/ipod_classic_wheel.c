@@ -594,52 +594,79 @@ static int wheel_env_int(const char *name, int def, int lo, int hi)
 static IPodClassicWheelState *wasm_wheel_state;
 
 /*
+ * The page runs on its own thread and must not execute QEMU code, take the
+ * BQL or arm timers there (Q11).  It only fills this mailbox and wakes the
+ * main loop; the bottom half does the work with the BQL held, exactly like
+ * ipod_snapshot_request().
+ */
+static void wasm_key_bh_fn(void *opaque)
+{
+    IPodClassicWheelState *s = opaque;
+    int op = qatomic_read(&s->wasm_key_op);
+    int keycode = qatomic_read(&s->wasm_key_arg);
+    int hold_ms = qatomic_read(&s->wasm_key_hold);
+
+    if (!op) {
+        return;
+    }
+    if (op == 2) {
+        wheel_key_event(s, keycode);
+        return;
+    }
+
+    /*
+     * A wall-clock wait between two presses can be shorter than the previous
+     * press's guest-time hold, and a new deadline would overwrite the pending
+     * release and leave the button down. Release the previous key first, so
+     * every press has a down and an up.
+     */
+    if (s->wasm_release_at) {
+        s->wasm_release_at = 0;
+        wheel_key_event(s, s->wasm_keycode | 0x80);
+    }
+    wheel_key_event(s, keycode);
+    s->wasm_keycode = keycode;
+    s->wasm_press_mask = s->buttons;
+    s->wasm_consumed0 = qatomic_read(&s->wasm_consumed);
+    s->wasm_release_at = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                         (int64_t)hold_ms * 1000000;
+    s->wasm_release_cap = s->wasm_release_at + 1000 * 1000000;
+
+    /*
+     * Keep the wheel ticking until the release deadline.  The tick only
+     * reschedules while there is something to send, so if its repeat window
+     * ends first the release never happens and the button stays down for the
+     * guest -- which drops every later press.
+     */
+    if (s->button_repeat_until < s->wasm_release_at) {
+        s->button_repeat_until = s->wasm_release_at;
+    }
+}
+
+static void wasm_key_queue(int op, int keycode, int hold_ms)
+{
+    IPodClassicWheelState *s = wasm_wheel_state;
+
+    if (!s || !s->wasm_key_bh) {
+        return;
+    }
+    qatomic_set(&s->wasm_key_op, op);
+    qatomic_set(&s->wasm_key_arg, keycode);
+    qatomic_set(&s->wasm_key_hold, hold_ms);
+    qemu_bh_schedule(s->wasm_key_bh);
+    qemu_notify_event();
+}
+
+/*
  * Press a key and release it after hold_ms of *guest* time.  A wall-clock
  * hold is unreliable under -icount sleep=off: the virtual clock can outrun
  * the host while the guest is idle, so a 150 ms wall hold may span almost no
  * guest time and the guest never samples the button.  The release is done by
- * the wheel's own tick timer, because the page thread must not create or
- * arm QEMU timers (Emscripten pthread atomics trap there).
+ * the wheel's own tick timer, in guest time.
  */
 EMSCRIPTEN_KEEPALIVE void ipod_wasm_key_press(int keycode, int hold_ms)
 {
-    qemu_mutex_lock_iothread();
-    if (wasm_wheel_state) {
-        /*
-         * A wall-clock wait between two presses can be shorter than the
-         * previous press's guest-time hold, and a new deadline would
-         * overwrite the pending release and leave the button down. Release
-         * the previous key first, so every press has a down and an up.
-         */
-        if (wasm_wheel_state->wasm_release_at) {
-            wasm_wheel_state->wasm_release_at = 0;
-            wheel_key_event(wasm_wheel_state,
-                            wasm_wheel_state->wasm_keycode | 0x80);
-        }
-        wheel_key_event(wasm_wheel_state, keycode);
-        wasm_wheel_state->wasm_keycode = keycode;
-        wasm_wheel_state->wasm_press_mask = wasm_wheel_state->buttons;
-        wasm_wheel_state->wasm_consumed0 =
-            qatomic_read(&wasm_wheel_state->wasm_consumed);
-        wasm_wheel_state->wasm_release_at =
-            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-            (int64_t)hold_ms * 1000000;
-        wasm_wheel_state->wasm_release_cap =
-            wasm_wheel_state->wasm_release_at + 1000 * 1000000;
-
-        /*
-         * Keep the wheel ticking until the release deadline.  The tick only
-         * reschedules while there is something to send, so if its repeat
-         * window ends first the release never happens and the button stays
-         * down for the guest -- which drops every later press.
-         */
-        if (wasm_wheel_state->button_repeat_until <
-            wasm_wheel_state->wasm_release_at) {
-            wasm_wheel_state->button_repeat_until =
-                wasm_wheel_state->wasm_release_at;
-        }
-    }
-    qemu_mutex_unlock_iothread();
+    wasm_key_queue(1, keycode, hold_ms);
 }
 
 EMSCRIPTEN_KEEPALIVE int ipod_wasm_key_ack(void)
@@ -650,16 +677,10 @@ EMSCRIPTEN_KEEPALIVE int ipod_wasm_key_ack(void)
 
 EMSCRIPTEN_KEEPALIVE void ipod_wasm_key(int keycode)
 {
-    /*
-     * Called from the page's main thread: the handler touches the FIFO and
-     * raises an IRQ, so it must hold the BQL like any main-loop input.
-     */
-    qemu_mutex_lock_iothread();
-    if (wasm_wheel_state) {
-        wheel_key_event(wasm_wheel_state, keycode);
-    }
-    qemu_mutex_unlock_iothread();
+    /* Raw press/release event; queued like any other browser key (Q11). */
+    wasm_key_queue(2, keycode, 0);
 }
+
 #endif
 
 static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
@@ -697,6 +718,7 @@ static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
     qemu_add_kbd_event_handler(wheel_key_event, s);
 #ifdef EMSCRIPTEN
     wasm_wheel_state = s;
+    s->wasm_key_bh = qemu_bh_new(wasm_key_bh_fn, s);
 #endif
 }
 
