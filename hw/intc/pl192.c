@@ -144,14 +144,26 @@ static void pl192_update(PL192State *s)
    lately. */
 static inline void pl192_mask_priority(PL192State *s)
 {
-    if (s->stack_i >= PL192_INT_SOURCES) {
-        hw_error("pl192: internal error (trying to mask when there are no more sources)\n");
+    /*
+     * The stack holds PL192_PRIO_LEVELS + 1 entries; the old guard compared
+     * against PL192_INT_SOURCES (32) and let a guest that read VECTADDR more
+     * than 16 times without an EOI write past both arrays into priority,
+     * daisy_vectaddr and the qemu_irq pointers (Q3).
+     */
+    if (s->stack_i >= PL192_PRIO_LEVELS) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "pl192: priority stack full (%d levels)\n",
+                      PL192_PRIO_LEVELS);
+        return;
     }
     s->stack_i++;
     if (s->current == PL192_DAISY_IRQ) {
         s->priority = s->daisy_priority;
-    } else {
+    } else if (s->current < PL192_INT_SOURCES) {
         s->priority = s->vect_priority[s->current];
+    } else {
+        /* Nothing pending (PL192_NO_IRQ): never index past the array. */
+        s->priority = 0;
     }
     s->priority_stack[s->stack_i] = s->priority;
     s->irq_stack[s->stack_i] = s->current;
@@ -185,6 +197,14 @@ static uint32_t pl192_irq_ack(PL192State *s)
                     s->stack_i);
         }
         dbg_n++;
+    }
+    if (!is_daisy && s->current_highest >= PL192_INT_SOURCES) {
+        /*
+         * A read with no interrupt pending (VECTADDR or SOFTINTCLEAR
+         * falling through here) must return the default vector without
+         * pushing the stack (Q3).
+         */
+        return res;
     }
     s->current = s->current_highest;
     pl192_mask_priority(s);
