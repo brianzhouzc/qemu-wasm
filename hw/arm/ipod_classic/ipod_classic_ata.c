@@ -152,14 +152,14 @@ static int32_t ipod_classic_ata_dma_prepare_buf(const IDEDMA *dma,
             !(s->reg[S5L8702_ATA_CFG / 4] & S5L8702_ATA_CFG_WRITE)) {
             static uint64_t rd_ops, rd_bytes;
             /*
-             * Comprobar que los bytes ATERRIZAN. Saber que se lee el sector
-             * correcto no dice que el dato llegue a la memoria del invitado: si
-             * el destino esta mal, el parser ve basura y el reproductor aborta
-             * -- que es exactamente el sintoma. Leer el destino de la
-             * transferencia ANTERIOR (esta ya ha terminado cuando llega la
-             * siguiente) y publicar sus primeras palabras junto al sector del
-             * que venian. Un volcado por el monitor no sirve: los buferes se
-             * reutilizan en segundos.
+             * Check that the bytes LAND.  Knowing the right sector is read
+             * does not mean the data reaches guest memory: a wrong
+             * destination makes the parser see garbage and the player abort
+             * -- exactly the symptom.  Read the destination of the PREVIOUS
+             * transfer (this one has finished by the time the next arrives)
+             * and print its first words next to the sector they came from.
+             * A monitor dump does not help: the buffers are reused within
+             * seconds.
              */
             static uint32_t prev_dst;
             static int64_t prev_sec = -1;
@@ -173,20 +173,19 @@ static int32_t ipod_classic_ata_dma_prepare_buf(const IDEDMA *dma,
                         head[4], head[5], head[6], head[7]);
             }
             /*
-             * OJO: `s->dma_cur` ya se ha adelantado `len` bytes unas lineas mas
-             * arriba, asi que el principio de ESTA transferencia es
-             * `dma_cur - len`. Leer sin restarlo mira el final del bloque y
-             * devuelve ceros, que se lee igual que "el dato no llega" -- un
-             * falso positivo listo para colarse en una conclusion.
+             * NOTE: s->dma_cur has already advanced by len bytes a few lines
+             * above, so the start of THIS transfer is dma_cur - len.  Reading
+             * without subtracting looks at the end of the block and returns
+             * zeros, which reads the same as "the data does not arrive" -- a
+             * false positive ready to slip into a conclusion.
              */
             /*
-             * ANCLA DE TIEMPO DE REPRODUCCION. Todos los sitios con nombre del
-             * mapa heredado disparan tambien en el arranque, asi que no sirven
-             * para abrir una ventana de traza en el momento de reproducir. Una
-             * lectura de un sector DENTRO del fichero de la cancion si es
-             * exclusiva de la reproduccion: ATALBA_LO/HI acotan ese rango (en
-             * bytes) y aqui se publica el PC del invitado que la pidio, que es
-             * codigo del reproductor y sirve de punto de entrada fiable.
+             * PLAYBACK TIME ANCHOR.  Every named site of the inherited map
+             * also fires during boot, so none of them can open a trace window
+             * at playback time.  A read of a sector INSIDE the song file is
+             * exclusive to playback: ATALBA_LO/HI bound that range (in bytes)
+             * and the guest PC that asked for it is printed here -- player
+             * code, a reliable entry point.
              */
             {
                 const char *lo_s = getenv("ATALBA_LO");
