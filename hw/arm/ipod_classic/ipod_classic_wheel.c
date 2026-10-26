@@ -795,6 +795,18 @@ static const VMStateDescription vmstate_ipod_classic_wheel_wasm = {
         VMSTATE_UINT32(wasm_consumed0, IPodClassicWheelState),
         VMSTATE_END_OF_LIST()
     },
+#ifdef EMSCRIPTEN
+    /*
+     * The browser-only fields are a wasm-only subsection (S9): keeping them
+     * in the main list made native and wasm version-3 streams different, and
+     * a cross load would misparse instead of failing on an unknown
+     * subsection.
+     */
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_ipod_classic_wheel_wasm,
+        NULL,
+    },
+#endif
 };
 #endif
 
@@ -827,16 +839,6 @@ static const VMStateDescription vmstate_ipod_classic_wheel = {
         VMSTATE_INT64(untouch_at, IPodClassicWheelState),
         VMSTATE_INT64(button_repeat_until, IPodClassicWheelState),
         VMSTATE_TIMER_PTR(tick, IPodClassicWheelState),
-#ifdef EMSCRIPTEN
-        /*
-         * The browser-only fields are a wasm-only subsection (S9): keeping
-         * them in the main list made native and wasm version-3 streams
-         * different, and a cross load would misparse instead of failing on
-         * an unknown subsection.
-         */
-        VMSTATE_SUBSECTION(vmstate_ipod_classic_wheel_wasm,
-                           IPodClassicWheelState),
-#endif
         VMSTATE_END_OF_LIST()
     },
 };
