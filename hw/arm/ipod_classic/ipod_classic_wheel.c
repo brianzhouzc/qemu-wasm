@@ -776,6 +776,28 @@ static int wheel_post_load(void *opaque, int version_id)
     return 0;
 }
 
+#ifdef EMSCRIPTEN
+/*
+ * A snapshot taken while a browser key is held would otherwise come back with
+ * the button bit set and no release scheduled (Q20).  Only the wasm build has
+ * these fields, so they are a subsection of their own (S9).
+ */
+static const VMStateDescription vmstate_ipod_classic_wheel_wasm = {
+    .name = "ipod_classic.wheel.wasm",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_INT32(wasm_keycode, IPodClassicWheelState),
+        VMSTATE_INT64(wasm_release_at, IPodClassicWheelState),
+        VMSTATE_INT64(wasm_release_cap, IPodClassicWheelState),
+        VMSTATE_UINT32(wasm_press_mask, IPodClassicWheelState),
+        VMSTATE_UINT32(wasm_consumed, IPodClassicWheelState),
+        VMSTATE_UINT32(wasm_consumed0, IPodClassicWheelState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+#endif
+
 static const VMStateDescription vmstate_ipod_classic_wheel = {
     .name = TYPE_IPOD_CLASSIC_WHEEL,
     /*
@@ -807,15 +829,13 @@ static const VMStateDescription vmstate_ipod_classic_wheel = {
         VMSTATE_TIMER_PTR(tick, IPodClassicWheelState),
 #ifdef EMSCRIPTEN
         /*
-         * A snapshot taken while a browser key is held would otherwise come
-         * back with the button bit set and no release scheduled (Q20).
+         * The browser-only fields are a wasm-only subsection (S9): keeping
+         * them in the main list made native and wasm version-3 streams
+         * different, and a cross load would misparse instead of failing on
+         * an unknown subsection.
          */
-        VMSTATE_INT32(wasm_keycode, IPodClassicWheelState),
-        VMSTATE_INT64(wasm_release_at, IPodClassicWheelState),
-        VMSTATE_INT64(wasm_release_cap, IPodClassicWheelState),
-        VMSTATE_UINT32(wasm_press_mask, IPodClassicWheelState),
-        VMSTATE_UINT32(wasm_consumed, IPodClassicWheelState),
-        VMSTATE_UINT32(wasm_consumed0, IPodClassicWheelState),
+        VMSTATE_SUBSECTION(vmstate_ipod_classic_wheel_wasm,
+                           IPodClassicWheelState),
 #endif
         VMSTATE_END_OF_LIST()
     },

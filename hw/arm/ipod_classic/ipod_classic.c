@@ -768,7 +768,20 @@ static bool ipod_snapshot_id_ok(const char *path)
     }
     fclose(f);
     buf[strcspn(buf, "\r\n")] = 0;
-    return strcmp(buf, QEMU_WASM_BUILD_ID) == 0;
+    if (strcmp(buf, QEMU_WASM_BUILD_ID) != 0) {
+        return false;
+    }
+    if (strcmp(buf, "unknown") == 0) {
+        /*
+         * Two builds without the generated header both say "unknown", so the
+         * id cannot tie the state to a build; warn instead of pretending the
+         * check passed (S10).
+         */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "snapshot: build id is \"unknown\"; the state cannot be "
+                      "tied to a build\n");
+    }
+    return true;
 }
 
 
