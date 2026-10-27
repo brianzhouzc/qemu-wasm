@@ -246,7 +246,22 @@ typedef uint32_t (*wasm_func_ptr)(struct wasmContext*);
 
 int get_core_nums()
 {
-    return emscripten_num_logical_cores();
+    /*
+     * The number of logical cores cannot change while the module is loaded,
+     * but this is asked twice for every translated block: tcg_gen_code()
+     * sizes the per-core export vector and the per-core counters in the TB
+     * header with it (tcg/tcg.c).  emscripten_num_logical_cores() is a
+     * wasm->JS call that rebuilds the array every time (os.cpus() under
+     * Node), and it was the largest single entry in the boot profile.
+     * Ask the host once; a second vCPU thread racing to fill the cache
+     * stores the same value the first one did.
+     */
+    static int core_nums;
+
+    if (core_nums == 0) {
+        core_nums = emscripten_num_logical_cores();
+    }
+    return core_nums;
 }
 
 EM_JS(void, init_wasm32_js, (int tb_ptr_ptr, int cur_core_num, int to_remove_instance_ptr, int to_remove_instance_idx_ptr, int instance_garbage_collected_ptr), {
