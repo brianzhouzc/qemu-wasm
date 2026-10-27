@@ -179,6 +179,26 @@ AioContext *qemu_get_aio_context(void)
     return qemu_aio_context;
 }
 
+#ifdef EMSCRIPTEN
+/*
+ * Wake the main loop through this port's own futex counter.
+ *
+ * The browser build's main loop does not block in poll(); os_host_main_loop_wait
+ * polls the descriptors with a zero timeout and then waits on qemu_em_notify,
+ * so the event notifier's file descriptor is not what a sleeping main loop
+ * watches.  Writing that descriptor from another thread is a synchronous proxy
+ * into the page thread (Emscripten implements the pipe in JS), which showed up
+ * as the second largest cost in the boot profile, so the producers wake this
+ * counter instead.  The notifier's memory flag (ctx->notified) is what the
+ * main loop checks when it polls, and it is still set by aio_notify().
+ */
+void qemu_em_notify_wake(void)
+{
+    qatomic_fetch_add(&qemu_em_notify, 1);
+    emscripten_futex_wake(&qemu_em_notify, INT32_MAX);
+}
+#endif
+
 void qemu_notify_event(void)
 {
     if (!qemu_aio_context) {
@@ -186,8 +206,7 @@ void qemu_notify_event(void)
     }
     qemu_bh_schedule(qemu_notify_bh);
 #ifdef EMSCRIPTEN
-    qatomic_fetch_add(&qemu_em_notify, 1);
-    emscripten_futex_wake(&qemu_em_notify, INT32_MAX);
+    qemu_em_notify_wake();
 #endif
 }
 

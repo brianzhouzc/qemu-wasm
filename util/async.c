@@ -496,9 +496,32 @@ void aio_notify(AioContext *ctx)
      * Pairs with smp_mb() in aio_ctx_prepare or aio_poll.
      */
     smp_mb();
+#ifdef EMSCRIPTEN
+    /*
+     * Two different kinds of waiter read this notification.
+     *
+     * A blocking aio_poll() (notify_me has its +2 bit) sleeps in poll() on
+     * the notifier's file descriptor, and only that descriptor wakeup ends
+     * it, so it keeps the write.
+     *
+     * Everything else -- the glib main loop, which sets bit 0 in
+     * aio_ctx_prepare and re-checks ctx->notified/scheduled bottom halves in
+     * aio_ctx_check -- re-evaluates its state on every iteration, so the
+     * descriptor write is not what makes it make progress.  Its sleep is
+     * os_host_main_loop_wait's futex, and on this port the descriptor write
+     * is a synchronous proxy into the page thread that showed up as the
+     * second largest cost in the boot profile.  Wake the futex instead.
+     */
+    if (qatomic_read(&ctx->notify_me) >= 2) {
+        event_notifier_set(&ctx->notifier);
+    } else {
+        qemu_em_notify_wake();
+    }
+#else
     if (qatomic_read(&ctx->notify_me)) {
         event_notifier_set(&ctx->notifier);
     }
+#endif
 }
 
 void aio_notify_accept(AioContext *ctx)
