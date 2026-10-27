@@ -37,6 +37,7 @@
 #include "hw/sysbus.h"
 #include "target/arm/cpregs.h"
 #include "qemu/error-report.h"
+#include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "migration/global_state.h"
@@ -645,24 +646,57 @@ typedef struct {
      */
     void *machine;
     QEMUTimer *wake;
+    /*
+     * How many times the handshake has completed.  Printed in the heartbeat:
+     * a firmware that finds no reason for the wake and immediately asks to
+     * sleep again would show up here as a count in the thousands during an
+     * idle run, which would mean the emulator is spinning instead of idling.
+     */
+    uint64_t wakes;
 } S5L8702SysalvState;
+
+/*
+ * One machine per process, so the heartbeat (which runs from a timer and has
+ * no path to the region) can report the counter above.
+ */
+static S5L8702SysalvState *ipod_sysalv_state;
+static IPodClassicMachineState *ipod_machine;
+
+/*
+ * Resume a halted vCPU without taking an exception.  Two things need it: the
+ * power-transition handshake below, and the wheel, because a detent is a wake
+ * source on the hardware and the sleep the firmware enters has interrupts
+ * masked while it waits for the EIC/PMU, which this machine does not model.
+ * CPU_INTERRUPT_EXITTB is the one request that is in arm_cpu_has_work() and is
+ * cleared in cpu_handle_interrupt() without dispatching to a vector.
+ */
+void ipod_classic_wake_vcpu(void)
+{
+    CPUState *cs;
+
+    if (!ipod_machine) {
+        return;
+    }
+    cs = &ipod_machine->cpu->parent_obj;
+    cs->interrupt_request |= CPU_INTERRUPT_EXITTB;
+    qemu_cpu_kick(cs);
+}
 
 static void ipod_classic_sysalv_wake(void *opaque)
 {
     S5L8702SysalvState *s = opaque;
-    IPodClassicMachineState *nms = s->machine;
-    CPUState *cs = &nms->cpu->parent_obj;
 
     /*
-     * CPU_INTERRUPT_EXITTB is the one request that resumes a halted vCPU
-     * *without* taking an exception: it is in arm_cpu_has_work(), it clears
-     * itself in cpu_exec(), and it does not send the guest to a vector.  That
-     * is what the firmware's WFI needs here -- it does not want an interrupt
-     * service routine, it wants execution to continue at 0x22002e74 so it can
-     * poll SYSALV bit 12 itself, which the register file above satisfies.
+     * Resume the vCPU so it continues at 0x22002e74 and finishes the
+     * handshake by polling SYSALV bit 12 itself, which the register file above
+     * satisfies.  The request is set directly rather than through
+     * cpu_interrupt(): with cpu_interrupt() the wake became unreliable on this
+     * path (measured 1.6 to 1.8 s from press to ack after idling, and one
+     * press that was consumed but never redrew), while the direct request
+     * keeps it at ~50 ms.
      */
-    cs->interrupt_request |= CPU_INTERRUPT_EXITTB;
-    qemu_cpu_kick(cs);
+    s->wakes++;
+    ipod_classic_wake_vcpu();
 }
 
 static uint64_t ipod_classic_sysalv_read(void *opaque, hwaddr offset,
@@ -718,8 +752,36 @@ static const MemoryRegionOps ipod_classic_sysalv_ops = {
     .read = ipod_classic_sysalv_read,
     .write = ipod_classic_sysalv_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid.min_access_size = 4,
-    .valid.max_access_size = 4,
+    /*
+     * The unimplemented device this replaces accepted 1- to 8-byte accesses
+     * (hw/misc/unimp.c), so a byte or halfword touch of the window used to be
+     * ignored.  Keep that tolerance: only word accesses are implemented, and
+     * memory.c splits the narrower ones.  A 4-byte-only region would turn such
+     * an access into a data abort in the guest instead.
+     */
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 8,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+};
+
+/*
+ * The registers and the pending wake belong in the snapshot: a save taken
+ * while the vCPU is halted in the sleep WFI would otherwise restore a halted
+ * CPU with no timer to wake it, which is the same freeze.  The window is not a
+ * QOM device, so it registers its state directly (the machine's other devices
+ * carry a VMStateDescription on their DeviceClass).
+ */
+static const VMStateDescription vmstate_ipod_classic_sysalv = {
+    .name = "s5l8702.sysalv",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(reg, S5L8702SysalvState, S5L8702_SYSALV_WORDS),
+        VMSTATE_TIMER_PTR(wake, S5L8702SysalvState),
+        VMSTATE_UINT64(wakes, S5L8702SysalvState),
+        VMSTATE_END_OF_LIST()
+    },
 };
 
 static QEMUTimer *ipod_heartbeat_timer;
@@ -755,6 +817,9 @@ static void ipod_heartbeat(void *opaque)
                 ipod_heartbeat_cpu->env.regs[15],
                 cpsr_read(&ipod_heartbeat_cpu->env),
                 CPU(ipod_heartbeat_cpu)->halted);
+    }
+    if (ipod_sysalv_state) {
+        fprintf(stderr, " wakes=%" PRIu64, ipod_sysalv_state->wakes);
     }
     fprintf(stderr, "\n");
     timer_mod(ipod_heartbeat_timer,
@@ -1041,6 +1106,7 @@ static void ipod_classic_machine_init(MachineState *machine)
     ipod_classic_cpu_setup(machine, &sysmem, &cpu, &nsas);
     nms->cpu = cpu;
     ipod_heartbeat_cpu = cpu;
+    ipod_machine = nms;
     nms->nsas = nsas;
 
     nms->sysclk = clock_new(OBJECT(machine), "SYSCLK");
@@ -1295,6 +1361,8 @@ static void ipod_classic_machine_init(MachineState *machine)
     sysalv->machine = nms;
     sysalv->wake = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                 ipod_classic_sysalv_wake, sysalv);
+    ipod_sysalv_state = sysalv;
+    vmstate_register(NULL, 0, &vmstate_ipod_classic_sysalv, sysalv);
     memory_region_init_io(sysalv_mr, NULL, &ipod_classic_sysalv_ops, sysalv,
                           "s5l8702.sysalv", S5L8702_SYSALV_MEM_SIZE);
     memory_region_add_subregion(sysmem, EIC_MEM_BASE, sysalv_mr);

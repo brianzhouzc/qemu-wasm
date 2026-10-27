@@ -38,6 +38,17 @@
 #include "hw/arm/ipod_classic/ipod_classic_wheel.h"
 #include "hw/arm/ipod_classic/ipod_classic_np_overlay.h"
 
+#ifdef EMSCRIPTEN
+/*
+ * The machine's way to resume a halted vCPU without taking an exception.  A
+ * detent is a wake source on the hardware, and the sleep the firmware enters
+ * has interrupts masked while it waits for the EIC/PMU, which this machine
+ * does not model: without this, a click after idling is queued and never
+ * looked at.
+ */
+void ipod_classic_wake_vcpu(void);
+#endif
+
 /*
  * INSTRUMENTATION ONLY -- nothing below changes what the model does. Same
  * pattern as DISPTRACE=1, LCDTRACE=1 and ATATRACE=1 elsewhere in this machine:
@@ -122,6 +133,9 @@ static void wheel_update_irq(IPodClassicWheelState *s)
     }
     if (level && !s->irq_level) {
         wheel_irq_raises++;
+#ifdef EMSCRIPTEN
+        ipod_classic_wake_vcpu();
+#endif
     }
     s->irq_level = level;
     qemu_set_irq(s->irq, level);
