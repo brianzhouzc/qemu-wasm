@@ -496,9 +496,35 @@ void aio_notify(AioContext *ctx)
      * Pairs with smp_mb() in aio_ctx_prepare or aio_poll.
      */
     smp_mb();
+#ifdef EMSCRIPTEN
+    /*
+     * Two different kinds of waiter read this notification.
+     *
+     * The main loop does not block in poll(): os_host_main_loop_wait() polls
+     * the descriptors with a zero timeout and then sleeps on this port's own
+     * futex, and aio_ctx_check() re-reads ctx->notified and the bottom-half
+     * lists on every iteration.  For the two contexts that live on that loop
+     * -- the main one and its iohandler context -- a futex wake is therefore a
+     * complete notification, and the descriptor write is not just redundant
+     * but expensive: Emscripten implements the pipe in JS, so writing it is a
+     * synchronous proxy into the page thread (the second largest cost in the
+     * boot profile).
+     *
+     * Everything else still needs the descriptor: a blocking aio_poll()
+     * (notify_me has its +2 bit) sleeps in poll() on it, and so does any other
+     * AioContext's owner that runs its own main loop, such as an IOThread with
+     * run_gcontext set.  qemu_em_notify_ctx_is_main() draws that line.
+     */
+    if (qatomic_read(&ctx->notify_me) >= 2 || !qemu_em_notify_ctx_is_main(ctx)) {
+        event_notifier_set(&ctx->notifier);
+    } else {
+        qemu_em_notify_wake();
+    }
+#else
     if (qatomic_read(&ctx->notify_me)) {
         event_notifier_set(&ctx->notifier);
     }
+#endif
 }
 
 void aio_notify_accept(AioContext *ctx)

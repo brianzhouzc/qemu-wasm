@@ -110,6 +110,22 @@ AioContext *qemu_get_aio_context(void);
  */
 void qemu_notify_event(void);
 
+#ifdef EMSCRIPTEN
+/*
+ * Wake a main loop that is sleeping on this port's futex counter instead of
+ * on the AIO notifier's file descriptor.  Called from qemu_notify_event() and
+ * from aio_notify() when nothing is blocked on the descriptor itself.
+ */
+void qemu_em_notify_wake(void);
+
+/*
+ * True for the AioContexts whose owner sleeps on that futex (the main
+ * context and the iohandler context).  Other contexts still need their
+ * notifier's descriptor written.
+ */
+bool qemu_em_notify_ctx_is_main(AioContext *ctx);
+#endif
+
 #ifdef _WIN32
 /* return TRUE if no sleep should be done afterwards */
 typedef int PollingFunc(void *opaque);
