@@ -117,6 +117,13 @@ void qemu_notify_event(void);
  * from aio_notify() when nothing is blocked on the descriptor itself.
  */
 void qemu_em_notify_wake(void);
+
+/*
+ * True for the AioContexts whose owner sleeps on that futex (the main
+ * context and the iohandler context).  Other contexts still need their
+ * notifier's descriptor written.
+ */
+bool qemu_em_notify_ctx_is_main(AioContext *ctx);
 #endif
 
 #ifdef _WIN32

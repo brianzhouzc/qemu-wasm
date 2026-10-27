@@ -356,6 +356,24 @@ static int os_host_main_loop_wait(int64_t timeout)
 {
     GMainContext *context = g_main_context_default();
     int ret;
+#ifdef EMSCRIPTEN
+    /*
+     * Sample the counter before filling the poll list, not after.
+     *
+     * glib_pollfds_fill() runs aio_ctx_prepare(), which sets bit 0 of
+     * ctx->notify_me, checks the bottom halves and computes the timeout.  A
+     * notification that lands after that check but before a later sample
+     * would already be counted by the sample, so the zero-timeout poll below
+     * would find nothing (no descriptor was written) and the loop would sleep
+     * out the whole bound with work pending -- up to 10 ms.
+     *
+     * Sampling first closes that window in both directions: a bump before the
+     * sample happens before aio_ctx_prepare()'s smp_mb(), so prepare sees the
+     * pending bottom half and returns a zero timeout; a bump after the sample
+     * makes qemu_em_notify_wait() return at once.
+     */
+    int seen = qatomic_read(&qemu_em_notify);
+#endif
 
     g_main_context_acquire(context);
 
@@ -366,11 +384,9 @@ static int os_host_main_loop_wait(int64_t timeout)
 
 #ifdef EMSCRIPTEN
     /*
-     * Sample the counter before the poll: a qemu_notify_event() between the
-     * poll and a later read used to be lost and the loop slept the whole
-     * bound (Q10).
+     * Poll without blocking, then wait on the futex this port's notifiers
+     * bump (see qemu_em_notify_wake).
      */
-    int seen = qatomic_read(&qemu_em_notify);
     ret = qemu_poll_ns((GPollFD *)gpollfds->data, gpollfds->len, 0);
     if (ret == 0 && timeout != 0) {
         qemu_em_notify_wait(timeout, seen);
@@ -709,6 +725,26 @@ GSource *iohandler_get_g_source(void)
     iohandler_init();
     return aio_get_g_source(iohandler_ctx);
 }
+
+#ifdef EMSCRIPTEN
+/*
+ * Is this one of the contexts whose owner sleeps on qemu_em_notify?
+ *
+ * os_host_main_loop_wait() polls exactly the two contexts below (the main
+ * AioContext and the iohandler context it owns) and then waits on that futex,
+ * so for them a futex wake is a complete notification.  Any other AioContext
+ * blocks in a real poll() on its own notifier descriptor -- an IOThread with
+ * run_gcontext set, for instance -- and must keep getting the descriptor
+ * write, or it would never wake.  Keep this test here rather than in
+ * aio_notify() so the list of "contexts that live on the main loop" stays
+ * next to the loop itself.
+ */
+bool qemu_em_notify_ctx_is_main(AioContext *ctx)
+{
+    return ctx != NULL && (ctx == qemu_aio_context ||
+                           (iohandler_ctx != NULL && ctx == iohandler_ctx));
+}
+#endif
 
 void qemu_set_fd_handler(int fd,
                          IOHandler *fd_read,
