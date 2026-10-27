@@ -682,6 +682,19 @@ void ipod_classic_wake_vcpu(void)
     qemu_cpu_kick(cs);
 }
 
+/*
+ * A key has arrived, so wake the guest even if it is asleep.  This has to be
+ * driven by the input itself and not by the wheel's interrupt: while it sleeps
+ * the firmware can mask that interrupt inside the device (s->mask), so no
+ * rising edge ever happens and an IRQ-driven wake never runs -- measured as a
+ * press the guest did not see at all, the instruction count frozen for the
+ * whole eight-second wait.
+ */
+void ipod_classic_input_wake(void)
+{
+    ipod_classic_wake_vcpu();
+}
+
 static void ipod_classic_sysalv_wake(void *opaque)
 {
     S5L8702SysalvState *s = opaque;

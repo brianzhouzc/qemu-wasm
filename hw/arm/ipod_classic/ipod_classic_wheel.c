@@ -47,6 +47,7 @@
  * looked at.
  */
 void ipod_classic_wake_vcpu(void);
+void ipod_classic_input_wake(void);
 #endif
 
 /*
@@ -678,6 +679,14 @@ static void wasm_key_bh_fn(void *opaque)
         int hold = s->wasm_key_ring[slot].hold;
 
         qatomic_store_release(&s->wasm_key_tail, tail + 1);
+        /*
+         * Wake first, and not from the IRQ: while the guest sleeps it can mask
+         * the wheel's interrupt inside the device (s->mask), so no rising edge
+         * happens and an IRQ-driven wake never runs -- measured as a press the
+         * guest did not even see (icount frozen for the whole 8 s wait).  The
+         * input itself has to be the wake source.
+         */
+        ipod_classic_input_wake();
         if (op == 2) {
             wheel_key_event(s, arg);
         } else if (op == 1) {
