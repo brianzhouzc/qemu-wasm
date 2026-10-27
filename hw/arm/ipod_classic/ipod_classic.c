@@ -444,7 +444,8 @@ ipod_classic_unimplemented[] = {
     { "s5l8702.adm-sfr",  ADM_SFR_MEM_BASE,  0x100000 },
     { "s5l8702.lcd-win",  LCD_WIN_MEM_BASE,  0x100000 },
     { "s5l8702.fmc",      FMC_MEM_BASE,      0x100000 },
-    { "s5l8702.eic",      EIC_MEM_BASE,      0x100000 },
+    /* s5l8702.sysalv (0x39A00000) is a real (register) device now; the sleep
+     * handshake hangs on it.  See the note above the device. */
     { "s5l8702.int",      INT_MEM_BASE,      0x100000 },
     { "s5l8702.ecc",      ECC_MEM_BASE,      0x100000 },
     /* The click wheel is a real device now; see the machine init. */
@@ -602,6 +603,120 @@ static void ipod_classic_rng_write(void *opaque, hwaddr offset, uint64_t value,
 static const MemoryRegionOps ipod_classic_rng_ops = {
     .read = ipod_classic_rng_read,
     .write = ipod_classic_rng_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
+/*
+ * SYSALV at 0x39A00000 (EIC_BASE / SYSALV_BASE), a 1 MB window.
+ *
+ * The retailOS's sleep sequence saves the CLK registers, then at 0x22002e50
+ * writes bit 0 of SYSALV and spins on it *with IRQs and FIQs disabled*:
+ *
+ *   22002e50  ldr r2, [r1]          r1 = 0x39A00000
+ *   22002e54  orr r2, r2, #1
+ *   22002e58  str r2, [r1]          request the transition
+ *   22002e60  ldr r1, [r2]          <- the pc in the "frozen" heartbeat
+ *   22002e64  tst r1, #1
+ *   22002e68  beq 0x22002e60        wait for the hardware to acknowledge
+ *
+ * It then ORs in bit 12 (and bit 1), waits for bit 12, clears bit 0 and the
+ * 0x03f00000 bits, restores the clocks and returns.  The window used to be a
+ * create_unimplemented_device(), so every read returned 0 and the
+ * acknowledgement never came: the guest spun forever with interrupts
+ * disabled, its own timers could no longer fire, and the emulator looked
+ * asleep (Apple's firmware: frozen panel; Rockbox: its "Sleeping" screen).
+ * A hung run measured 166295 reads of +0 with the three writes above ignored.
+ *
+ * A write-back register file is enough for that handshake: the guest writes
+ * the acknowledgement bits itself and must read them back, which is what the
+ * real hardware does.  The rest of the window still reads 0 (no write ever
+ * says otherwise), so nothing the guest relied on before this changes.
+ */
+#define S5L8702_SYSALV_MEM_SIZE  0x100000
+#define S5L8702_SYSALV_WORDS     0x400      /* 4 KB of registers modelled */
+
+typedef struct {
+    uint32_t reg[S5L8702_SYSALV_WORDS];
+    /*
+     * The machine, so the transition can wake the vCPU (see below), and the
+     * timer that does it after the guest has had time to execute its WFI.
+     */
+    void *machine;
+    QEMUTimer *wake;
+} S5L8702SysalvState;
+
+static void ipod_classic_sysalv_wake(void *opaque)
+{
+    S5L8702SysalvState *s = opaque;
+    IPodClassicMachineState *nms = s->machine;
+    CPUState *cs = &nms->cpu->parent_obj;
+
+    /*
+     * CPU_INTERRUPT_EXITTB is the one request that resumes a halted vCPU
+     * *without* taking an exception: it is in arm_cpu_has_work(), it clears
+     * itself in cpu_exec(), and it does not send the guest to a vector.  That
+     * is what the firmware's WFI needs here -- it does not want an interrupt
+     * service routine, it wants execution to continue at 0x22002e74 so it can
+     * poll SYSALV bit 12 itself, which the register file above satisfies.
+     */
+    cs->interrupt_request |= CPU_INTERRUPT_EXITTB;
+    qemu_cpu_kick(cs);
+}
+
+static uint64_t ipod_classic_sysalv_read(void *opaque, hwaddr offset,
+                                         unsigned size)
+{
+    S5L8702SysalvState *s = opaque;
+
+    if (offset + size > sizeof(s->reg)) {
+        qemu_log_mask(LOG_UNIMP, "s5l8702.sysalv: read of +0x%"
+                      HWADDR_PRIx "\n", offset);
+        return 0;
+    }
+    return s->reg[offset / 4];
+}
+
+static void ipod_classic_sysalv_write(void *opaque, hwaddr offset,
+                                      uint64_t value, unsigned size)
+{
+    S5L8702SysalvState *s = opaque;
+    uint32_t old;
+
+    if (offset + size > sizeof(s->reg)) {
+        qemu_log_mask(LOG_UNIMP, "s5l8702.sysalv: write of 0x%" PRIx64
+                      " to +0x%" HWADDR_PRIx "\n", value, offset);
+        return;
+    }
+    old = s->reg[offset / 4];
+    s->reg[offset / 4] = value;
+
+    /*
+     * Bit 0 is the power-transition request at +0.  The guest polls it (which
+     * the write-back register above satisfies), then executes WFI and waits
+     * for the transition-complete interrupt that the PMU would raise on real
+     * hardware.  Nothing raises it here (the PMU's interrupt output is not
+     * wired and the EIC is not modelled), so the vCPU would stay halted for
+     * good, with the UI frozen on its last frame -- the sleep bug.
+     *
+     * The machine has no power to sequence, so the transition completes one
+     * millisecond of virtual time after it is requested.  The wake has to be
+     * scheduled rather than raised here: the guest still has a handful of
+     * instructions to execute before it reaches WFI, and an exit-TB request
+     * raised now would be consumed by them (measured: the vCPU stayed
+     * halted).  A millisecond later the guest is halted, the icount warp
+     * advances the virtual clock straight to this timer, and the callback
+     * resumes the vCPU.
+     */
+    if (offset == 0 && (value & 1) && !(old & 1) && s->machine) {
+        timer_mod_ns(s->wake, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+    }
+}
+
+static const MemoryRegionOps ipod_classic_sysalv_ops = {
+    .read = ipod_classic_sysalv_read,
+    .write = ipod_classic_sysalv_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid.min_access_size = 4,
     .valid.max_access_size = 4,
@@ -1169,6 +1284,20 @@ static void ipod_classic_machine_init(MachineState *machine)
                           g_new0(S5L8702RNGState, 1), "s5l8702.rng",
                           S5L8702_RNG_MEM_SIZE);
     memory_region_add_subregion(sysmem, S5L8702_RNG_MEM_BASE, rng_mr);
+
+    /*
+     * SYSALV (0x39A00000). See the long note above: the retailOS's sleep
+     * sequence waits on a bit in this window with interrupts disabled, so a
+     * zero read there is not a missing register, it is a hang.
+     */
+    MemoryRegion *sysalv_mr = g_new(MemoryRegion, 1);
+    S5L8702SysalvState *sysalv = g_new0(S5L8702SysalvState, 1);
+    sysalv->machine = nms;
+    sysalv->wake = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                ipod_classic_sysalv_wake, sysalv);
+    memory_region_init_io(sysalv_mr, NULL, &ipod_classic_sysalv_ops, sysalv,
+                          "s5l8702.sysalv", S5L8702_SYSALV_MEM_SIZE);
+    memory_region_add_subregion(sysmem, EIC_MEM_BASE, sysalv_mr);
 
     /*
      * SM1 (0x38500000): the audio clock/stream engine. A stateful device that
