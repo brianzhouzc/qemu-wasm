@@ -59,10 +59,12 @@ static int qemu_em_notify;
  * zero-timeout polls found a ready descriptor *once*, and all 60,373 real
  * wakeups came through the notify futex below.  Each poll is a synchronous
  * proxy into the page thread (~83 us here), so polling on every iteration is
- * almost pure overhead.  The interval only bounds how late a descriptor-only
+ * almost pure overhead.  The interval bounds how late a descriptor-only
  * wakeup (a non-main AioContext's notifier, or glib's own wakeup pipe) can be
- * seen; 5 ms keeps that well below the frame time while cutting the polls by
- * ~93%.
+ * seen: when a poll is skipped, the futex wait below is capped at the time
+ * left before the next poll, so the bound is this interval and not the wait's
+ * own 10 ms cap.  5 ms keeps it well below the frame time while cutting the
+ * polls by ~93%.
  */
 #define EM_POLL_INTERVAL_NS (5 * SCALE_MS)
 
@@ -394,6 +396,7 @@ static int os_host_main_loop_wait(int64_t timeout)
      * makes qemu_em_notify_wait() return at once.
      */
     int seen = qatomic_read(&qemu_em_notify);
+    bool polled = true;
 #endif
 
     g_main_context_acquire(context);
@@ -414,16 +417,39 @@ static int os_host_main_loop_wait(int64_t timeout)
         if (now >= em_next_poll_ns) {
             ret = qemu_poll_ns((GPollFD *)gpollfds->data, gpollfds->len, 0);
             em_next_poll_ns = now + EM_POLL_INTERVAL_NS;
+            polled = true;
         } else {
             /* glib's query zeroes revents, so skipping the poll leaves the
              * descriptors reported as not ready: no source is dispatched
              * spuriously, a descriptor-only wakeup is just noticed on the
              * next real poll. */
             ret = 0;
+            polled = false;
         }
     }
     if (ret == 0 && timeout != 0) {
-        qemu_em_notify_wait(timeout, seen);
+        int64_t wait_ns = timeout;
+
+        /*
+         * A skipped poll means the next real poll is already scheduled, so do
+         * not sleep past it: the futex wait on its own can be up to 10 ms
+         * (qemu_em_notify_wait's cap), which would put a descriptor-only
+         * wakeup 15 ms out instead of the interval.  Capping the wait keeps
+         * the interval as the real bound.
+         */
+        if (!polled) {
+            int64_t remaining = em_next_poll_ns - em_now_ns();
+
+            if (remaining < 0) {
+                remaining = 0;
+            }
+            if (wait_ns < 0 || remaining < wait_ns) {
+                wait_ns = remaining;
+            }
+        }
+        if (wait_ns > 0) {
+            qemu_em_notify_wait(wait_ns, seen);
+        }
     }
 #else
     ret = qemu_poll_ns((GPollFD *)gpollfds->data, gpollfds->len, timeout);
