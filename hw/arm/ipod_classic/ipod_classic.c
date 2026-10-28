@@ -713,6 +713,41 @@ bool ipod_classic_input_wake(void)
 }
 
 /*
+ * One raw key event (press or release, the high bit of the code carries the
+ * release).  While the machine is off, a press is the power button: it powers
+ * the machine on and is dropped, and its release is dropped too -- the firmware
+ * that is about to boot never saw the press, so it must not see an orphan
+ * release either.  Returns true when the event was consumed.
+ *
+ * The synthesized wasm press does not need this: the model generates its
+ * release internally, so there is no separate event to drop.
+ */
+bool ipod_classic_power_key_event(int keycode)
+{
+    bool release = (keycode & 0x80) != 0;
+
+    if (!ipod_machine) {
+        return false;
+    }
+    if (ipod_machine->powered_off) {
+        if (!release) {
+            ipod_machine->power_release_pending = true;
+            ipod_classic_power_on();
+        }
+        return true;
+    }
+    if (release && ipod_machine->power_release_pending) {
+        ipod_machine->power_release_pending = false;
+        return true;
+    }
+    if (!release) {
+        /* A fresh press: any remembered power-on release is stale by now. */
+        ipod_machine->power_release_pending = false;
+    }
+    return false;
+}
+
+/*
  * The PMU's ON/OFF controller was asked to cut the power (OOCSHDWN), which is
  * how a firmware turns the device off: Rockbox writes it from power_off(),
  * shows "Shutting down..." and then waits for the supply to drop, which never

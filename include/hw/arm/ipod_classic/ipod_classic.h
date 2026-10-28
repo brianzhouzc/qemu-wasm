@@ -262,6 +262,11 @@ typedef struct {
      * press powers the machine on again with a reset.
      */
     bool powered_off;
+    /*
+     * A power-on press was dropped; its release must be dropped too, so the
+     * firmware that boots next does not see a release for a press it never got.
+     */
+    bool power_release_pending;
 } IPodClassicMachineState;
 
 /*
@@ -278,6 +283,12 @@ void ipod_classic_wake_vcpu(void);
  * to power the machine back on (and must therefore be dropped).
  */
 bool ipod_classic_input_wake(void);
+/*
+ * A raw key event (press, or release with the high bit set).  While off, a
+ * press powers the machine on; the press and its release are both dropped.
+ * Returns true when the event was consumed.
+ */
+bool ipod_classic_power_key_event(int keycode);
 /* The PMU was told to cut the power; the next key press resets the machine. */
 void ipod_classic_power_off(void);
 void ipod_classic_power_on(void);
