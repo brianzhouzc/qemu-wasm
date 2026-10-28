@@ -258,4 +258,16 @@ typedef struct {
     uint32_t wasm_instantiate;
 } IPodClassicMachineState;
 
+/*
+ * Resume a halted vCPU without taking an exception (CPU_INTERRUPT_EXITTB).
+ * Devices use it when they have a wake source of their own -- the wheel does,
+ * for a queued key -- and the machine uses it to finish the SYSALV power
+ * transition.  Declared here so the definitions in ipod_classic.c are checked
+ * against the same prototype every caller sees.
+ */
+void ipod_classic_wake_vcpu(void);
+/* A key has arrived: wake the guest even if it is asleep and the wheel's own
+ * interrupt is masked inside the device. */
+void ipod_classic_input_wake(void);
+
 #endif

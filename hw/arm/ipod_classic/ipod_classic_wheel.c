@@ -37,6 +37,8 @@
 #include "ui/console.h"
 #include "hw/arm/ipod_classic/ipod_classic_wheel.h"
 #include "hw/arm/ipod_classic/ipod_classic_np_overlay.h"
+/* ipod_classic_wake_vcpu() / ipod_classic_input_wake(): see the machine header. */
+#include "hw/arm/ipod_classic/ipod_classic.h"
 
 /*
  * INSTRUMENTATION ONLY -- nothing below changes what the model does. Same
@@ -122,6 +124,9 @@ static void wheel_update_irq(IPodClassicWheelState *s)
     }
     if (level && !s->irq_level) {
         wheel_irq_raises++;
+#ifdef EMSCRIPTEN
+        ipod_classic_wake_vcpu();
+#endif
     }
     s->irq_level = level;
     qemu_set_irq(s->irq, level);
@@ -664,6 +669,14 @@ static void wasm_key_bh_fn(void *opaque)
         int hold = s->wasm_key_ring[slot].hold;
 
         qatomic_store_release(&s->wasm_key_tail, tail + 1);
+        /*
+         * Wake first, and not from the IRQ: while the guest sleeps it can mask
+         * the wheel's interrupt inside the device (s->mask), so no rising edge
+         * happens and an IRQ-driven wake never runs -- measured as a press the
+         * guest did not even see (icount frozen for the whole 8 s wait).  The
+         * input itself has to be the wake source.
+         */
+        ipod_classic_input_wake();
         if (op == 2) {
             wheel_key_event(s, arg);
         } else if (op == 1) {
