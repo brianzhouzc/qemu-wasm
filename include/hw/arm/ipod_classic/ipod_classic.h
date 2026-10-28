@@ -256,6 +256,12 @@ typedef struct {
      */
     uint32_t heartbeat_ms;
     uint32_t wasm_instantiate;
+    /*
+     * Set when the PMU's ON/OFF controller was asked to cut the power.  The
+     * guest keeps running (it spins in its power-off path), and the next key
+     * press powers the machine on again with a reset.
+     */
+    bool powered_off;
 } IPodClassicMachineState;
 
 /*
@@ -266,8 +272,14 @@ typedef struct {
  * against the same prototype every caller sees.
  */
 void ipod_classic_wake_vcpu(void);
-/* A key has arrived: wake the guest even if it is asleep and the wheel's own
- * interrupt is masked inside the device. */
-void ipod_classic_input_wake(void);
+/*
+ * A key has arrived: wake the guest even if it is asleep and the wheel's own
+ * interrupt is masked inside the device.  Returns true when the key was used
+ * to power the machine back on (and must therefore be dropped).
+ */
+bool ipod_classic_input_wake(void);
+/* The PMU was told to cut the power; the next key press resets the machine. */
+void ipod_classic_power_off(void);
+void ipod_classic_power_on(void);
 
 #endif

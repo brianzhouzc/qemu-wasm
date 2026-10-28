@@ -696,8 +696,15 @@ static void wasm_key_bh_fn(void *opaque)
          * happens and an IRQ-driven wake never runs -- measured as a press the
          * guest did not even see (icount frozen for the whole 8 s wait).  The
          * input itself has to be the wake source.
+         *
+         * While the machine is powered off this is the power button: the wake
+         * call resets the machine and returns true, and the key must not be
+         * delivered to the firmware that is about to boot.
          */
-        ipod_classic_input_wake();
+        if (ipod_classic_input_wake()) {
+            tail++;
+            continue;
+        }
         if (op == 2) {
             wheel_key_event(s, arg);
         } else if (op == 1) {
