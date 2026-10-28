@@ -1270,12 +1270,24 @@ static inline uintptr_t tcg_qemu_tb_exec_tci(CPUArchState *env)
             if (*(uint32_t **)ptr != 0) {
                 tb_ptr = *(uint32_t **)ptr;
                 ctx.tb_ptr = tb_ptr;
-                int tb_counter_ptr = (uint32_t)tb_ptr + counter_vec_off;
-                if ((*(int32_t*)tb_counter_ptr >= 0) && (*(int32_t*)tb_counter_ptr < instantiate_num)) {
-                    *(int32_t*)tb_counter_ptr += 1;
-                } else {
-                    // enter to wasm TB
-                    return 0;
+                /*
+                 * -icount sets instantiate_num to INT32_MAX (init_wasm32) to
+                 * keep the unaudited JIT out of that configuration.  The hit
+                 * counter below is a per-TB word that starts at zero and only
+                 * counts up, so a TB that runs often enough eventually reaches
+                 * INT32_MAX, which makes this return "enter to wasm TB" and
+                 * compiles it after all.  With the threshold out of reach the
+                 * counter can never pass it, so skip it: icount then really
+                 * never compiles a TB, and the branch is cheaper too.
+                 */
+                if (instantiate_num != INT32_MAX) {
+                    int tb_counter_ptr = (uint32_t)tb_ptr + counter_vec_off;
+                    if ((*(int32_t*)tb_counter_ptr >= 0) && (*(int32_t*)tb_counter_ptr < instantiate_num)) {
+                        *(int32_t*)tb_counter_ptr += 1;
+                    } else {
+                        // enter to wasm TB
+                        return 0;
+                    }
                 }
                 tb_ptr = (uint8_t*)tb_ptr + *(uint32_t*)tb_ptr;
             }
@@ -1291,12 +1303,15 @@ static inline uintptr_t tcg_qemu_tb_exec_tci(CPUArchState *env)
             tb_ptr = ptr;
 
             ctx.tb_ptr = tb_ptr;
-            int tb_counter_ptr = (uint32_t)tb_ptr + counter_vec_off;
-            if ((*(int32_t*)tb_counter_ptr >= 0) && (*(int32_t*)tb_counter_ptr < instantiate_num)) {
-                *(int32_t*)tb_counter_ptr += 1;
-            } else {
-                // enter to wasm TB
-                return 0;
+            /* Same guard as goto_tb: the counter cannot pass INT32_MAX. */
+            if (instantiate_num != INT32_MAX) {
+                int tb_counter_ptr = (uint32_t)tb_ptr + counter_vec_off;
+                if ((*(int32_t*)tb_counter_ptr >= 0) && (*(int32_t*)tb_counter_ptr < instantiate_num)) {
+                    *(int32_t*)tb_counter_ptr += 1;
+                } else {
+                    // enter to wasm TB
+                    return 0;
+                }
             }
             tb_ptr = (uint8_t*)tb_ptr + *(uint32_t*)tb_ptr;
 
@@ -1388,23 +1403,35 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
     ctx.do_init = 1;
     while (true) {
         trysleep();
-        int tb_counter_ptr = (uint32_t)ctx.tb_ptr + counter_vec_off;
         uint32_t res;
-        int fidx = get_instance_running_local(ctx.tb_ptr);
-        if (fidx > 0) {
-            res = wasm_run_instance(fidx);
-        } else if (*(int32_t*)tb_counter_ptr < instantiate_num) {
-            *(int32_t*)tb_counter_ptr += 1;
-            res = tcg_qemu_tb_exec_tci(env);
-        } else if (!can_add_instance()) {
-            remove_instance_running_local();
-            check_instance_garbage_collected();
+        /*
+         * Under -icount the JIT is off (instantiate_num == INT32_MAX), so no
+         * instance can exist and the hit counter can never reach its
+         * threshold: run the interpreter without the per-TB instance lookup
+         * and counter bookkeeping.  This also keeps the counter from
+         * overflowing into "instantiate now" after 2^31 TB entries, which is
+         * how the JIT could otherwise be entered under -icount.
+         */
+        if (instantiate_num == INT32_MAX) {
             res = tcg_qemu_tb_exec_tci(env);
         } else {
-            int fidx = instantiate_wasm();
-            wasm_tb_compiled_count++;
-            add_instance_running_local(fidx, ctx.tb_ptr);
-            res = wasm_run_instance(fidx);
+            int tb_counter_ptr = (uint32_t)ctx.tb_ptr + counter_vec_off;
+            int fidx = get_instance_running_local(ctx.tb_ptr);
+            if (fidx > 0) {
+                res = wasm_run_instance(fidx);
+            } else if (*(int32_t*)tb_counter_ptr < instantiate_num) {
+                *(int32_t*)tb_counter_ptr += 1;
+                res = tcg_qemu_tb_exec_tci(env);
+            } else if (!can_add_instance()) {
+                remove_instance_running_local();
+                check_instance_garbage_collected();
+                res = tcg_qemu_tb_exec_tci(env);
+            } else {
+                int fidx = instantiate_wasm();
+                wasm_tb_compiled_count++;
+                add_instance_running_local(fidx, ctx.tb_ptr);
+                res = wasm_run_instance(fidx);
+            }
         }
         if ((uint32_t)ctx.tb_ptr == 0) {
             return res;
