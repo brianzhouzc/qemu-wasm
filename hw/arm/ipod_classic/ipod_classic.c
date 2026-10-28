@@ -768,9 +768,15 @@ static const MemoryRegionOps ipod_classic_sysalv_ops = {
     /*
      * The unimplemented device this replaces accepted 1- to 8-byte accesses
      * (hw/misc/unimp.c), so a byte or halfword touch of the window used to be
-     * ignored.  Keep that tolerance: only word accesses are implemented, and
-     * memory.c splits the narrower ones.  A 4-byte-only region would turn such
-     * an access into a data abort in the guest instead.
+     * ignored.  Keep that tolerance; a 4-byte-only region would turn any such
+     * access into a data abort in the guest instead.
+     *
+     * Note what "keep that tolerance" means here: memory.c does not split a
+     * narrow access.  access_with_adjusted_size() widens it into one 4-byte
+     * call at the same, possibly unaligned, offset with the value unshifted,
+     * so a byte write at +1 replaces all of reg[0] rather than being ignored.
+     * Nothing so far shows the guest writing bytes in this window (the sleep
+     * sequence uses words), and this is still better than the abort.
      */
     .valid.min_access_size = 1,
     .valid.max_access_size = 8,

@@ -37,18 +37,8 @@
 #include "ui/console.h"
 #include "hw/arm/ipod_classic/ipod_classic_wheel.h"
 #include "hw/arm/ipod_classic/ipod_classic_np_overlay.h"
-
-#ifdef EMSCRIPTEN
-/*
- * The machine's way to resume a halted vCPU without taking an exception.  A
- * detent is a wake source on the hardware, and the sleep the firmware enters
- * has interrupts masked while it waits for the EIC/PMU, which this machine
- * does not model: without this, a click after idling is queued and never
- * looked at.
- */
-void ipod_classic_wake_vcpu(void);
-void ipod_classic_input_wake(void);
-#endif
+/* ipod_classic_wake_vcpu() / ipod_classic_input_wake(): see the machine header. */
+#include "hw/arm/ipod_classic/ipod_classic.h"
 
 /*
  * INSTRUMENTATION ONLY -- nothing below changes what the model does. Same
