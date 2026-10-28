@@ -442,10 +442,11 @@ static void wheel_key_event(void *opaque, int keycode)
          * with it the scroll acceleration -- sees the same intervals, only
          * shifted earlier.
          *
-         * The FIFO backoff is the tick's own: with the FIFO over half full the
-         * push below would be dropped, and arming anyway would leave the step
-         * to be the gesture's first packet.  Backed up, let the tick arm it
-         * later, exactly as before.
+         * The FIFO backoff is the tick's own: at or above the backoff point
+         * the fast path would bypass the tick's pacing, and with the FIFO
+         * full the push below would be dropped -- arming anyway would leave
+         * the step to be the gesture's first packet.  Backed up, let the tick
+         * arm it later, exactly as before.
          */
         if (!s->armed && s->fifo_len < S5L8702_WHEEL_FIFO_LEN / 2) {
             s->armed = true;
