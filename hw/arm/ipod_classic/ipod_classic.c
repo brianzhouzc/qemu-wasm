@@ -189,6 +189,13 @@ static void ipod_classic_machine_reset(MachineState *machine,
      * last. This override is the one place guaranteed to run after all of them.
      */
     qemu_devices_reset(reason);
+    /*
+     * Every reset means powered on, whatever asked for it (our own power-on,
+     * QMP's system_reset, a guest-triggered reset).  Otherwise a reset from
+     * another source while the machine is off would leave the flag set, and the
+     * next key would be swallowed as a second power-on.
+     */
+    IPOD_CLASSIC_MACHINE(machine)->powered_off = false;
     ipod_classic_handoff(IPOD_CLASSIC_MACHINE(machine));
 }
 

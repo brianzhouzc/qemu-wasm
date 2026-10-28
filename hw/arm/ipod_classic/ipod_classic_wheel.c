@@ -473,6 +473,22 @@ static void wheel_key_event(void *opaque, int keycode)
     wheel_kick(s);
 }
 
+/*
+ * The keyboard handler the machine registers (qemu_add_kbd_event_handler).
+ * A key while the machine is powered off is the power button: it powers the
+ * machine on and is then dropped, so it is not delivered to the firmware that
+ * is still spinning in its power-off path.  The wasm bottom half makes the same
+ * check; this one covers the native keyboard path, which calls the handler
+ * directly.
+ */
+static void wheel_kbd_event(void *opaque, int keycode)
+{
+    if (ipod_classic_input_wake()) {
+        return;
+    }
+    wheel_key_event(opaque, keycode);
+}
+
 /* ------------------------------------------------------------------ */
 /* MMIO                                                               */
 /* ------------------------------------------------------------------ */
@@ -793,7 +809,7 @@ static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
                                                     0, 5000);
 
     s->tick = timer_new_ns(QEMU_CLOCK_VIRTUAL, wheel_tick, s);
-    qemu_add_kbd_event_handler(wheel_key_event, s);
+    qemu_add_kbd_event_handler(wheel_kbd_event, s);
 #ifdef EMSCRIPTEN
     wasm_wheel_state = s;
     s->wasm_key_bh = qemu_bh_new(wasm_key_bh_fn, s);
