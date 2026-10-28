@@ -189,6 +189,13 @@ static void ipod_classic_machine_reset(MachineState *machine,
      * last. This override is the one place guaranteed to run after all of them.
      */
     qemu_devices_reset(reason);
+    /*
+     * Every reset means powered on, whatever asked for it (our own power-on,
+     * QMP's system_reset, a guest-triggered reset).  Otherwise a reset from
+     * another source while the machine is off would leave the flag set, and the
+     * next key would be swallowed as a second power-on.
+     */
+    IPOD_CLASSIC_MACHINE(machine)->powered_off = false;
     ipod_classic_handoff(IPOD_CLASSIC_MACHINE(machine));
 }
 
@@ -689,10 +696,85 @@ void ipod_classic_wake_vcpu(void)
  * rising edge ever happens and an IRQ-driven wake never runs -- measured as a
  * press the guest did not see at all, the instruction count frozen for the
  * whole eight-second wait.
+ *
+ * A key pressed while the machine is powered off is the power button instead:
+ * it powers the machine back on (a reset, which is what a real iPod does) and
+ * the key itself is dropped, so it does not leak into the firmware's boot.
+ * Returns true when that happened.
  */
-void ipod_classic_input_wake(void)
+bool ipod_classic_input_wake(void)
 {
+    if (ipod_machine && ipod_machine->powered_off) {
+        ipod_classic_power_on();
+        return true;
+    }
     ipod_classic_wake_vcpu();
+    return false;
+}
+
+/*
+ * One raw key event (press or release, the high bit of the code carries the
+ * release).  While the machine is off, a press is the power button: it powers
+ * the machine on and is dropped, and its release is dropped too -- the firmware
+ * that is about to boot never saw the press, so it must not see an orphan
+ * release either.  Returns true when the event was consumed.
+ *
+ * The synthesized wasm press does not need this: the model generates its
+ * release internally, so there is no separate event to drop.
+ */
+bool ipod_classic_power_key_event(int keycode)
+{
+    bool release = (keycode & 0x80) != 0;
+
+    if (!ipod_machine) {
+        return false;
+    }
+    if (ipod_machine->powered_off) {
+        if (!release) {
+            ipod_machine->power_release_pending = true;
+            ipod_classic_power_on();
+        }
+        return true;
+    }
+    if (release && ipod_machine->power_release_pending) {
+        ipod_machine->power_release_pending = false;
+        return true;
+    }
+    if (!release) {
+        /* A fresh press: any remembered power-on release is stale by now. */
+        ipod_machine->power_release_pending = false;
+    }
+    return false;
+}
+
+/*
+ * The PMU's ON/OFF controller was asked to cut the power (OOCSHDWN), which is
+ * how a firmware turns the device off: Rockbox writes it from power_off(),
+ * shows "Shutting down..." and then waits for the supply to drop, which never
+ * happens here.  There is no supply to cut, so the machine just remembers that
+ * it is off; the screen keeps its last frame and the next key powers it on.
+ */
+void ipod_classic_power_off(void)
+{
+    if (!ipod_machine || ipod_machine->powered_off) {
+        return;
+    }
+    ipod_machine->powered_off = true;
+}
+
+/*
+ * Power on: a machine reset, exactly what pressing a button on a powered-off
+ * iPod does (the PMU brings the SoC out of reset and the firmware boots again).
+ * The reset handler puts the CPU back at the reset PC and rewrites the boot
+ * information, so the guest restarts from its entry point.
+ */
+void ipod_classic_power_on(void)
+{
+    if (!ipod_machine || !ipod_machine->powered_off) {
+        return;
+    }
+    ipod_machine->powered_off = false;
+    qemu_system_reset_request(SHUTDOWN_CAUSE_HOST_QMP_SYSTEM_RESET);
 }
 
 static void ipod_classic_sysalv_wake(void *opaque)

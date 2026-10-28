@@ -473,6 +473,22 @@ static void wheel_key_event(void *opaque, int keycode)
     wheel_kick(s);
 }
 
+/*
+ * The keyboard handler the machine registers (qemu_add_kbd_event_handler).
+ * A key while the machine is powered off is the power button: the press powers
+ * the machine on and both it and its release are dropped, so neither reaches
+ * the firmware that is still spinning in its power-off path (nor the one that
+ * boots next).  The wasm raw-key path makes the same check; this one covers the
+ * native keyboard handler, which is called directly.
+ */
+static void wheel_kbd_event(void *opaque, int keycode)
+{
+    if (ipod_classic_power_key_event(keycode)) {
+        return;
+    }
+    wheel_key_event(opaque, keycode);
+}
+
 /* ------------------------------------------------------------------ */
 /* MMIO                                                               */
 /* ------------------------------------------------------------------ */
@@ -696,8 +712,19 @@ static void wasm_key_bh_fn(void *opaque)
          * happens and an IRQ-driven wake never runs -- measured as a press the
          * guest did not even see (icount frozen for the whole 8 s wait).  The
          * input itself has to be the wake source.
+         *
+         * While the machine is powered off this is the power button.  op 2 is a
+         * raw key event (press or release) and takes the same path as the
+         * native keyboard handler, so a release cannot power the machine on and
+         * the release of a dropped power-on press is dropped as well.  op 1 is
+         * a synthesized press whose release the model generates itself, so it
+         * only needs the wake.
          */
-        ipod_classic_input_wake();
+        if (op == 2 ? ipod_classic_power_key_event(arg)
+                    : ipod_classic_input_wake()) {
+            tail++;
+            continue;
+        }
         if (op == 2) {
             wheel_key_event(s, arg);
         } else if (op == 1) {
@@ -786,7 +813,7 @@ static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
                                                     0, 5000);
 
     s->tick = timer_new_ns(QEMU_CLOCK_VIRTUAL, wheel_tick, s);
-    qemu_add_kbd_event_handler(wheel_key_event, s);
+    qemu_add_kbd_event_handler(wheel_kbd_event, s);
 #ifdef EMSCRIPTEN
     wasm_wheel_state = s;
     s->wasm_key_bh = qemu_bh_new(wasm_key_bh_fn, s);

@@ -60,6 +60,14 @@
 #include "hw/arm/ipod_classic/ipod_classic_pmu.h"
 
 /*
+ * The machine's reaction to the ON/OFF controller's shutdown, defined next to
+ * the machine (ipod_classic.c) where the state it sets lives.  Declared here
+ * rather than pulling in the machine header, which needs the sysbus types the
+ * I2C device does not.
+ */
+void ipod_classic_power_off(void);
+
+/*
  * PMUBATT=N overrides the raw battery reading, 0..1023.
  *
  * Why this needs to be reachable: on the way into a song retailOS puts up its
@@ -241,6 +249,19 @@ static void pmu_reg_write(IPodClassicPMUState *s, uint8_t addr, uint8_t val)
     case PCF50635_REG_INT6:
         qemu_log_mask(LOG_GUEST_ERROR, "%s: INT%d is read-only\n", __func__,
                       addr == PCF50635_REG_INT6 ? 6 : addr - 1);
+        return;
+    case PCF5063X_REG_OOCSHDWN:
+        /*
+         * The ON/OFF controller's shutdown.  Rockbox writes 0x01 here at the
+         * end of power_off(), after painting "Shutting down...", and then
+         * waits for the supply to drop -- which never happens in a model with
+         * no supply.  Tell the machine instead, so a later key press can power
+         * it back on with a reset (see ipod_classic_power_off()).
+         */
+        s->reg[addr] = val;
+        if (val) {
+            ipod_classic_power_off();
+        }
         return;
     case PCF5063X_REG_ADCC1:
         s->reg[addr] = val;
