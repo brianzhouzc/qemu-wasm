@@ -181,6 +181,32 @@ struct IPodClassicLCDState {
     /* Counters, for the trace only. */
     uint64_t pixels_this_frame;
     uint64_t composed_frames;
+
+    /*
+     * The panel comes up on the firmware's boot screen instead of black.  Set
+     * by the machine for the paths that start a kernel directly (-kernel) and
+     * so skip the bootrom/bootloader that would have painted it on hardware;
+     * the panel's reset then paints it.  With a real bootrom the chain owns the
+     * panel, so the flag stays off.
+     */
+    bool boot_screen;
+
+    /*
+     * Non-zero while the panel is still showing the boot screen painted at
+     * reset.  Cleared when the display pipe composes, or when the guest has
+     * pushed a whole panel's worth of pixels through the data port -- a single
+     * stray write does not count as the guest taking the panel over.  Written
+     * by the QEMU thread and read from the page thread, so it goes through
+     * qatomic (the wasm LCD exports publish it with the frame; see
+     * ipod_wasm_lcd_boot_screen_active()).
+     */
+    uint32_t boot_screen_active;
+
+    /* Pixels pushed through the data port since the boot screen was painted. */
+    uint32_t boot_screen_pixels;
 };
+
+/* Paint the boot screen on the panel's next reset (see boot_screen above). */
+void ipod_classic_lcd_set_boot_screen(IPodClassicLCDState *s, bool on);
 
 #endif /* HW_ARM_IPOD_CLASSIC_LCD_H */
