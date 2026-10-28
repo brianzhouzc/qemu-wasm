@@ -431,6 +431,21 @@ static void wheel_key_event(void *opaque, int keycode)
                           ? (int32_t)s->key_step : -(int32_t)s->key_step;
         s->touched = true;
         s->untouch_at = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->untouch_ns;
+        /*
+         * Arm the gesture here instead of letting the first tick do it.
+         *
+         * The tick that arms runs a full tick (40 ms of guest time) before
+         * the one that pays the step, so the first detent of a gesture cost
+         * two ticks before the guest heard about it at all.  Arming at press
+         * time removes one of them; the arm->step spacing is unchanged (the
+         * step still waits a tick), so the firmware's gesture delta -- and
+         * with it the scroll acceleration -- sees the same intervals, only
+         * shifted earlier.
+         */
+        if (!s->armed) {
+            s->armed = true;
+            wheel_send_event(s);
+        }
         wheel_kick(s);
         return;
 
