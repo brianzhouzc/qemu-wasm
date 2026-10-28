@@ -441,8 +441,13 @@ static void wheel_key_event(void *opaque, int keycode)
          * step still waits a tick), so the firmware's gesture delta -- and
          * with it the scroll acceleration -- sees the same intervals, only
          * shifted earlier.
+         *
+         * The FIFO backoff is the tick's own: with the FIFO over half full the
+         * push below would be dropped, and arming anyway would leave the step
+         * to be the gesture's first packet.  Backed up, let the tick arm it
+         * later, exactly as before.
          */
-        if (!s->armed) {
+        if (!s->armed && s->fifo_len < S5L8702_WHEEL_FIFO_LEN / 2) {
             s->armed = true;
             wheel_send_event(s);
         }
