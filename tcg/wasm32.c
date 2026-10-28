@@ -204,6 +204,14 @@ static int get_instance_running_local(void *tb_ptr)
     if (elm->tb != tb_ptr) {
         *(uint32_t*)tb_export_ptr = 0;
         int tb_counter_ptr = (uint32_t)tb_ptr + counter_vec_off;
+        /*
+         * Only reachable when the JIT is enabled: tcg_qemu_tb_exec() skips
+         * this lookup entirely under -icount (instantiate_num == INT32_MAX),
+         * so no instance exists and this "instantiate immediately" write --
+         * which sets the counter to the threshold -- cannot happen there.  If
+         * the lookup is ever moved back before that guard, this write is the
+         * overflow the guard exists to prevent.
+         */
         *(uint32_t*)tb_counter_ptr = instantiate_num; // will be instanciated immediately
         return 0;
     }
