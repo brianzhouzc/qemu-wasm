@@ -231,19 +231,6 @@ static unsigned disp_bpp(unsigned fmt)
     }
 }
 
-static bool disp_alpha_on(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("DISP_ALPHA");
-        on = (e && *e && *e != '0') ? 1 : 0;
-        if (on) {
-            fprintf(stderr, "DISP_ALPHA: capas compuestas de delante a atras con alfa\n");
-        }
-    }
-    return on == 1;
-}
-
 static inline uint16_t disp_rgb565(unsigned r, unsigned g, unsigned b)
 {
     return ((r & 0xf8) << 8) | ((g & 0xfc) << 3) | (b >> 3);
@@ -354,26 +341,31 @@ static bool disp_draw_layer(IPodClassicDispState *s, int k, uint16_t *fb,
             for (int i = 0; i < w; i++) {
                 const uint8_t *p = s->rowbuf + i * 4;
                 /*
-                 * ALPHA (DISP_ALPHA=1). The 32-bit layer really does carry one:
-                 * dumped while Now Playing is up, its alpha byte takes 243
-                 * distinct values across the surface, which no "ignore it"
-                 * reading survives. Straight source-over onto what is already
-                 * in the framebuffer.
+                 * ALPHA. The 32-bit layers carry a real alpha channel: dumped
+                 * while Now Playing is up, the alpha byte took 243 distinct
+                 * values across the surface, and the stock UI's right pane
+                 * fades its artwork in with it. Straight source-over onto what
+                 * is already in the framebuffer; the layers are drawn
+                 * back-to-front (slot 2 first, slot 0 last, so slot 0 ends up
+                 * on top -- see ipod_classic_disp_compose).
+                 *
+                 * Ignoring it is not harmless: a mid-fade frame then renders as
+                 * the raw mask -- a white icon and text on black, which is
+                 * exactly the "black and white icon that turns colour a frame
+                 * later" artefact on the main menu.
                  */
-                if (disp_alpha_on()) {
-                    unsigned a = p[3];
-                    if (a == 0) {
-                        continue;
-                    }
-                    if (a != 0xff) {
-                        uint16_t d = dst[i];
-                        unsigned dr = (d >> 8) & 0xf8, dg = (d >> 3) & 0xfc;
-                        unsigned db = (d << 3) & 0xf8;
-                        dst[i] = disp_rgb565((p[2] * a + dr * (255 - a)) / 255,
-                                             (p[1] * a + dg * (255 - a)) / 255,
-                                             (p[0] * a + db * (255 - a)) / 255);
-                        continue;
-                    }
+                unsigned a = p[3];
+                if (a == 0) {
+                    continue;
+                }
+                if (a != 0xff) {
+                    uint16_t d = dst[i];
+                    unsigned dr = (d >> 8) & 0xf8, dg = (d >> 3) & 0xfc;
+                    unsigned db = (d << 3) & 0xf8;
+                    dst[i] = disp_rgb565((p[2] * a + dr * (255 - a)) / 255,
+                                         (p[1] * a + dg * (255 - a)) / 255,
+                                         (p[0] * a + db * (255 - a)) / 255);
+                    continue;
                 }
                 dst[i] = disp_rgb565(p[2], p[1], p[0]);
             }
@@ -392,21 +384,27 @@ bool ipod_classic_disp_compose(IPodClassicDispState *s, uint16_t *fb,
     bool drew = false;
 
     /*
-     * Slot order is Z order, lowest index at the back. INFERRED, but a
-     * measurement does back it, and an earlier version of this comment claimed
-     * the opposite ("no two layers have ever overlapped"), which is false:
-     * slots 0 and 1 overlap the whole time the language screen appears.
+     * Z ORDER: slot 0 is composited LAST, so it is the one on top.
      *
-     * MEASURED with DISPTRACE=1 over one boot with a disk. Slot 0 is 320x240 at
-     * (0,0) for the whole run. Slot 1 is a 16-bit surface whose right edge is
-     * pinned to the panel edge while its left edge slides right -- +0x084/+0x07c
-     * go (x=80, w=240), (82, 238), (95, 225), (122, 198), (168, 152), (232, 88),
-     * (310, 10), (400, -80), so x + w is 320 at every step until the surface
-     * goes negative and stops being drawn. That is a wipe, and a wipe only works
-     * if the sliding surface is IN FRONT: slot 1 holds the outgoing artwork (the
-     * bare gradient, no text -- dumped and looked at) and slot 0 the incoming
-     * one. With the Z order the other way round slot 0 would cover slot 1 from
-     * the first frame and there would be no transition at all.
+     * The loop below runs from the highest slot down to 0, i.e. it composites
+     * back-to-front, and each 32-bit layer is blended source-over onto what is
+     * already there.  Two measurements pin the order down:
+     *
+     * - NOW PLAYING: slot 0 holds the ENTIRE player UI -- title bar, artist,
+     *   album, "4 of 4", progress bar -- while slot 1 holds the album art,
+     *   opaque and full-screen.  With slot 0 at the back the art wipes the
+     *   player out completely, which is exactly the blank right-hand side that
+     *   made that screen look half-drawn.  Slot 0 on top fixes it.
+     *
+     * - THE LANGUAGE SCREEN'S WIPE: slot 1 is a 16-bit surface whose right edge
+     *   stays pinned to the panel edge while its left edge slides right (x + w
+     *   is 320 at every step: (80,240), (95,225), (122,198), (168,152),
+     *   (232,88), (310,10), then negative and gone).  It holds the outgoing
+     *   artwork and slot 0 the incoming one.  This works with slot 0 on top
+     *   because the incoming pane is transparent where the outgoing one must
+     *   show through -- the same alpha that the menu's pane fade uses.  The
+     *   earlier note here assumed every layer was opaque and concluded the
+     *   opposite; that assumption is what the alpha channel disproves.
      *
      * A layer is drawn when it has a source address, a positive size AND its
      * enable bit set in CONTROL (+0x008): bit 6 for layer 0, bit 5 for layer 1,
@@ -417,29 +415,7 @@ bool ipod_classic_disp_compose(IPodClassicDispState *s, uint16_t *fb,
      * bits 4..6, they move all the time, and ignoring them left every finished
      * transition's surface on the panel for ever. See the header.
      */
-    /*
-     * Z ORDER, and DISP_ALPHA=1 turns it over.
-     *
-     * The order below (slot 0 at the back) was inferred from the language
-     * screen's wipe, on the assumption that every layer is opaque. MEASURED,
-     * that assumption is false: the 32-bit layer carries a real alpha channel,
-     * and while Now Playing is on screen slot 0 holds the ENTIRE player UI --
-     * title bar, artist, album, "4 of 4", progress bar -- while slot 1 holds
-     * the album art, opaque and full-screen. Drawn back-to-front the art wipes
-     * the player out completely, which is exactly the blank right-hand side
-     * that made the screen look half-drawn.
-     *
-     * Front-to-back with source-over alpha explains BOTH: the player UI sits on
-     * top of the art, and the language wipe still works because the incoming
-     * pane is transparent where the outgoing one must show through.
-     */
-    if (disp_alpha_on()) {
-        for (int k = S5L8702_DISP_NSLOTS - 1; k >= 0; k--) {
-            drew |= disp_draw_layer(s, k, fb, width, height);
-        }
-        return drew;
-    }
-    for (int k = 0; k < S5L8702_DISP_NSLOTS; k++) {
+    for (int k = S5L8702_DISP_NSLOTS - 1; k >= 0; k--) {
         drew |= disp_draw_layer(s, k, fb, width, height);
     }
     return drew;
