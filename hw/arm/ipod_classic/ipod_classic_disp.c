@@ -345,8 +345,9 @@ static bool disp_draw_layer(IPodClassicDispState *s, int k, uint16_t *fb,
                  * while Now Playing is up, the alpha byte took 243 distinct
                  * values across the surface, and the stock UI's right pane
                  * fades its artwork in with it. Straight source-over onto what
-                 * is already in the framebuffer (the layers are drawn
-                 * front-to-back, see ipod_classic_disp_compose).
+                 * is already in the framebuffer; the layers are drawn
+                 * back-to-front (slot 2 first, slot 0 last, so slot 0 ends up
+                 * on top -- see ipod_classic_disp_compose).
                  *
                  * Ignoring it is not harmless: a mid-fade frame then renders as
                  * the raw mask -- a white icon and text on black, which is
@@ -383,21 +384,27 @@ bool ipod_classic_disp_compose(IPodClassicDispState *s, uint16_t *fb,
     bool drew = false;
 
     /*
-     * Slot order is Z order, lowest index at the back. INFERRED, but a
-     * measurement does back it, and an earlier version of this comment claimed
-     * the opposite ("no two layers have ever overlapped"), which is false:
-     * slots 0 and 1 overlap the whole time the language screen appears.
+     * Z ORDER: slot 0 is composited LAST, so it is the one on top.
      *
-     * MEASURED with DISPTRACE=1 over one boot with a disk. Slot 0 is 320x240 at
-     * (0,0) for the whole run. Slot 1 is a 16-bit surface whose right edge is
-     * pinned to the panel edge while its left edge slides right -- +0x084/+0x07c
-     * go (x=80, w=240), (82, 238), (95, 225), (122, 198), (168, 152), (232, 88),
-     * (310, 10), (400, -80), so x + w is 320 at every step until the surface
-     * goes negative and stops being drawn. That is a wipe, and a wipe only works
-     * if the sliding surface is IN FRONT: slot 1 holds the outgoing artwork (the
-     * bare gradient, no text -- dumped and looked at) and slot 0 the incoming
-     * one. With the Z order the other way round slot 0 would cover slot 1 from
-     * the first frame and there would be no transition at all.
+     * The loop below runs from the highest slot down to 0, i.e. it composites
+     * back-to-front, and each 32-bit layer is blended source-over onto what is
+     * already there.  Two measurements pin the order down:
+     *
+     * - NOW PLAYING: slot 0 holds the ENTIRE player UI -- title bar, artist,
+     *   album, "4 of 4", progress bar -- while slot 1 holds the album art,
+     *   opaque and full-screen.  With slot 0 at the back the art wipes the
+     *   player out completely, which is exactly the blank right-hand side that
+     *   made that screen look half-drawn.  Slot 0 on top fixes it.
+     *
+     * - THE LANGUAGE SCREEN'S WIPE: slot 1 is a 16-bit surface whose right edge
+     *   stays pinned to the panel edge while its left edge slides right (x + w
+     *   is 320 at every step: (80,240), (95,225), (122,198), (168,152),
+     *   (232,88), (310,10), then negative and gone).  It holds the outgoing
+     *   artwork and slot 0 the incoming one.  This works with slot 0 on top
+     *   because the incoming pane is transparent where the outgoing one must
+     *   show through -- the same alpha that the menu's pane fade uses.  The
+     *   earlier note here assumed every layer was opaque and concluded the
+     *   opposite; that assumption is what the alpha channel disproves.
      *
      * A layer is drawn when it has a source address, a positive size AND its
      * enable bit set in CONTROL (+0x008): bit 6 for layer 0, bit 5 for layer 1,
@@ -407,27 +414,6 @@ bool ipod_classic_disp_compose(IPodClassicDispState *s, uint16_t *fb,
      * was right about 16/20/24 and wrong about the conclusion: the gate is
      * bits 4..6, they move all the time, and ignoring them left every finished
      * transition's surface on the panel for ever. See the header.
-     */
-    /*
-     * Z ORDER.
-     *
-     * The 32-bit layers carry a real alpha channel and the stock UI composites
-     * front-to-back with source-over: while Now Playing is on screen slot 0
-     * holds the ENTIRE player UI -- title bar, artist, album, "4 of 4",
-     * progress bar -- while slot 1 holds the album art, opaque and full-screen.
-     * Drawn back-to-front the art wipes the player out completely, which is
-     * exactly the blank right-hand side that made that screen look half-drawn.
-     * Front-to-back explains both that and the language screen's wipe: the
-     * incoming pane is transparent where the outgoing one must show through,
-     * and the main menu's right pane fades its artwork in the same way.
-     *
-     * MEASURED on the main menu: with alpha ignored, every selection change
-     * published a frame of the new pane's raw mask -- a white icon and text on
-     * black, the "black and white icon that turns colour a frame later" the
-     * browser port showed. With this compositing the same transition publishes
-     * the fade itself (the pane's colour count rises over ~200 ms instead of
-     * collapsing to two), and the settled screens hash the same: language
-     * screen 15f9cdd9, main menu 8fdb0054.
      */
     for (int k = S5L8702_DISP_NSLOTS - 1; k >= 0; k--) {
         drew |= disp_draw_layer(s, k, fb, width, height);
@@ -484,23 +470,6 @@ static void ipod_classic_disp_class_init(ObjectClass *klass, void *data)
     dc->reset = ipod_classic_disp_reset;
     dc->vmsd = &vmstate_ipod_classic_disp;
     dc->user_creatable = false;
-}
-
-/*
- * Debug aid for the browser port (LCD_FRAMES=1): the three layer slots as the
- * compositor would read them.
- */
-void ipod_classic_disp_layer_state(IPodClassicDispState *s, uint32_t out[3][5])
-{
-    for (int k = 0; k < 3; k++) {
-        hwaddr base = S5L8702_DISP_SLOT_BASE + k * S5L8702_DISP_SLOT_STEP;
-
-        out[k][0] = s->reg[(base + S5L8702_DISP_SLOT_SRC) >> 2];
-        out[k][1] = (s->reg[(base + S5L8702_DISP_SLOT_FORMAT) >> 2] >> 8) & 0xff;
-        out[k][2] = s->reg[(base + S5L8702_DISP_SLOT_STRIDE) >> 2];
-        out[k][3] = s->reg[(base + S5L8702_DISP_SLOT_SIZE) >> 2];
-        out[k][4] = s->reg[(base + S5L8702_DISP_SLOT_POS) >> 2];
-    }
 }
 
 static const TypeInfo ipod_classic_disp_info = {
