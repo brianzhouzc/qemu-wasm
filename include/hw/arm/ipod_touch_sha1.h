@@ -42,7 +42,6 @@ typedef struct IPodTouchSHA1State {
     uint8_t hashout[0x14];
     bool hw_buffer_dirty;
     bool hash_computed;
-    bool memory_fed;   /* message came in via memory mode, so it is unpadded */
     IPodTouchSHA1Ctx ctx;
 } IPodTouchSHA1State;
 
