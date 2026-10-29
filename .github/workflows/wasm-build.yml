@@ -1,0 +1,143 @@
+# Build qemu-system-arm for wasm32: the browser build iPodWasm deploys.
+#
+# Every push to a branch builds that commit; workflow_dispatch builds any
+# commit (`gh workflow run wasm-build.yml -f ref=<sha>`), including ones from
+# before this workflow existed.  The result is an artifact named
+# qemu-wasm-nog-<sha12> holding qemu-system-arm.{js,wasm,worker.js} and
+# build.json.
+#
+# The recipe is iPodWasm's tools/build.sh in its `nog` mode (the deployed
+# build: no -g, asserts off) and must stay in step with it: the same image
+# (this Dockerfile), the same configure line and flags, and the full source
+# commit as QEMU_WASM_BUILD_ID, which is what mirror.sh records for a clean
+# tree.
+name: wasm build
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit to build (default: the commit the workflow runs on)"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer push to a work branch supersedes the older build; every commit on
+  # wasm gets its own build.
+  group: wasm-build-${{ github.ref }}-${{ inputs.ref || 'push' }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref != 'refs/heads/wasm' }}
+
+jobs:
+  nog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      # The toolchain image and the build need more than the runner's free
+      # space by default.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          path: src
+          fetch-depth: 1
+          submodules: false
+
+      - name: Resolve the commit
+        id: src
+        run: |
+          commit=$(git -C src rev-parse HEAD)
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "short=${commit:0:12}" >> "$GITHUB_OUTPUT"
+          echo "building $commit"
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The Dockerfile copies nothing from its context, so an empty one keeps
+      # the source tree out of the image build.  Layers are cached in the
+      # Actions cache; only a Dockerfile change rebuilds them.
+      - name: Empty build context
+        run: mkdir -p empty-context
+      - name: Build the toolchain image
+        uses: docker/build-push-action@v6
+        with:
+          context: empty-context
+          file: src/Dockerfile
+          tags: buildqemu:ci
+          load: true
+          cache-from: type=gha,scope=buildqemu
+          cache-to: type=gha,mode=max,scope=buildqemu
+
+      # As build.sh: the source goes into the container without .git, and the
+      # build id header is written at the source root.
+      - name: Build qemu-system-arm
+        env:
+          COMMIT: ${{ steps.src.outputs.commit }}
+        run: |
+          set -euo pipefail
+          docker run --rm -d --name build buildqemu:ci >/dev/null
+          docker exec build mkdir -p /qemu
+          tar -C src --exclude=.git -cf - . | docker cp - build:/qemu
+          docker exec build bash -c "printf '#define QEMU_WASM_BUILD_ID \"%s\"\\n' '$COMMIT' > /qemu/qemu-wasm-build-id.h"
+          docker exec build bash -lc '
+          set -e
+          cd /build
+          export EXTRA_CFLAGS="-O3 -Wno-error=unused-command-line-argument -matomics -mbulk-memory -DNDEBUG -DG_DISABLE_ASSERT -D_GNU_SOURCE -pthread -sPROXY_TO_PTHREAD=1 -sFORCE_FILESYSTEM -sALLOW_TABLE_GROWTH -sTOTAL_MEMORY=2300MB -sWASM_BIGINT -sMALLOC=mimalloc"
+          emconfigure /qemu/configure --static --target-list=arm-softmmu --cpu=wasm32 --cross-prefix= \
+            --without-default-features --enable-system --with-coroutine=fiber \
+            --extra-cflags="$EXTRA_CFLAGS" --extra-cxxflags="$EXTRA_CFLAGS" \
+            --extra-ldflags="-sEXPORTED_RUNTIME_METHODS=getTempRet0,setTempRet0,addFunction,removeFunction,FS,ccall -sMODULARIZE=1 -sEXPORT_NAME=createQEMU"
+          emmake make -j$(nproc) qemu-system-arm
+          '
+          docker exec build ls -l /build | grep qemu-system-arm
+          mkdir -p out
+          # The link leaves the loader without an extension; the page asks
+          # for qemu-system-arm.js.  Accept either, as make-dist.sh does.
+          if docker exec build test -f /build/qemu-system-arm.js; then
+              docker cp build:/build/qemu-system-arm.js out/qemu-system-arm.js
+          else
+              docker cp build:/build/qemu-system-arm out/qemu-system-arm.js
+          fi
+          docker cp build:/build/qemu-system-arm.wasm out/
+          docker cp build:/build/qemu-system-arm.worker.js out/
+          docker stop build >/dev/null
+          ls -l out
+
+      # Workers static assets take at most 25 MiB per file, and a wasm
+      # without the commit in it would not refuse another build's snapshot.
+      - name: Check and describe the build
+        env:
+          COMMIT: ${{ steps.src.outputs.commit }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          size=$(stat -c%s out/qemu-system-arm.wasm)
+          [ "$size" -lt 26214400 ] || { echo "::error::the wasm is $size bytes, over the 25 MiB asset limit"; exit 1; }
+          grep -aqF "$COMMIT" out/qemu-system-arm.wasm || { echo "::error::build id $COMMIT is not in the wasm"; exit 1; }
+          wasm=$(sha256sum out/qemu-system-arm.wasm | cut -d' ' -f1)
+          printf '{"commit":"%s","wasm_sha256":"%s","wasm_id":"%s","wasm_bytes":%s,"mode":"nog","built":"%s","run":"%s"}\n' \
+            "$COMMIT" "$wasm" "${wasm:0:16}" "$size" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUN_URL" > out/build.json
+          cat out/build.json
+          {
+            echo "### qemu-system-arm (nog) at \`${COMMIT:0:12}\`"
+            echo
+            echo "| file | bytes |"
+            echo "|---|---|"
+            for f in out/*; do echo "| $(basename "$f") | $(stat -c%s "$f") |"; done
+            echo
+            echo "wasm id \`${wasm:0:16}\` (the \`wasm\` field of iPodWasm's version.json)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qemu-wasm-nog-${{ steps.src.outputs.short }}
+          path: out/
+          if-no-files-found: error
