@@ -141,3 +141,48 @@ jobs:
           name: qemu-wasm-nog-${{ steps.src.outputs.short }}
           path: out/
           if-no-files-found: error
+
+      # The build store iPodWasm serves from: R2 bucket ipodwasm-builds,
+      # qemu/<commit>/{qemu-system-arm.js,.wasm,.worker.js,build.json}.  The
+      # site looks the wasm up by the commit it pins, so a preview gets the
+      # build of its own pin.  A stored build is never replaced: production
+      # and saved snapshots are keyed to it.  build.json goes last and marks
+      # the build complete.  Without the secrets (a fork of this fork) the
+      # artifact is the only output.
+      - name: Store the build by commit
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          # R2 does not take the CLI's default request checksums.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          ENDPOINT: https://6294ad55ac3edd602393584bdb9ad15b.r2.cloudflarestorage.com
+          BUCKET: ipodwasm-builds
+          COMMIT: ${{ steps.src.outputs.commit }}
+        run: |
+          set -euo pipefail
+          if [ -z "$AWS_ACCESS_KEY_ID" ]; then
+              echo "::notice::no R2 credentials: the build is only an artifact"
+              exit 0
+          fi
+          prefix=qemu/$COMMIT
+          if err=$(aws s3api head-object --endpoint-url "$ENDPOINT" \
+                     --bucket "$BUCKET" --key "$prefix/build.json" 2>&1 >/dev/null); then
+              echo "::notice::$prefix is already stored; stored builds are not replaced"
+              exit 0
+          fi
+          case "$err" in
+              *"Not Found"*|*404*) ;;
+              *) echo "::error::cannot read the build store: $err"; exit 1 ;;
+          esac
+          put() {
+              aws s3 cp --only-show-errors --endpoint-url "$ENDPOINT" \
+                  --content-type "$2" "out/$1" "s3://$BUCKET/$prefix/$1"
+          }
+          put qemu-system-arm.wasm application/wasm
+          put qemu-system-arm.js text/javascript
+          put qemu-system-arm.worker.js text/javascript
+          put build.json application/json
+          echo "stored $prefix"
+          echo "Stored as \`$prefix/\` in the build store." >> "$GITHUB_STEP_SUMMARY"
