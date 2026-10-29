@@ -56,6 +56,7 @@
 #include "ui/pixel_ops.h"
 #include "hw/arm/ipod_classic/ipod_classic_lcd.h"
 #include "hw/arm/ipod_classic/ipod_classic_disp.h"
+#include "hw/arm/ipod_classic/ipod_classic_bootscreen.h"
 #include "hw/arm/ipod_classic/ipod_classic_np_overlay.h"
 
 /*
@@ -191,6 +192,17 @@ static void panel_pixel(IPodClassicLCDState *s, uint16_t px)
     if (s->cur_y < S5L8702_PANEL_HEIGHT && s->cur_x < S5L8702_PANEL_WIDTH) {
         s->fb[s->cur_y * S5L8702_PANEL_WIDTH + s->cur_x] = px;
         s->dirty = true;
+        /*
+         * A whole panel's worth of pixels means the guest is driving the panel,
+         * not that the boot screen is gone on the strength of one stray write.
+         */
+        if (s->boot_screen_pixels < S5L8702_PANEL_WIDTH * S5L8702_PANEL_HEIGHT) {
+            s->boot_screen_pixels++;
+            if (s->boot_screen_pixels ==
+                S5L8702_PANEL_WIDTH * S5L8702_PANEL_HEIGHT) {
+                qatomic_set(&s->boot_screen_active, 0);
+            }
+        }
     }
     s->pixels_this_frame++;
     lcd_pixels_total++;
@@ -552,6 +564,30 @@ static const MemoryRegionOps ipod_classic_lcd_ops = {
 /* ---------------------------------------------------------------- console */
 
 /*
+ * Paint the boot screen into the panel's image memory.  Called from the panel's
+ * own reset, so the panel comes up on the boot screen exactly when it would
+ * come up on whatever the bootrom/bootloader left there; the machine turns the
+ * flag on for the paths that start a kernel directly and so skip that chain.
+ *
+ * The picture is the firmware's own: the 320x240 RGB565 boot graphic from the
+ * 2.0.5 image, copied straight into image memory.  Our panel's framebuffer has
+ * the same 5-6-5 layout and byte order, so this is byte-for-byte what the
+ * hardware's boot graphics carry -- no reconstruction and no dither of ours.
+ */
+static void ipod_classic_lcd_paint_boot_screen(IPodClassicLCDState *s)
+{
+    memcpy(s->fb, ipod_boot_screen, sizeof(s->fb));
+    s->dirty = true;
+    s->boot_screen_pixels = 0;
+    qatomic_set(&s->boot_screen_active, 1);
+}
+
+void ipod_classic_lcd_set_boot_screen(IPodClassicLCDState *s, bool on)
+{
+    s->boot_screen = on;
+}
+
+/*
  * Compose the panel from the display pipe and the HLE overlay, and report
  * whether a new frame is available.  Split out for the browser build, which
  * composes on its own timer and has no console frontend to update.
@@ -588,6 +624,8 @@ static bool ipod_classic_lcd_compose(IPodClassicLCDState *s)
         s->composed_frames++;
         lcd_composed_frames++;
         s->dirty = true;
+        /* Guest content is on the panel: the boot screen is gone. */
+        qatomic_set(&s->boot_screen_active, 0);
     }
 
     /*
@@ -653,6 +691,13 @@ static IPodClassicLCDState *wasm_lcd_state;
 static uint16_t *wasm_lcd_pub[2];
 static int wasm_lcd_pub_idx;
 
+/*
+ * Whether the frame in wasm_lcd_pub[i] is still the boot screen, published with
+ * that frame so a reader never gets a state newer than the pixels it is judging
+ * (ipod_wasm_lcd_boot_screen_active() indexes it by the published one).
+ */
+static uint32_t wasm_lcd_pub_boot_screen[2];
+
 static void wasm_lcd_frame_tick(void *opaque)
 {
     IPodClassicLCDState *s = opaque;
@@ -669,6 +714,8 @@ static void wasm_lcd_frame_tick(void *opaque)
     if (memcmp(s->fb, wasm_lcd_pub[cur], bytes) != 0) {
         int next = cur ^ 1;
         memcpy(wasm_lcd_pub[next], s->fb, bytes);
+        wasm_lcd_pub_boot_screen[next] =
+            qatomic_read(&s->boot_screen_active);
         qatomic_set(&wasm_lcd_pub_idx, next);
         qatomic_store_release(&s->wasm_seq,
                               qatomic_read(&s->wasm_seq) + 1);
@@ -695,6 +742,25 @@ EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_lcd_stride(void)
 EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_lcd_seq(void)
 {
     return wasm_lcd_state ? qatomic_read(&wasm_lcd_state->wasm_seq) : 0;
+}
+
+/*
+ * True while the panel is still showing the boot screen painted at reset --
+ * i.e. until the guest first composes or has pushed a full panel's worth of
+ * pixels.  The page uses this to tell "the boot screen is up" from "the
+ * firmware has drawn something", which matters for Rockbox: its bootloader runs
+ * down the same -kernel path and its readiness check must not mistake the static
+ * boot screen for its own output.
+ */
+EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_lcd_boot_screen_active(void)
+{
+    int idx;
+
+    if (!wasm_lcd_state) {
+        return 0;
+    }
+    idx = qatomic_read(&wasm_lcd_pub_idx);
+    return wasm_lcd_pub_boot_screen[idx];
 }
 
 EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_lcd_ptr(void)
@@ -730,6 +796,10 @@ static void ipod_classic_lcd_reset(DeviceState *dev)
     s->composed_frames = 0;
 
     memset(s->fb, 0, sizeof(s->fb));
+    if (s->boot_screen) {
+        /* The panel starts on the boot screen, see ipod_classic_lcd_paint_boot_screen(). */
+        ipod_classic_lcd_paint_boot_screen(s);
+    }
     s->win_x0 = 0;
     s->win_y0 = 0;
     s->win_x1 = S5L8702_PANEL_WIDTH - 1;

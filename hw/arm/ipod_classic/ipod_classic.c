@@ -1304,6 +1304,19 @@ static void ipod_classic_machine_init(MachineState *machine)
      */
     dev = qdev_new(TYPE_IPOD_CLASSIC_LCD);
     nms->lcd = IPOD_CLASSIC_LCD(dev);
+
+    /*
+     * A machine started from -kernel skips the bootrom and bootloader, so
+     * nothing has painted the panel when the OS takes over: have the panel come
+     * up on the official boot screen that chain would have left, which the OS
+     * keeps until its first display-pipe composition overwrites it.  A machine
+     * that runs a supplied bootrom gets that from the chain itself, so the flag
+     * stays off.  -kernel wins over the bootrom, which is what this tests.
+     */
+    if (machine->kernel_filename) {
+        ipod_classic_lcd_set_boot_screen(nms->lcd, true);
+    }
+
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, LCD_MEM_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
