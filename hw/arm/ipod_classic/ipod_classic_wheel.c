@@ -678,10 +678,9 @@ static void wasm_key_do_press(IPodClassicWheelState *s, int keycode,
 {
     /*
      * Every press gets its own down and up.  The up is on a dedicated
-     * realtime timer, not the wheel tick: the tick is paced on the virtual
-     * clock and must not be kept busy by a button hold, and timer B (which
-     * makes the guest's clock host-time) no longer services a virtual release
-     * deadline reliably.
+     * realtime timer: with Rockbox's tick on host time, nothing near keeps an
+     * idle guest from warping straight past a virtual hold, so the key would
+     * go down and up before the guest had run at all.
      */
     if (s->wasm_release_timer && timer_pending(s->wasm_release_timer)) {
         timer_del(s->wasm_release_timer);
@@ -691,11 +690,9 @@ static void wasm_key_do_press(IPodClassicWheelState *s, int keycode,
     s->wasm_keycode = keycode;
     s->wasm_press_mask = s->buttons;
     s->wasm_consumed0 = qatomic_read(&s->wasm_consumed);
-    if (hold_ms > 0) {
-        timer_mod_ns(s->wasm_release_timer,
-                     qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
-                     (int64_t)hold_ms * 1000000);
-    }
+    timer_mod_ns(s->wasm_release_timer,
+                 qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                 (int64_t)MAX(hold_ms, 0) * 1000000);
 }
 
 static void wasm_key_bh_fn(void *opaque)
@@ -760,11 +757,9 @@ static void wasm_key_queue(int op, int keycode, int hold_ms)
 }
 
 /*
- * Press a key and release it after hold_ms of *guest* time.  A wall-clock
- * hold is unreliable under -icount sleep=off: the virtual clock can outrun
- * the host while the guest is idle, so a 150 ms wall hold may span almost no
- * guest time and the guest never samples the button.  The release is done by
- * the wheel's own tick timer, in guest time.
+ * Press a key and release it after hold_ms of host time.  The down and the
+ * up are both queued as packets, so a guest that is busy for the whole hold
+ * still sees the press; see wasm_key_do_press() for why this is not guest time.
  */
 EMSCRIPTEN_KEEPALIVE void ipod_wasm_key_press(int keycode, int hold_ms)
 {
