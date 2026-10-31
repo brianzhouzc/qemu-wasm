@@ -96,6 +96,20 @@ static void ipod_classic_timer_tick(void *opaque)
     }
 }
 
+static void ipod_classic_timer_host_tick(void *opaque)
+{
+    IPodClassicTimerChannel *c = opaque;
+
+    if (!c->host_tick_enabled) {
+        return;
+    }
+    c->host_tick_count += c->host_tick_step;
+    ipod_classic_timer_tick(c);
+    timer_mod_ns(c->host_tick,
+                 qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                 c->host_tick_period_ns);
+}
+
 /*
  * Source clock for a channel, from CON[10:8] (Tx_CS) and CON[6] (ECLK select).
  *
@@ -249,12 +263,35 @@ static void chan_reload(IPodClassicTimerChannel *c)
     ptimer_transaction_begin(c->ptimer);
     ptimer_set_freq(c->ptimer, chan_freq(c));
     ptimer_set_limit(c->ptimer, limit, 1);
-    if (c->cmd & S5L8702_TIMER_CMD_EN) {
+    if (c->index == 1) {
+        /* Timer B: the host-tick QEMUTimer below is the only driver. */
+        ptimer_stop(c->ptimer);
+    } else if (c->cmd & S5L8702_TIMER_CMD_EN) {
         ptimer_run(c->ptimer, 0);       /* 0: reload and keep going */
     } else {
         ptimer_stop(c->ptimer);
     }
     ptimer_transaction_commit(c->ptimer);
+
+    if (c->index == 1) {
+        uint32_t freq = chan_freq(c);
+        c->host_tick_step = (uint32_t)limit;
+        c->host_tick_period_ns =
+            freq ? (uint64_t)limit * 1000000000ULL / freq : 1000000ULL;
+        if (c->host_tick_period_ns == 0) {
+            c->host_tick_period_ns = 1000000ULL;
+        }
+        if (c->cmd & S5L8702_TIMER_CMD_EN) {
+            c->host_tick_count = 0;
+            c->host_tick_enabled = true;
+            timer_mod_ns(c->host_tick,
+                         qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                         c->host_tick_period_ns);
+        } else {
+            c->host_tick_enabled = false;
+            timer_del(c->host_tick);
+        }
+    }
 
     if (c->index == S5L8702_TIMER_E) {
         if (c->cmd & S5L8702_TIMER_CMD_EN) {
@@ -319,6 +356,9 @@ static uint64_t ipod_classic_timer_read(void *opaque, hwaddr offset,
     case S5L8702_TIMER_PRE:
         return c->pre;
     case S5L8702_TIMER_CNT:
+        if (c->index == 1) {
+            return c->host_tick_count;
+        }
         if (c->index == S5L8702_TIMER_E) {
             return timer_e_count(c);
         }
@@ -464,6 +504,11 @@ static void ipod_classic_timer_reset(DeviceState *dev)
         c->host_start_ns = 0;
         c->host_count = 0;
         c->host_anchor = false;
+        c->host_tick_count = 0;
+        c->host_tick_enabled = false;
+        if (c->host_tick) {
+            timer_del(c->host_tick);
+        }
         ptimer_transaction_begin(c->ptimer);
         ptimer_stop(c->ptimer);
         ptimer_transaction_commit(c->ptimer);
@@ -487,19 +532,20 @@ static void ipod_classic_timer_init(Object *obj)
         s->chan[i].parent = s;
         s->chan[i].index = i;
         s->chan[i].ptimer =
-            i == 1
-                ? ptimer_init_with_clock(ipod_classic_timer_tick,
-                                         &s->chan[i], PTIMER_POLICY_LEGACY,
-                                         QEMU_CLOCK_REALTIME)
-                : ptimer_init(ipod_classic_timer_tick, &s->chan[i],
-                              PTIMER_POLICY_LEGACY);
+            ptimer_init(ipod_classic_timer_tick, &s->chan[i],
+                        PTIMER_POLICY_LEGACY);
+        if (i == 1) {
+            s->chan[i].host_tick =
+                timer_new_ns(QEMU_CLOCK_REALTIME,
+                             ipod_classic_timer_host_tick, &s->chan[i]);
+        }
     }
 }
 
 static const VMStateDescription vmstate_ipod_classic_timer_channel = {
     .name = "ipod_classic_timer_channel",
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (VMStateField[]) {
         VMSTATE_PTIMER(ptimer, IPodClassicTimerChannel),
         VMSTATE_UINT32(con, IPodClassicTimerChannel),
@@ -510,6 +556,11 @@ static const VMStateDescription vmstate_ipod_classic_timer_channel = {
         VMSTATE_INT64(host_start_ns, IPodClassicTimerChannel),
         VMSTATE_UINT32(host_count, IPodClassicTimerChannel),
         VMSTATE_BOOL(host_anchor, IPodClassicTimerChannel),
+        VMSTATE_UINT64(host_tick_period_ns, IPodClassicTimerChannel),
+        VMSTATE_UINT32(host_tick_count, IPodClassicTimerChannel),
+        VMSTATE_UINT32(host_tick_step, IPodClassicTimerChannel),
+        VMSTATE_BOOL(host_tick_enabled, IPodClassicTimerChannel),
+        VMSTATE_TIMER_PTR(host_tick, IPodClassicTimerChannel),
         VMSTATE_END_OF_LIST()
     }
 };

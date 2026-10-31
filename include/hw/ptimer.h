@@ -130,19 +130,6 @@ ptimer_state *ptimer_init(ptimer_cb callback,
                           uint8_t policy_mask);
 
 /**
- * ptimer_init_with_clock - Allocate a ptimer on a chosen QEMU clock
- * @clock_type: clock the period and deadlines are measured on
- *
- * The default ptimer runs on QEMU_CLOCK_VIRTUAL.  A device whose guest-visible
- * time base must follow the host (the S5L8702 kernel tick, which must not be
- * warped by -icount) can pass QEMU_CLOCK_REALTIME instead.
- */
-ptimer_state *ptimer_init_with_clock(ptimer_cb callback,
-                                     void *callback_opaque,
-                                     uint8_t policy_mask,
-                                     QEMUClockType clock_type);
-
-/**
  * ptimer_free - Free a ptimer
  * @s: timer to free
  *
