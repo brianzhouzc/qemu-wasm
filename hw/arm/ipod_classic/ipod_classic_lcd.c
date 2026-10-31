@@ -698,8 +698,7 @@ static int wasm_lcd_pub_idx;
  * and a sleeping iPod looks like a hung one: the hardware's screen is dark.
  *
  * Only the published frame changes.  s->fb is the panel's image memory, which
- * survives a display-off and which the guest does not repaint unless it has
- * something new to show, so it has to be there when the panel comes back.
+ * survives a display-off on the hardware, so a guest may rely on it.
  */
 static uint16_t *wasm_lcd_black;
 
