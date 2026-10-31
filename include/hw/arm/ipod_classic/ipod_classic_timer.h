@@ -102,6 +102,13 @@ typedef struct {
     int64_t host_start_ns;
     uint32_t host_count;
     bool host_anchor;
+
+    /* Channel B's dedicated host-time tick (Rockbox kernel tick). */
+    QEMUTimer *host_tick;
+    uint64_t host_tick_period_ns;
+    uint32_t host_tick_backlog;         /* periods passed, not yet raised */
+    bool host_tick_enabled;
+    int64_t host_tick_next_ns;
 } IPodClassicTimerChannel;
 
 struct IPodClassicTimerState {

@@ -692,6 +692,17 @@ static uint16_t *wasm_lcd_pub[2];
 static int wasm_lcd_pub_idx;
 
 /*
+ * What the page sees while the guest has the panel off.  Rockbox sends Display
+ * Off 20 s after the last input (15 s of backlight, 5 s to LCD sleep) and then
+ * pushes no pixels until it wakes, so without this the page keeps the last frame
+ * and a sleeping iPod looks like a hung one: the hardware's screen is dark.
+ *
+ * Only the published frame changes.  s->fb is the panel's image memory, which
+ * survives a display-off on the hardware, so a guest may rely on it.
+ */
+static uint16_t *wasm_lcd_black;
+
+/*
  * Whether the frame in wasm_lcd_pub[i] is still the boot screen, published with
  * that frame so a reader never gets a state newer than the pixels it is judging
  * (ipod_wasm_lcd_boot_screen_active() indexes it by the published one).
@@ -703,6 +714,7 @@ static void wasm_lcd_frame_tick(void *opaque)
     IPodClassicLCDState *s = opaque;
     const size_t bytes = S5L8702_PANEL_WIDTH * S5L8702_PANEL_HEIGHT * 2;
     int cur = qatomic_read(&wasm_lcd_pub_idx);
+    const uint16_t *frame;
 
     /*
      * 30 Hz is enough for a 320x240 panel and halves the time the compose
@@ -710,10 +722,11 @@ static void wasm_lcd_frame_tick(void *opaque)
      * keeps the timer off the console, which has no frontend here anyway.
      */
     ipod_classic_lcd_compose(s);
+    frame = s->display_on ? s->fb : wasm_lcd_black;
 
-    if (memcmp(s->fb, wasm_lcd_pub[cur], bytes) != 0) {
+    if (memcmp(frame, wasm_lcd_pub[cur], bytes) != 0) {
         int next = cur ^ 1;
-        memcpy(wasm_lcd_pub[next], s->fb, bytes);
+        memcpy(wasm_lcd_pub[next], frame, bytes);
         wasm_lcd_pub_boot_screen[next] =
             qatomic_read(&s->boot_screen_active);
         qatomic_set(&wasm_lcd_pub_idx, next);
@@ -848,6 +861,8 @@ static void ipod_classic_lcd_realize(DeviceState *dev, Error **errp)
                                 S5L8702_PANEL_HEIGHT * 2);
     wasm_lcd_pub[1] = g_malloc0(S5L8702_PANEL_WIDTH *
                                 S5L8702_PANEL_HEIGHT * 2);
+    wasm_lcd_black = g_malloc0(S5L8702_PANEL_WIDTH *
+                               S5L8702_PANEL_HEIGHT * 2);
     wasm_lcd_pub_idx = 0;
     s->wasm_timer = timer_new_ns(QEMU_CLOCK_REALTIME, wasm_lcd_frame_tick, s);
     timer_mod(s->wasm_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +

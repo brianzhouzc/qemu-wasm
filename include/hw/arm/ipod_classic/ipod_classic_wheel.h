@@ -304,14 +304,12 @@ struct IPodClassicWheelState {
     SysBusDevice parent_obj;
 
 #ifdef EMSCRIPTEN
-    /* Browser input: releases a held key at a virtual deadline, or as soon
-     * as the guest has consumed a packet carrying the button. */
+    /* Browser input: a dedicated host-time timer releases a held key. */
     int wasm_keycode;
-    int64_t wasm_release_at;
-    int64_t wasm_release_cap;
     uint32_t wasm_press_mask;
     uint32_t wasm_consumed;      /* presses the guest has consumed */
     uint32_t wasm_consumed0;     /* counter value when the press started */
+    QEMUTimer *wasm_release_timer;
     /* Mailbox: the page queues a key, the main loop's BH performs it (Q11). */
     QEMUBH *wasm_key_bh;
     /*
