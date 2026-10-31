@@ -454,8 +454,36 @@ static void ipod_classic_timer_write(void *opaque, hwaddr offset,
             /* Initialise: reset the counter and latch DATA0/DATA1. */
             chan_reload(c);
         }
+        if (c->index == 1) {
+            /*
+             * Timer B is driven only by the host tick.  Running the virtual
+             * ptimer here as well was the 3.5x Running Time bug: the guest's
+             * TBCMD enable write started the virtual ptimer in addition to
+             * the host QEMUTimer, and the icount warp made it fire far more
+             * often than 100 Hz.
+             */
+            if (value & S5L8702_TIMER_CMD_EN) {
+                uint32_t freq = chan_freq(c);
+                uint32_t limit = c->data0 ? c->data0 : 0x10000;
+                c->host_tick_step = limit;
+                c->host_tick_period_ns =
+                    freq ? (uint64_t)limit * 1000000000ULL / freq
+                         : 1000000ULL;
+                if (c->host_tick_period_ns == 0) {
+                    c->host_tick_period_ns = 1000000ULL;
+                }
+                c->host_tick_count = 0;
+                c->host_tick_enabled = true;
+                timer_mod_ns(c->host_tick,
+                             qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                             c->host_tick_period_ns);
+            } else {
+                c->host_tick_enabled = false;
+                timer_del(c->host_tick);
+            }
+        }
         ptimer_transaction_begin(c->ptimer);
-        if (value & S5L8702_TIMER_CMD_EN) {
+        if (c->index != 1 && (value & S5L8702_TIMER_CMD_EN)) {
             ptimer_run(c->ptimer, 0);
         } else {
             ptimer_stop(c->ptimer);
