@@ -30,6 +30,7 @@ struct ptimer_state
     int64_t next_event;
     uint8_t policy_mask;
     QEMUTimer *timer;
+    QEMUClockType clock_type;
     ptimer_cb callback;
     void *callback_opaque;
     /*
@@ -203,7 +204,7 @@ uint64_t ptimer_get_count(ptimer_state *s)
     uint64_t counter;
 
     if (s->enabled && s->delta != 0) {
-        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        int64_t now = qemu_clock_get_ns(s->clock_type);
         int64_t next = s->next_event;
         int64_t last = s->last_event;
         bool expired = (now - next >= 0);
@@ -430,7 +431,7 @@ void ptimer_transaction_commit(ptimer_state *s)
      */
     while (s->need_reload && s->enabled) {
         s->need_reload = false;
-        s->next_event = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        s->next_event = qemu_clock_get_ns(s->clock_type);
         ptimer_reload(s, 0);
     }
     /* Now we've finished reload we can leave the transaction block. */
@@ -454,8 +455,9 @@ const VMStateDescription vmstate_ptimer = {
     }
 };
 
-ptimer_state *ptimer_init(ptimer_cb callback, void *callback_opaque,
-                          uint8_t policy_mask)
+ptimer_state *ptimer_init_with_clock(ptimer_cb callback, void *callback_opaque,
+                                     uint8_t policy_mask,
+                                     QEMUClockType clock_type)
 {
     ptimer_state *s;
 
@@ -463,7 +465,8 @@ ptimer_state *ptimer_init(ptimer_cb callback, void *callback_opaque,
     assert(callback);
 
     s = g_new0(ptimer_state, 1);
-    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ptimer_tick, s);
+    s->clock_type = clock_type;
+    s->timer = timer_new_ns(clock_type, ptimer_tick, s);
     s->policy_mask = policy_mask;
     s->callback = callback;
     s->callback_opaque = callback_opaque;
@@ -476,6 +479,13 @@ ptimer_state *ptimer_init(ptimer_cb callback, void *callback_opaque,
     assert(!((policy_mask & PTIMER_POLICY_TRIGGER_ONLY_ON_DECREMENT) &&
              (policy_mask & PTIMER_POLICY_NO_IMMEDIATE_TRIGGER)));
     return s;
+}
+
+ptimer_state *ptimer_init(ptimer_cb callback, void *callback_opaque,
+                          uint8_t policy_mask)
+{
+    return ptimer_init_with_clock(callback, callback_opaque, policy_mask,
+                                  QEMU_CLOCK_VIRTUAL);
 }
 
 void ptimer_free(ptimer_state *s)

@@ -476,8 +476,13 @@ static void ipod_classic_timer_init(Object *obj)
     for (unsigned i = 0; i < S5L8702_NUM_TIMERS; i++) {
         s->chan[i].parent = s;
         s->chan[i].index = i;
-        s->chan[i].ptimer = ptimer_init(ipod_classic_timer_tick, &s->chan[i],
-                                        PTIMER_POLICY_LEGACY);
+        s->chan[i].ptimer =
+            i == 1
+                ? ptimer_init_with_clock(ipod_classic_timer_tick,
+                                         &s->chan[i], PTIMER_POLICY_LEGACY,
+                                         QEMU_CLOCK_REALTIME)
+                : ptimer_init(ipod_classic_timer_tick, &s->chan[i],
+                              PTIMER_POLICY_LEGACY);
     }
 }
 
