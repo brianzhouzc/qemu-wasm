@@ -86,24 +86,46 @@ static void ipod_classic_timer_tick(void *opaque)
     ipod_classic_timer_update_irq(c->parent);
 }
 
+/* Raise the next owed tick, once the guest has acked the one before it. */
+static void host_tick_deliver(IPodClassicTimerChannel *c)
+{
+    if (c->host_tick_backlog && !(chan_status(c) & 1)) {
+        c->host_tick_backlog--;
+        chan_set_int0(c);
+        ipod_classic_timer_update_irq(c->parent);
+    }
+}
+
+/*
+ * The guest counts interrupts, so its clock is exactly as good as the number
+ * of ticks it gets.  This callback cannot run every 10 ms: the main loop sleeps
+ * between timers and on a Windows host a timed wait rounds up to the 15.6 ms
+ * scheduler tick.  MEASURED: one tick per callback, restarting from "now" when
+ * late, gave Rockbox 66 ticks a second, so Running Time gained 13 s in 20.
+ *
+ * So count every period that has passed and pay them out as the guest acks,
+ * which makes the rate independent of the host's timer resolution.  The backlog
+ * is capped: after a long stall (a suspended laptop) the clock should lose that
+ * time, not spend seconds replaying it.
+ */
+#define S5L8702_HOST_TICK_MAX_BACKLOG 100
+
 static void ipod_classic_timer_host_tick(void *opaque)
 {
     IPodClassicTimerChannel *c = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    uint64_t due = 1;
 
     if (!c->host_tick_enabled) {
         return;
     }
-    ipod_classic_timer_tick(c);
-    /*
-     * Schedule the next tick from the previous deadline, not from "now".
-     * The browser main loop can be late by a millisecond or two; scheduling
-     * from now made 100 ticks take 1.09 s and Running Time lost about 7%.
-     */
-    c->host_tick_next_ns += c->host_tick_period_ns;
-    if (c->host_tick_next_ns <= qemu_clock_get_ns(QEMU_CLOCK_REALTIME)) {
-        c->host_tick_next_ns =
-            qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + c->host_tick_period_ns;
+    if (now > c->host_tick_next_ns) {
+        due += (uint64_t)(now - c->host_tick_next_ns) / c->host_tick_period_ns;
     }
+    c->host_tick_next_ns += due * c->host_tick_period_ns;
+    c->host_tick_backlog = MIN(c->host_tick_backlog + due,
+                               S5L8702_HOST_TICK_MAX_BACKLOG);
+    host_tick_deliver(c);
     timer_mod_ns(c->host_tick, c->host_tick_next_ns);
 }
 
@@ -254,6 +276,7 @@ static void chan_host_tick_update(IPodClassicTimerChannel *c)
             (uint64_t)c->data0 * 1000000000ULL / chan_freq(c);
         c->host_tick_next_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
                                c->host_tick_period_ns;
+        c->host_tick_backlog = 0;
         c->host_tick_enabled = true;
         timer_mod_ns(c->host_tick, c->host_tick_next_ns);
     } else {
@@ -492,6 +515,10 @@ static void ipod_classic_timer_write(void *opaque, hwaddr offset,
             chan_reload(c);
         }
         ipod_classic_timer_update_irq(s);
+        /* The ack is what lets the next owed tick through. */
+        if (c->host_tick_enabled) {
+            host_tick_deliver(c);
+        }
         break;
     }
     case S5L8702_TIMER_CMD:
@@ -557,6 +584,7 @@ static void ipod_classic_timer_reset(DeviceState *dev)
         c->host_count = 0;
         c->host_anchor = false;
         c->host_tick_next_ns = 0;
+        c->host_tick_backlog = 0;
         c->host_tick_enabled = false;
         timer_del(c->host_tick);
         ptimer_transaction_begin(c->ptimer);
@@ -606,6 +634,7 @@ static const VMStateDescription vmstate_ipod_classic_timer_channel = {
         VMSTATE_UINT32(host_count, IPodClassicTimerChannel),
         VMSTATE_BOOL(host_anchor, IPodClassicTimerChannel),
         VMSTATE_UINT64(host_tick_period_ns, IPodClassicTimerChannel),
+        VMSTATE_UINT32(host_tick_backlog, IPodClassicTimerChannel),
         VMSTATE_BOOL(host_tick_enabled, IPodClassicTimerChannel),
         VMSTATE_INT64(host_tick_next_ns, IPodClassicTimerChannel),
         VMSTATE_TIMER_PTR(host_tick, IPodClassicTimerChannel),
