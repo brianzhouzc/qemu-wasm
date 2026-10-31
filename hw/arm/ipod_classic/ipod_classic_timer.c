@@ -87,12 +87,14 @@ static void ipod_classic_timer_tick(void *opaque)
     chan_set_int0(c);
     ipod_classic_timer_update_irq(c->parent);
     /*
-     * A halted vCPU may be waiting for the guest timer interrupt itself
-     * (timer B's kernel tick or timer F's user timeout).  Kick it on every
-     * timer interrupt, not just B, so Rockbox's UI timeout and Running Time
-     * redraw run while the screen is idle.
+     * Timer B is the guest's 100 Hz kernel tick.  When it is on host time the
+     * vCPU may be halted in WFI between ticks; kick it so Rockbox's tick task
+     * runs.  Do not kick on every channel: doing so keeps the vCPU out of the
+     * idle path and Rockbox never reaches its idle power-off.
      */
-    ipod_classic_wake_vcpu();
+    if (c->index == 1) {
+        ipod_classic_wake_vcpu();
+    }
 }
 
 static void ipod_classic_timer_host_tick(void *opaque)

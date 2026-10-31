@@ -686,7 +686,6 @@ void ipod_classic_wake_vcpu(void)
     }
     cs = &ipod_machine->cpu->parent_obj;
     cs->interrupt_request |= CPU_INTERRUPT_EXITTB;
-    cs->exit_request = true;
     qemu_cpu_kick(cs);
 }
 
