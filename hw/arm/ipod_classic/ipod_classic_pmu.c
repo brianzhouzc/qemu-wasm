@@ -66,6 +66,7 @@
  * I2C device does not.
  */
 void ipod_classic_power_off(void);
+void ipod_classic_wake_vcpu(void);
 
 /*
  * PMUBATT=N overrides the raw battery reading, 0..1023.
@@ -200,7 +201,15 @@ static uint8_t pmu_reg_read(IPodClassicPMUState *s, uint8_t addr)
             struct tm tm;
             unsigned v;
 
-            qemu_get_timedate(&tm, 0);
+            {
+                /*
+                 * The RTC must follow the host, not QEMU_CLOCK_VIRTUAL:
+                 * under -icount the virtual clock is warped to the next timer
+                 * while the vCPU is halted, which made the guest clock race.
+                 */
+                time_t host_now = time(NULL);
+                gmtime_r(&host_now, &tm);
+            }
             switch (addr - PCF5063X_REG_RTCSC) {
             case 0: v = tm.tm_sec;          break;
             case 1: v = tm.tm_min;          break;
@@ -388,9 +397,26 @@ static int ipod_classic_pmu_send(I2CSlave *i2c, uint8_t data)
     return 0;
 }
 
+static void pmu_rtc_second_tick(void *opaque)
+{
+    IPodClassicPMUState *s = opaque;
+
+    s->reg[PCF5063X_REG_INT1] |= 0x80; /* INT1_SECOND */
+    ipod_classic_wake_vcpu();
+    timer_mod_ns(s->rtc_second,
+                 qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 1000000000LL);
+}
+
 static void ipod_classic_pmu_reset(DeviceState *dev)
 {
     IPodClassicPMUState *s = IPOD_CLASSIC_PMU(dev);
+
+    if (!s->rtc_second) {
+        s->rtc_second = timer_new_ns(QEMU_CLOCK_REALTIME,
+                                     pmu_rtc_second_tick, s);
+    }
+    timer_mod_ns(s->rtc_second,
+                 qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 1000000000LL);
 
     memset(s->reg, 0, sizeof(s->reg));
     s->addr = 0;
@@ -452,8 +478,8 @@ static void ipod_classic_pmu_reset(DeviceState *dev)
 
 static const VMStateDescription vmstate_ipod_classic_pmu = {
     .name = TYPE_IPOD_CLASSIC_PMU,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (VMStateField[]) {
         VMSTATE_I2C_SLAVE(parent_obj, IPodClassicPMUState),
         VMSTATE_UINT8_ARRAY(reg, IPodClassicPMUState, S5L8702_PMU_NUM_REGS),
@@ -461,6 +487,7 @@ static const VMStateDescription vmstate_ipod_classic_pmu = {
         VMSTATE_BOOL(addr_pending, IPodClassicPMUState),
         VMSTATE_UINT8(addr_saved, IPodClassicPMUState),
         VMSTATE_BOOL(wrote_data, IPodClassicPMUState),
+        VMSTATE_TIMER_PTR(rtc_second, IPodClassicPMUState),
         VMSTATE_END_OF_LIST()
     },
 };
