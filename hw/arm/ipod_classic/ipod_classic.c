@@ -1133,12 +1133,6 @@ EMSCRIPTEN_KEEPALIVE const char *ipod_wasm_build_id(void)
     return QEMU_WASM_BUILD_ID;
 }
 
-/* Page-thread timer pump: wake QEMU main loop so realtime timers run. */
-EMSCRIPTEN_KEEPALIVE void ipod_wasm_kick(void)
-{
-    qemu_notify_event();
-}
-
 /*
  * The save leaves the VM stopped (state 4) so the caller can read a disk that
  * matches the saved RAM.  It must call this when it is done.
