@@ -163,7 +163,8 @@ static uint32_t wheel_fifo_pop(IPodClassicWheelState *s)
     s->fifo_head = (s->fifo_head + 1) % S5L8702_WHEEL_FIFO_LEN;
     s->fifo_len--;
 #ifdef EMSCRIPTEN
-    if (s->wasm_release_at &&
+    if (s->wasm_release_timer &&
+        timer_pending(s->wasm_release_timer) &&
         ((word >> S5L8702_WHEEL_BTN_SHIFT) & s->wasm_press_mask)) {
         /*
          * A monotonic counter, not a flag: a flag can be missed between two
@@ -279,20 +280,21 @@ static void wheel_kick(IPodClassicWheelState *s)
     timer_mod(s->tick, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->tick_ns);
 }
 
+#ifdef EMSCRIPTEN
+static void wasm_release_timer_cb(void *opaque)
+{
+    IPodClassicWheelState *s = opaque;
+
+    s->wasm_press_mask = 0;
+    wheel_key_event(s, s->wasm_keycode | 0x80);
+}
+#endif
+
 static void wheel_tick(void *opaque)
 {
     IPodClassicWheelState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     bool busy;
-
-#ifdef EMSCRIPTEN
-    if (s->wasm_release_at && now >= s->wasm_release_at &&
-        (qatomic_read(&s->wasm_consumed) != s->wasm_consumed0 ||
-         now >= s->wasm_release_cap)) {
-        s->wasm_release_at = 0;
-        wheel_key_event(s, s->wasm_keycode | 0x80);
-    }
-#endif
 
     /*
      * If the guest has not drained what it already has, do not add to it.
@@ -328,11 +330,15 @@ static void wheel_tick(void *opaque)
          * The wheel keys do not change the button state, so the packet that
          * pays out the last pending step is what "consumes" a detent (Q12).
          */
-        if (s->wasm_release_at && s->pending_steps == 0 &&
+#ifdef EMSCRIPTEN
+        if (s->wasm_release_timer &&
+            timer_pending(s->wasm_release_timer) &&
+            s->pending_steps == 0 &&
             ((s->wasm_keycode & 0x7f) == 0x12 ||   /* cw */
              (s->wasm_keycode & 0x7f) == 0x10)) {  /* ccw */
             s->wasm_consumed = qatomic_read(&s->wasm_consumed) + 1;
         }
+#endif
     } else if (s->touched && now >= s->untouch_at) {
         /*
          * The finger comes off. This is not cosmetic: the ISR uses an
@@ -622,6 +628,11 @@ static void ipod_classic_wheel_reset(DeviceState *dev)
     s->sent_buttons = 0;
     s->irq_level = false;
     timer_del(s->tick);
+#ifdef EMSCRIPTEN
+    if (s->wasm_release_timer) {
+        timer_del(s->wasm_release_timer);
+    }
+#endif
     qemu_set_irq(s->irq, 0);
 }
 
@@ -666,31 +677,24 @@ static void wasm_key_do_press(IPodClassicWheelState *s, int keycode,
                               int hold_ms)
 {
     /*
-     * A wall-clock wait between two presses can be shorter than the previous
-     * press's guest-time hold, and a new deadline would overwrite the pending
-     * release and leave the button down. Release the previous key first, so
-     * every press has a down and an up.
+     * Every press gets its own down and up.  The up is on a dedicated
+     * realtime timer, not the wheel tick: the tick is paced on the virtual
+     * clock and must not be kept busy by a button hold, and timer B (which
+     * makes the guest's clock host-time) no longer services a virtual release
+     * deadline reliably.
      */
-    if (s->wasm_release_at) {
-        s->wasm_release_at = 0;
+    if (s->wasm_release_timer && timer_pending(s->wasm_release_timer)) {
+        timer_del(s->wasm_release_timer);
         wheel_key_event(s, s->wasm_keycode | 0x80);
     }
     wheel_key_event(s, keycode);
     s->wasm_keycode = keycode;
     s->wasm_press_mask = s->buttons;
     s->wasm_consumed0 = qatomic_read(&s->wasm_consumed);
-    s->wasm_release_at = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                         (int64_t)hold_ms * 1000000;
-    s->wasm_release_cap = s->wasm_release_at + 1000 * 1000000;
-
-    /*
-     * Keep the wheel ticking until the release deadline.  The tick only
-     * reschedules while there is something to send, so if its repeat window
-     * ends first the release never happens and the button stays down for the
-     * guest -- which drops every later press.
-     */
-    if (s->button_repeat_until < s->wasm_release_at) {
-        s->button_repeat_until = s->wasm_release_at;
+    if (hold_ms > 0) {
+        timer_mod_ns(s->wasm_release_timer,
+                     qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                     (int64_t)hold_ms * 1000000);
     }
 }
 
@@ -817,6 +821,8 @@ static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
 #ifdef EMSCRIPTEN
     wasm_wheel_state = s;
     s->wasm_key_bh = qemu_bh_new(wasm_key_bh_fn, s);
+    s->wasm_release_timer =
+        timer_new_ns(QEMU_CLOCK_REALTIME, wasm_release_timer_cb, s);
 #endif
 }
 
@@ -850,15 +856,14 @@ static const VMStateDescription vmstate_ipod_classic_wheel_wasm = {
      * left unconsumed and the parent footer check fails.
      */
     .name = "s5l8702.wheel.wasm",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (VMStateField[]) {
         VMSTATE_INT32(wasm_keycode, IPodClassicWheelState),
-        VMSTATE_INT64(wasm_release_at, IPodClassicWheelState),
-        VMSTATE_INT64(wasm_release_cap, IPodClassicWheelState),
         VMSTATE_UINT32(wasm_press_mask, IPodClassicWheelState),
         VMSTATE_UINT32(wasm_consumed, IPodClassicWheelState),
         VMSTATE_UINT32(wasm_consumed0, IPodClassicWheelState),
+        VMSTATE_TIMER_PTR(wasm_release_timer, IPodClassicWheelState),
         VMSTATE_END_OF_LIST()
     },
 };
