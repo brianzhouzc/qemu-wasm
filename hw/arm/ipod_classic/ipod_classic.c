@@ -1509,10 +1509,11 @@ static void ipod_classic_machine_init(MachineState *machine)
     /*
      * SHA1_OFF=1 leaves the block as the zero window it used to be. Kept as a
      * switch because turning the engine on changes what the firmware can
-     * verify: with it the panic-reset stops, but a disk image whose iTunesDB
-     * hash the device cannot reproduce is then rejected outright ("0 songs")
-     * instead of being accepted by a check that could never fail. Being able to
-     * A/B the two on the same image is what tells those apart.
+     * verify: with it the panic-reset stops, and a disk whose iTunesDB is
+     * signed with the real hash58 (libgpod's HMAC-SHA1 over the file) loads,
+     * while a zeroed signature is rejected outright ("0 songs") instead of
+     * being accepted by a check that could never fail. Being able to A/B the
+     * two on the same image is what tells those apart.
      */
     /*
      * The 1 MB window is backed EITHER WAY, and the engine sits on top of it.
