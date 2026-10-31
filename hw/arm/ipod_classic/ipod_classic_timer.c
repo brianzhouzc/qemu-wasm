@@ -78,12 +78,22 @@ static void chan_set_int0(IPodClassicTimerChannel *c)
     }
 }
 
+void ipod_classic_wake_vcpu(void);
+
 static void ipod_classic_timer_tick(void *opaque)
 {
     IPodClassicTimerChannel *c = opaque;
 
     chan_set_int0(c);
     ipod_classic_timer_update_irq(c->parent);
+    /*
+     * Timer B is the guest's 100 Hz kernel tick.  When it is on host time the
+     * vCPU may be halted in WFI between ticks; kick it so Rockbox's tick task
+     * (and the Running Time redraw) runs even without input.
+     */
+    if (c->index == 1) {
+        ipod_classic_wake_vcpu();
+    }
 }
 
 /*
