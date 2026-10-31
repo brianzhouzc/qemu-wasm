@@ -109,6 +109,7 @@ typedef struct {
     uint32_t host_tick_count;
     uint32_t host_tick_step;
     bool host_tick_enabled;
+    int64_t host_tick_next_ns;
 } IPodClassicTimerChannel;
 
 struct IPodClassicTimerState {

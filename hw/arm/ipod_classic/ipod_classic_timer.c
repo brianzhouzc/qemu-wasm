@@ -105,9 +105,17 @@ static void ipod_classic_timer_host_tick(void *opaque)
     }
     c->host_tick_count += c->host_tick_step;
     ipod_classic_timer_tick(c);
-    timer_mod_ns(c->host_tick,
-                 qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
-                 c->host_tick_period_ns);
+    /*
+     * Schedule the next tick from the previous deadline, not from "now".
+     * The browser main loop can be late by a millisecond or two; scheduling
+     * from now made 100 ticks take 1.09 s and Running Time lost about 7%.
+     */
+    c->host_tick_next_ns += c->host_tick_period_ns;
+    if (c->host_tick_next_ns <= qemu_clock_get_ns(QEMU_CLOCK_REALTIME)) {
+        c->host_tick_next_ns =
+            qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + c->host_tick_period_ns;
+    }
+    timer_mod_ns(c->host_tick, c->host_tick_next_ns);
 }
 
 /*
@@ -284,9 +292,10 @@ static void chan_reload(IPodClassicTimerChannel *c)
         if (c->cmd & S5L8702_TIMER_CMD_EN) {
             c->host_tick_count = 0;
             c->host_tick_enabled = true;
-            timer_mod_ns(c->host_tick,
-                         qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
-                         c->host_tick_period_ns);
+            c->host_tick_next_ns =
+                qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                c->host_tick_period_ns;
+            timer_mod_ns(c->host_tick, c->host_tick_next_ns);
         } else {
             c->host_tick_enabled = false;
             timer_del(c->host_tick);
@@ -474,9 +483,10 @@ static void ipod_classic_timer_write(void *opaque, hwaddr offset,
                 }
                 c->host_tick_count = 0;
                 c->host_tick_enabled = true;
-                timer_mod_ns(c->host_tick,
-                             qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
-                             c->host_tick_period_ns);
+                c->host_tick_next_ns =
+                    qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                    c->host_tick_period_ns;
+                timer_mod_ns(c->host_tick, c->host_tick_next_ns);
             } else {
                 c->host_tick_enabled = false;
                 timer_del(c->host_tick);
@@ -533,6 +543,7 @@ static void ipod_classic_timer_reset(DeviceState *dev)
         c->host_count = 0;
         c->host_anchor = false;
         c->host_tick_count = 0;
+        c->host_tick_next_ns = 0;
         c->host_tick_enabled = false;
         if (c->host_tick) {
             timer_del(c->host_tick);
@@ -588,6 +599,7 @@ static const VMStateDescription vmstate_ipod_classic_timer_channel = {
         VMSTATE_UINT32(host_tick_count, IPodClassicTimerChannel),
         VMSTATE_UINT32(host_tick_step, IPodClassicTimerChannel),
         VMSTATE_BOOL(host_tick_enabled, IPodClassicTimerChannel),
+        VMSTATE_INT64(host_tick_next_ns, IPodClassicTimerChannel),
         VMSTATE_TIMER_PTR(host_tick, IPodClassicTimerChannel),
         VMSTATE_END_OF_LIST()
     }
