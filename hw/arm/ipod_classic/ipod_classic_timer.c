@@ -185,6 +185,23 @@ static uint32_t chan_freq(IPodClassicTimerChannel *c)
  * the one that was measurably wrong, and that one IS fixed; see the CON case
  * in ipod_classic_timer_write().
  */
+#define S5L8702_TIMER_E 4
+
+static uint32_t timer_e_count(IPodClassicTimerChannel *c)
+{
+    int64_t elapsed;
+
+    if (!c->host_anchor) {
+        return c->host_count;
+    }
+    elapsed = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - c->host_start_ns;
+    if (elapsed <= 0) {
+        return c->host_count;
+    }
+    return c->host_count +
+           (uint32_t)((uint64_t)elapsed * chan_freq(c) / 1000000000ULL);
+}
+
 static void chan_reload(IPodClassicTimerChannel *c)
 {
     uint64_t limit = c->data0;
@@ -228,6 +245,17 @@ static void chan_reload(IPodClassicTimerChannel *c)
         ptimer_stop(c->ptimer);
     }
     ptimer_transaction_commit(c->ptimer);
+
+    if (c->index == S5L8702_TIMER_E) {
+        if (c->cmd & S5L8702_TIMER_CMD_EN) {
+            c->host_start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            c->host_count = 0;
+            c->host_anchor = true;
+        } else {
+            c->host_count = timer_e_count(c);
+            c->host_anchor = false;
+        }
+    }
 }
 
 /* Map an MMIO offset to a channel and a register, or return false. */
@@ -281,10 +309,9 @@ static uint64_t ipod_classic_timer_read(void *opaque, hwaddr offset,
     case S5L8702_TIMER_PRE:
         return c->pre;
     case S5L8702_TIMER_CNT:
-        /*
-         * The hardware counts up towards DATA0; ptimer counts down towards
-         * zero, so report the difference.
-         */
+        if (c->index == S5L8702_TIMER_E) {
+            return timer_e_count(c);
+        }
         return c->data0 - ptimer_get_count(c->ptimer);
     default:
         qemu_log_mask(LOG_GUEST_ERROR, "%s: bad register 0x%" HWADDR_PRIx
@@ -424,6 +451,9 @@ static void ipod_classic_timer_reset(DeviceState *dev)
         IPodClassicTimerChannel *c = &s->chan[i];
 
         c->con = c->cmd = c->data0 = c->data1 = c->pre = 0;
+        c->host_start_ns = 0;
+        c->host_count = 0;
+        c->host_anchor = false;
         ptimer_transaction_begin(c->ptimer);
         ptimer_stop(c->ptimer);
         ptimer_transaction_commit(c->ptimer);
@@ -453,8 +483,8 @@ static void ipod_classic_timer_init(Object *obj)
 
 static const VMStateDescription vmstate_ipod_classic_timer_channel = {
     .name = "ipod_classic_timer_channel",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (VMStateField[]) {
         VMSTATE_PTIMER(ptimer, IPodClassicTimerChannel),
         VMSTATE_UINT32(con, IPodClassicTimerChannel),
@@ -462,6 +492,9 @@ static const VMStateDescription vmstate_ipod_classic_timer_channel = {
         VMSTATE_UINT32(data0, IPodClassicTimerChannel),
         VMSTATE_UINT32(data1, IPodClassicTimerChannel),
         VMSTATE_UINT32(pre, IPodClassicTimerChannel),
+        VMSTATE_INT64(host_start_ns, IPodClassicTimerChannel),
+        VMSTATE_UINT32(host_count, IPodClassicTimerChannel),
+        VMSTATE_BOOL(host_anchor, IPodClassicTimerChannel),
         VMSTATE_END_OF_LIST()
     }
 };

@@ -99,6 +99,9 @@ typedef struct {
     uint32_t data0;
     uint32_t data1;
     uint32_t pre;
+    int64_t host_start_ns;
+    uint32_t host_count;
+    bool host_anchor;
 } IPodClassicTimerChannel;
 
 struct IPodClassicTimerState {
