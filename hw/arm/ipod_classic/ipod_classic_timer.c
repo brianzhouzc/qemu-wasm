@@ -93,7 +93,6 @@ static void ipod_classic_timer_host_tick(void *opaque)
     if (!c->host_tick_enabled) {
         return;
     }
-    c->host_tick_count += c->host_tick_step;
     ipod_classic_timer_tick(c);
     /*
      * Schedule the next tick from the previous deadline, not from "now".
@@ -207,7 +206,77 @@ static uint32_t chan_freq(IPodClassicTimerChannel *c)
  * the one that was measurably wrong, and that one IS fixed; see the CON case
  * in ipod_classic_timer_write().
  */
+#define S5L8702_TIMER_B 1
 #define S5L8702_TIMER_E 4
+
+/*
+ * Rockbox's kernel tick: timer B at 12 MHz / 16 / 75 = 10 kHz, DATA0 = 100.
+ * Only this configuration runs from host time.  The retailOS programs timer B
+ * at 6 MHz / 6000 and stays on the virtual ptimer, or its boot would wait in
+ * real time instead of warping (66 s against 35.6 s).
+ */
+static bool chan_is_host_tick(IPodClassicTimerChannel *c)
+{
+    return c->index == S5L8702_TIMER_B && c->data0 == 100 &&
+           chan_freq(c) == 10000;
+}
+
+/*
+ * Should this channel's virtual ptimer run?
+ *
+ * NOT THE FREE-RUNNING TIMER E, unless the guest wants its interrupt.  E's
+ * count comes from the host (timer_e_count()), so all the ptimer can still do
+ * is raise the wrap interrupt, and neither firmware enables that.  But an armed
+ * virtual timer is not harmless: under -icount sleep=off a halted vCPU warps
+ * QEMU_CLOCK_VIRTUAL straight to the next virtual deadline, however far away.
+ *
+ * With Rockbox's tick on host time, E's wrap was the only deadline left, so
+ * every idle WFI jumped the clock by 2^32 us (71.6 minutes).  MEASURED on the
+ * heartbeat: about 40,000 wraps per second, every jump a whole number of them.
+ * vclock reached INT64_MAX within a minute of boot and no virtual timer could
+ * fire after that, which stopped input and Rockbox's idle shutdown.
+ */
+static bool chan_ptimer_wanted(IPodClassicTimerChannel *c)
+{
+    if (!(c->cmd & S5L8702_TIMER_CMD_EN) || chan_is_host_tick(c)) {
+        return false;
+    }
+    return c->index != S5L8702_TIMER_E || chan_enabled_ints(c) != 0;
+}
+
+static void chan_host_tick_update(IPodClassicTimerChannel *c)
+{
+    if (c->index != S5L8702_TIMER_B) {
+        return;
+    }
+    if (chan_is_host_tick(c) && (c->cmd & S5L8702_TIMER_CMD_EN)) {
+        c->host_tick_period_ns =
+            (uint64_t)c->data0 * 1000000000ULL / chan_freq(c);
+        c->host_tick_next_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                               c->host_tick_period_ns;
+        c->host_tick_enabled = true;
+        timer_mod_ns(c->host_tick, c->host_tick_next_ns);
+    } else {
+        c->host_tick_enabled = false;
+        timer_del(c->host_tick);
+    }
+}
+
+/* How far through the current period the host tick is, as TBCNT reads it. */
+static uint32_t host_tick_count(IPodClassicTimerChannel *c)
+{
+    int64_t left = c->host_tick_next_ns -
+                   qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    if (left <= 0) {
+        return c->data0;
+    }
+    if ((uint64_t)left >= c->host_tick_period_ns) {
+        return 0;
+    }
+    return c->data0 -
+           (uint32_t)((uint64_t)left * c->data0 / c->host_tick_period_ns);
+}
 
 static uint32_t timer_e_count(IPodClassicTimerChannel *c)
 {
@@ -258,47 +327,17 @@ static void chan_reload(IPodClassicTimerChannel *c)
         limit = chan_is_32bit(c) ? 0x100000000ULL : 0x10000;
     }
 
-    bool host_b = c->index == 1 && chan_freq(c) == 10000 &&
-                  limit == 100;
-
     ptimer_transaction_begin(c->ptimer);
     ptimer_set_freq(c->ptimer, chan_freq(c));
     ptimer_set_limit(c->ptimer, limit, 1);
-    if (host_b) {
-        /* Rockbox timer B: the host-tick QEMUTimer below drives it. */
-        ptimer_stop(c->ptimer);
-    } else if (c->cmd & S5L8702_TIMER_CMD_EN) {
+    if (chan_ptimer_wanted(c)) {
         ptimer_run(c->ptimer, 0);       /* 0: reload and keep going */
     } else {
         ptimer_stop(c->ptimer);
     }
     ptimer_transaction_commit(c->ptimer);
 
-    if (c->index == 1) {
-        uint32_t freq = chan_freq(c);
-        if (!host_b) {
-            c->host_tick_enabled = false;
-            timer_del(c->host_tick);
-        } else {
-            c->host_tick_step = (uint32_t)limit;
-            c->host_tick_period_ns =
-                freq ? (uint64_t)limit * 1000000000ULL / freq : 1000000ULL;
-            if (c->host_tick_period_ns == 0) {
-                c->host_tick_period_ns = 1000000ULL;
-            }
-            if (c->cmd & S5L8702_TIMER_CMD_EN) {
-                c->host_tick_count = 0;
-                c->host_tick_enabled = true;
-                c->host_tick_next_ns =
-                    qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
-                    c->host_tick_period_ns;
-                timer_mod_ns(c->host_tick, c->host_tick_next_ns);
-            } else {
-                c->host_tick_enabled = false;
-                timer_del(c->host_tick);
-            }
-        }
-    }
+    chan_host_tick_update(c);
 
     if (c->index == S5L8702_TIMER_E) {
         if (c->cmd & S5L8702_TIMER_CMD_EN) {
@@ -363,8 +402,8 @@ static uint64_t ipod_classic_timer_read(void *opaque, hwaddr offset,
     case S5L8702_TIMER_PRE:
         return c->pre;
     case S5L8702_TIMER_CNT:
-        if (c->index == 1) {
-            return c->host_tick_count;
+        if (c->host_tick_enabled) {
+            return host_tick_count(c);
         }
         if (c->index == S5L8702_TIMER_E) {
             return timer_e_count(c);
@@ -461,39 +500,14 @@ static void ipod_classic_timer_write(void *opaque, hwaddr offset,
             /* Initialise: reset the counter and latch DATA0/DATA1. */
             chan_reload(c);
         }
-        bool host_b = c->index == 1 && chan_freq(c) == 10000 &&
-                      (c->data0 ? c->data0 : 0x10000) == 100;
-        if (host_b) {
-            /*
-             * Rockbox's timer B is driven only by the host tick.  Running the
-             * virtual ptimer here as well was the 3.5x Running Time bug: the
-             * guest's TBCMD enable write started the virtual ptimer in
-             * addition to the host QEMUTimer, and the icount warp made it
-             * fire far more often than 100 Hz.
-             */
-            if (value & S5L8702_TIMER_CMD_EN) {
-                uint32_t freq = chan_freq(c);
-                uint32_t limit = c->data0 ? c->data0 : 0x10000;
-                c->host_tick_step = limit;
-                c->host_tick_period_ns =
-                    freq ? (uint64_t)limit * 1000000000ULL / freq
-                         : 1000000ULL;
-                if (c->host_tick_period_ns == 0) {
-                    c->host_tick_period_ns = 1000000ULL;
-                }
-                c->host_tick_count = 0;
-                c->host_tick_enabled = true;
-                c->host_tick_next_ns =
-                    qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
-                    c->host_tick_period_ns;
-                timer_mod_ns(c->host_tick, c->host_tick_next_ns);
-            } else {
-                c->host_tick_enabled = false;
-                timer_del(c->host_tick);
-            }
-        }
+        /*
+         * Rockbox's timer B runs on the host tick alone: starting the virtual
+         * ptimer here as well was a 3.5x Running Time bug, because the warp
+         * fired it far more often than 100 Hz.
+         */
+        chan_host_tick_update(c);
         ptimer_transaction_begin(c->ptimer);
-        if (!host_b && (value & S5L8702_TIMER_CMD_EN)) {
+        if (chan_ptimer_wanted(c)) {
             ptimer_run(c->ptimer, 0);
         } else {
             ptimer_stop(c->ptimer);
@@ -542,12 +556,9 @@ static void ipod_classic_timer_reset(DeviceState *dev)
         c->host_start_ns = 0;
         c->host_count = 0;
         c->host_anchor = false;
-        c->host_tick_count = 0;
         c->host_tick_next_ns = 0;
         c->host_tick_enabled = false;
-        if (c->host_tick) {
-            timer_del(c->host_tick);
-        }
+        timer_del(c->host_tick);
         ptimer_transaction_begin(c->ptimer);
         ptimer_stop(c->ptimer);
         ptimer_transaction_commit(c->ptimer);
@@ -573,11 +584,10 @@ static void ipod_classic_timer_init(Object *obj)
         s->chan[i].ptimer =
             ptimer_init(ipod_classic_timer_tick, &s->chan[i],
                         PTIMER_POLICY_LEGACY);
-        if (i == 1) {
-            s->chan[i].host_tick =
-                timer_new_ns(QEMU_CLOCK_REALTIME,
-                             ipod_classic_timer_host_tick, &s->chan[i]);
-        }
+        /* On every channel: VMSTATE_TIMER_PTR cannot take a NULL. */
+        s->chan[i].host_tick =
+            timer_new_ns(QEMU_CLOCK_REALTIME,
+                         ipod_classic_timer_host_tick, &s->chan[i]);
     }
 }
 
@@ -596,8 +606,6 @@ static const VMStateDescription vmstate_ipod_classic_timer_channel = {
         VMSTATE_UINT32(host_count, IPodClassicTimerChannel),
         VMSTATE_BOOL(host_anchor, IPodClassicTimerChannel),
         VMSTATE_UINT64(host_tick_period_ns, IPodClassicTimerChannel),
-        VMSTATE_UINT32(host_tick_count, IPodClassicTimerChannel),
-        VMSTATE_UINT32(host_tick_step, IPodClassicTimerChannel),
         VMSTATE_BOOL(host_tick_enabled, IPodClassicTimerChannel),
         VMSTATE_INT64(host_tick_next_ns, IPodClassicTimerChannel),
         VMSTATE_TIMER_PTR(host_tick, IPodClassicTimerChannel),
