@@ -98,15 +98,15 @@ static void host_tick_deliver(IPodClassicTimerChannel *c)
 
 /*
  * The guest counts interrupts, so its clock is exactly as good as the number
- * of ticks it gets.  This callback cannot run every 10 ms: the main loop sleeps
- * between timers and on a Windows host a timed wait rounds up to the 15.6 ms
- * scheduler tick.  MEASURED: one tick per callback, restarting from "now" when
- * late, gave Rockbox 66 ticks a second, so Running Time gained 13 s in 20.
+ * of ticks it gets, and nothing promises this callback runs every 10 ms: the
+ * main loop sleeps between timers.  MEASURED on a Windows host: one tick per
+ * callback, restarting from "now" when late, gave Rockbox 66 ticks a second,
+ * so Running Time gained 13 s in 20.
  *
  * So count every period that has passed and pay them out as the guest acks,
- * which makes the rate independent of the host's timer resolution.  The backlog
- * is capped: after a long stall (a suspended laptop) the clock should lose that
- * time, not spend seconds replaying it.
+ * which makes the rate independent of how late the callback runs (1.00x).  The
+ * backlog is capped: after a long stall (a suspended laptop) the clock should
+ * lose that time, not spend seconds replaying it.
  */
 #define S5L8702_HOST_TICK_MAX_BACKLOG 100
 
