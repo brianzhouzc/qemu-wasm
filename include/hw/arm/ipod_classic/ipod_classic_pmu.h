@@ -120,6 +120,9 @@ struct IPodClassicPMUState {
      */
     uint8_t addr_saved;
     bool wrote_data;
+
+    /* The PCF50635 raises INT1_SECOND once a second. */
+    QEMUTimer *rtc_second;
 };
 
 #endif
