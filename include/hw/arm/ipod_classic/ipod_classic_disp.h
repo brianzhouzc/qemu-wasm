@@ -46,39 +46,29 @@
  *          path makes, so the decode above is confirmed end to end.
  *  +0x00c  (M) 0x000f0f0f from a literal at 0x08127460. UNDETERMINED.
  *  +0x020  (M) written 1 next to +0x004. UNDETERMINED.
- *  +0x024  (M) 0x00ffffff. UNDETERMINED.
- *  +0x030  (V) destination rectangle origin, (y | x << 16)
- *  +0x034  (V) destination rectangle limit, ((y+h) | (x+w) << 16)
- *          Both from 0x08127964, the blit entry point.
- *  +0x038  (V) SOURCE ADDRESS, plane 0   \
- *  +0x03c  (V) SOURCE ADDRESS, plane 1    |  written together by 0x081276dc
- *  +0x040  (V) SOURCE ADDRESS, plane 2    |  case 5, the planar-YUV path, for
- *  +0x044  (V) SOURCE ADDRESS, plane 3   /   pixel formats 8, 9 and 10.
- *  +0x04c  (V) (dstW | dstH << 16) from 0x08127d8c
- *  +0x050  (V) (x | y << 16) centring offset, 0x08127e30
- *  +0x054  (V) (w | h << 16) clipped size, 0x08127e20
+ *  +0x024  (M) the panel's BACKGROUND, as an ARGB colour: what shows where no
+ *          layer lands. INFERRED: 0x00ffffff at init and 0xffffffff when a
+ *          page slide starts, both from the same setter, and nothing else
+ *          covers the panel when Cover Flow slides away (only a part-width
+ *          layer 0 is on), whose white ground this matches.
+ *  +0x028..+0x054 (V,M) LAYER 5, the planar layer; see below.
  *  +0x060  (V) SOURCE ADDRESS, slot 0  \
  *  +0x078  (V) SOURCE ADDRESS, slot 1   |  0x081276dc cases 0..4. Stride 0x18.
  *  +0x090  (V) SOURCE ADDRESS, slot 2   |  Which slot is used is chosen by the
  *  +0x0a8  (V) SOURCE ADDRESS, slot 3   |  caller, not by this block.
  *  +0x0c0  (V) SOURCE ADDRESS, slot 4  /
- *  +0x0d4  (M) (a | b << 8) from 0x0812793c. UNDETERMINED.
- *  +0x0d8  (V,M) LAYER 0 config, +0x0dc LAYER 0 (second word)
- *  +0x0e0  (V,M) LAYER 1 config, +0x0e4 LAYER 1
- *  +0x0e8  (V,M) LAYER 2 config, +0x0ec LAYER 2
- *          The config word is built by 0x080b0140 as
- *          (fmt << 28) | (a << 16) | (b << 12) | c, and the second word is set
- *          by 0x080a9614 to a plain value. MEASURED on a diskless boot: the
- *          init path calls 0x080b0140(i, 0, 0, 1, 0) and 0x080a9614(i, 0) for
- *          i in 0..2, so all three configs are 0x00001000 and all three second
- *          words 0 -- which is what that trace shows, decode confirmed. A boot
- *          WITH a disk goes further and rewrites +0x0e0 and +0x0e8 as the user
- *          interface runs (MEASURED: 17 and 21 writes in 45 s, +0x0e8 ending on
- *          0x50004000); +0x0d8 is never written again. Nothing here gates the
- *          picture in this model -- see the note on the control register in
- *          ipod_classic_disp_compose().
- *  +0x0f0..+0x17c (V) nine 4-word entries, copied by 0x081276a0
- *  +0x180..+0x1c4 (V) nine 2-word entries, copied by 0x08127664
+ *  +0x0d4  (V,M) THE STAGE ORDER, (order | b << 8); see the mixer note below.
+ *          Only 0x201 and, for a back slide, 0x200 are ever written.
+ *  +0x0d8  (V,M) MIXER STAGE 0, +0x0dc its second word
+ *  +0x0e0  (V,M) MIXER STAGE 1, +0x0e4 its second word
+ *  +0x0e8  (V,M) MIXER STAGE 2, +0x0ec its second word
+ *          These are NOT one per layer, which is what an earlier version of
+ *          this comment called them; see the mixer note below. The word is
+ *          built as (dst factor << 28) | (src factor << 12) | global alpha.
+ *          The second words stay 0 in every run; what they do is UNDETERMINED.
+ *  +0x0f0..+0x17c (V) nine 4-word entries, layer 5's scaler coefficients,
+ *          copied by 0x081276a0. Stored; the model scales without them.
+ *  +0x180..+0x1c4 (V) nine 2-word entries, the same, copied by 0x08127664
  *  +0x1ec..+0x1fc (V,M) five words copied straight out of a struct by
  *          0x080bf110. MEASURED 0, 0, 0x10, 0, 0. UNDETERMINED.
  *  +0x200  (V,M) bit 0 set/cleared by 0x08096eb8, and OR'd with 0x00010080 by
@@ -116,15 +106,15 @@
  *
  * WHAT THIS MODEL DOES: store every register honestly, and compose the layers
  * into the panel when the panel is about to be shown. See the layer-descriptor
- * note below, and ipod_classic_disp.c for the composition itself.
+ * and mixer notes below, and ipod_classic_disp.c for the composition itself.
  *
- * WHAT IT DOES NOT DO: the gamma tables, the four colour-matrix coefficient
- * tables, the scaler (+0x04c/+0x50/+0x54), the destination rectangle
- * (+0x030/+0x034) and the rotate bit in +0x3ac are all stored and read back but
- * none of them affects the picture. Every one of them is the identity in every
- * boot measured so far -- the gamma tables are literally tbl[i] = i * 4 -- so
- * honouring them would change nothing today and could only be tested against a
- * guest that stops using the identity.
+ * WHAT IT DOES NOT DO: the gamma tables, the scaler's coefficient tables and
+ * the rotate bit in +0x3ac are stored and read back but do not affect the
+ * picture. The first two are the identity in every boot measured so far -- the
+ * gamma tables are literally tbl[i] = i * 4 -- so honouring them would change
+ * nothing today and could only be tested against a guest that stops using the
+ * identity. Layer 5 is scaled nearest-neighbour, and no screen the stock
+ * firmware has shown us scales it at all (+0x04c is 0x10001000 every time).
  *
  * A boot with no disk never writes a source address into any slot at all
  * (MEASURED: zero writes to +0x038..+0x0c0 in a 40-second diskless boot,
@@ -184,6 +174,77 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicDispState, IPOD_CLASSIC_DISP)
  * W and H are SIGNED. MEASURED: while the right-hand pane slides off screen the
  * firmware writes +0x07c = 0xffc900f0, i.e. width -55. Anything with a
  * non-positive width or height, or an origin off the panel, is not drawn.
+ *
+ * LAYER 5, THE PLANAR LAYER. A sixth layer, with registers of its own and an
+ * enable bit of its own (bit 7 of CONTROL), and the one the user interface
+ * keeps its background on while a page or a pane is in motion. MEASURED: format
+ * 8 every time, 320x240 at 1:1, on every screen a run through the menus reached.
+ * Decoded from the 2.0.5 image; the addresses are where it runs, 0xAF98 below
+ * where its file offset would put it (see the note in ipod_classic_disp.c):
+ *
+ *   +0x028  0x100 for format 8, YCbCr 4:2:0; 0 for 9 and 10         (0x08143d88)
+ *   +0x02c  luma stride | chroma stride << 16                       (0x08143de0)
+ *   +0x030  source origin, (x << 16) | y                            (0x081448a0)
+ *   +0x034  source limit, ((x + w) << 16) | (y + h)                 (0x081448b8)
+ *   +0x038  luma plane                                              (0x081446ac)
+ *   +0x03c  Cb plane                                                (0x081446b4)
+ *   +0x040  0 for format 8                                          (0x081446bc)
+ *   +0x044  Cr plane                                                (0x08144704)
+ *   +0x04c  source step per panel pixel, (x << 16) | y, in 4.12     (0x08144c80)
+ *   +0x050  panel position, (x << 16) | y                           (0x081448d8)
+ *   +0x054  panel size, (w << 16) | h, ten bits each                (0x081448d0)
+ *
+ * Formats 9 and 10 are the two-plane and four-plane paths at the same site. No
+ * screen has used them; they are logged and skipped.
+ *
+ * WHICH CHROMA PLANE IS WHICH, and the colour matrix, are MEASURED. Three frames
+ * of the main menu were composed by hand and compared with what the firmware
+ * itself flattens into layer 0 when the same transition ends, which is the only
+ * reference we have that is not this model: mean error per channel over the
+ * whole panel 0.36/255 with Cb in +0x03c and BT.601 limited range, 1.8 with full
+ * range, 8.4 with the chroma planes swapped.
+ *
+ * THE MIXER. There are three blend stages, stacked, and the layers do not own
+ * them. Each INPUT goes to a stage, and there are three inputs, not six:
+ *
+ *     layer 0 / layers 1, 2 and 3, sharing one / layer 5
+ *
+ * Layer 4 has no input: the firmware's blend setter (0x0814472c) refuses it.
+ * Which stage an input gets is the low byte of +0x0d4 through a table in the
+ * firmware (0x083f35ec, see disp_stage_of[]), so the same layer's blend register
+ * moves when the order does. That is why +0x0e8 is rewritten on every flip of
+ * layer 0: at the usual order, 1, layer 0 is on stage 2.
+ *
+ * Stage 2 is the top. Order 1 is layer 5 at the back and layer 0 in front, and
+ * the firmware switches to order 0 (layers 1..3 in front of layer 0) for a back
+ * slide, where the outgoing page in layer 3 starts sliding later than the
+ * incoming one in layer 0 does -- which only reads as a slide if layer 3 covers
+ * layer 0 while it waits.
+ *
+ * WITHIN the shared input, layer 3 covers layer 2 (the firmware slides layer 3
+ * off an opaque layer 2 when a page is pushed) and layer 1 covers layer 2 (a
+ * finished Cover Flow frame in layer 1 is what comes out from under layer 0, not
+ * the bare gradient in layer 2). Layers 1 and 3 have never overlapped, so their
+ * order against each other is a guess.
+ *
+ * A stage register holds two factors and a global alpha, and blends
+ *
+ *     out = src * F(bits 15:12) + below * F(bits 31:28)
+ *
+ * The firmware only ever sets one of five pairs, by mode:
+ *
+ *     mode  src  dst     meaning                         seen
+ *     0     0    1       the layer contributes nothing   no
+ *     1     1    0       opaque                          at reset
+ *     2     4    5       per-pixel alpha, straight       yes, formats 4, 5, 7
+ *     3     8    9       global alpha                    yes, 0xff
+ *     4     10   11      per-pixel times global          no
+ *
+ * The pairs are each a factor and its complement. Factors 4 and 5 are MEASURED:
+ * the same three frames rule out premultiplied alpha, at 6..10/255 against 0.36.
+ * Factors 8 and 9 are MEASURED only at 0xff; that mode 2 ignores the global
+ * alpha is MEASURED too, because stage 2 sits at 0x50004000, global alpha 0, with
+ * layer 0 plainly visible. Factors 10 and 11 are INFERRED from the pattern.
  */
 #define S5L8702_DISP_SLOT_BASE   0x058
 #define S5L8702_DISP_SLOT_STEP   0x018
@@ -199,19 +260,25 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicDispState, IPOD_CLASSIC_DISP)
 #define S5L8702_DISP_UNK04      0x004
 #define S5L8702_DISP_CONTROL    0x008
 #define S5L8702_DISP_UNK0C      0x00c
-#define S5L8702_DISP_DST_ORIGIN 0x030
-#define S5L8702_DISP_DST_LIMIT  0x034
+#define S5L8702_DISP_BACKGROUND 0x024
+#define S5L8702_DISP_PLANAR_FMT 0x028
+#define S5L8702_DISP_PLANAR_STRIDE 0x02c
+#define S5L8702_DISP_PLANAR_ORIGIN 0x030
+#define S5L8702_DISP_PLANAR_LIMIT  0x034
 #define S5L8702_DISP_SRC_PLANE0 0x038
+#define S5L8702_DISP_SRC_PLANE1 0x03c
+#define S5L8702_DISP_SRC_PLANE2 0x040
 #define S5L8702_DISP_SRC_PLANE3 0x044
-#define S5L8702_DISP_DST_SIZE   0x04c
-#define S5L8702_DISP_DST_OFF    0x050
-#define S5L8702_DISP_DST_CLIP   0x054
+#define S5L8702_DISP_PLANAR_STEP 0x04c
+#define S5L8702_DISP_PLANAR_POS  0x050
+#define S5L8702_DISP_PLANAR_SIZE 0x054
 #define S5L8702_DISP_SRC_SLOT0  0x060
 #define S5L8702_DISP_SRC_STRIDE 0x018
 #define S5L8702_DISP_NSLOT      5
-#define S5L8702_DISP_LAYER0     0x0d8
-#define S5L8702_DISP_LAYER_STEP 0x008
-#define S5L8702_DISP_NLAYER     3
+#define S5L8702_DISP_ORDER      0x0d4
+#define S5L8702_DISP_STAGE0     0x0d8
+#define S5L8702_DISP_STAGE_STEP 0x008
+#define S5L8702_DISP_NSTAGE     3
 #define S5L8702_DISP_STATUS200  0x200
 #define S5L8702_DISP_GEOMETRY   0x214
 #define S5L8702_DISP_FORMAT     0x3ac
@@ -222,7 +289,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicDispState, IPOD_CLASSIC_DISP)
 
 /*
  * THE PER-LAYER ENABLE BITS, in CONTROL (+0x008). Bit 6 turns layer 0 on,
- * bit 5 layer 1, bit 4 layer 2 -- so layer k is bit (6 - k).
+ * bit 5 layer 1, bit 4 layer 2, bit 3 layer 3 and bit 2 layer 4 -- so layer k
+ * is bit (6 - k) -- and bit 7 layer 5, the planar one.
  *
  * This is the gate that was missing, and without it the model kept drawing
  * layers the guest had switched off but left fully programmed, which covered
@@ -234,8 +302,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicDispState, IPOD_CLASSIC_DISP)
  *    "bic r0, r0, #BIT / orrne r0, r0, #BIT" on the word it read from +0x008
  *    before storing it back at 0x08127250. The arms are, in index order:
  *      0 -> 0x40   1 -> 0x20   2 -> 0x10   3 -> 0x08   4 -> 0x04   5 -> 0x80
- *    Indices 0..2 are the three layers; 3..5 are something else and only
- *    index 5 (bit 7) is ever seen, twice, in a whole run.
+ *    All six are layers: the same index picks the layer in the descriptor and
+ *    source-address switches. An earlier version of this comment took 3..5 for
+ *    something else, which is how bit 7 stayed unmodelled and left the main
+ *    menu's translucent pane on black.
  *
  * 2. THE ORDER OF WRITES, traced with DISPTRACE=1. Every single time, the
  *    guest programs a descriptor, writes its SOURCE ADDRESS, and only then
@@ -253,11 +323,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicDispState, IPOD_CLASSIC_DISP)
  * was correct about 16/20/24, and became the wrong conclusion only because it
  * stopped there and declared that nothing gated a layer at all.
  *
- * Layers 3 and 4 have no known enable bit. No boot has ever written their
- * descriptors, so the question has never come up; see the compositor.
  */
 #define S5L8702_DISP_LAYER_EN_BIT(k) (1u << (6 - (k)))
-#define S5L8702_DISP_NLAYER_GATED 3
+#define S5L8702_DISP_PLANAR_EN_BIT   (1u << 7)
 
 struct IPodClassicDispState {
     SysBusDevice parent_obj;
@@ -273,8 +341,20 @@ struct IPodClassicDispState {
      */
     uint32_t reg[S5L8702_DISP_NREG];
 
-    /* Scratch for one source row, biggest case: 320 pixels at 32 bpp. */
-    uint8_t rowbuf[320 * 4];
+    /*
+     * Scratch for one source row, as 32-bit words so a row of format 7 can be
+     * mixed where it lands. Biggest case: 320 pixels at 32 bpp.
+     */
+    uint32_t rowbuf[320];
+    /* Scratch for one row of the planar layer. +0x054's fields are ten bits. */
+    uint8_t lumarow[1024];
+    uint8_t cbrow[1024 / 2 + 1];
+    uint8_t crrow[1024 / 2 + 1];
+    /*
+     * The frame being mixed, 0x00RRGGBB. Mixed at eight bits and packed once at
+     * the end, so a frame with three layers rounds once and not three times.
+     */
+    uint32_t frame[320 * 240];
 };
 
 /*

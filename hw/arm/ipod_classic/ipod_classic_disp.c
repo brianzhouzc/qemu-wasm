@@ -7,10 +7,11 @@
  * gamma tables, and it is what the LCD frame engine (LCD +0x70) presents.
  *
  * The model is a register file with honest readback, a loud trace, and a
- * compositor that blits whichever layer slots currently carry a source address
- * into the panel's image memory. A boot that never mounts a volume never writes
- * a source address into any slot, so on that path it composes nothing and the
- * panel stays black -- that is the guest's behaviour, not the model's.
+ * compositor that mixes the enabled layers into the panel's image memory the
+ * way the guest programs the block's mixer. A boot that never mounts a volume
+ * never writes a source address into any slot, so on that path it composes
+ * nothing and the panel stays black -- that is the guest's behaviour, not the
+ * model's.
  *
  * Readback alone is not cosmetic. Six functions in the osos do
  * read-modify-write on +0x008 and one on +0x200; while this block was
@@ -26,6 +27,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
@@ -100,26 +102,30 @@ static const char *disp_reg_name(hwaddr off)
 {
     switch (off) {
     case S5L8702_DISP_CONTROL:    return "CONTROL";
-    case S5L8702_DISP_DST_ORIGIN: return "DST_ORIGIN";
-    case S5L8702_DISP_DST_LIMIT:  return "DST_LIMIT";
+    case S5L8702_DISP_BACKGROUND: return "BACKGROUND";
+    case S5L8702_DISP_PLANAR_FMT: return "PL_FORMAT";
+    case S5L8702_DISP_PLANAR_STRIDE: return "PL_STRIDE";
+    case S5L8702_DISP_PLANAR_ORIGIN: return "PL_ORIGIN";
+    case S5L8702_DISP_PLANAR_LIMIT:  return "PL_LIMIT";
     case 0x038:                   return "SRC_PLANE0";
     case 0x03c:                   return "SRC_PLANE1";
     case 0x040:                   return "SRC_PLANE2";
     case 0x044:                   return "SRC_PLANE3";
-    case S5L8702_DISP_DST_SIZE:   return "DST_SIZE";
-    case S5L8702_DISP_DST_OFF:    return "DST_OFF";
-    case S5L8702_DISP_DST_CLIP:   return "DST_CLIP";
+    case S5L8702_DISP_PLANAR_STEP: return "PL_STEP";
+    case S5L8702_DISP_PLANAR_POS:  return "PL_POS";
+    case S5L8702_DISP_PLANAR_SIZE: return "PL_SIZE";
     case 0x060:                   return "SRC_SLOT0";
     case 0x078:                   return "SRC_SLOT1";
     case 0x090:                   return "SRC_SLOT2";
     case 0x0a8:                   return "SRC_SLOT3";
     case 0x0c0:                   return "SRC_SLOT4";
-    case 0x0d8:                   return "LAYER0_CFG";
-    case 0x0dc:                   return "LAYER0_W1";
-    case 0x0e0:                   return "LAYER1_CFG";
-    case 0x0e4:                   return "LAYER1_W1";
-    case 0x0e8:                   return "LAYER2_CFG";
-    case 0x0ec:                   return "LAYER2_W1";
+    case S5L8702_DISP_ORDER:      return "ORDER";
+    case 0x0d8:                   return "STAGE0";
+    case 0x0dc:                   return "STAGE0_W1";
+    case 0x0e0:                   return "STAGE1";
+    case 0x0e4:                   return "STAGE1_W1";
+    case 0x0e8:                   return "STAGE2";
+    case 0x0ec:                   return "STAGE2_W1";
     case S5L8702_DISP_STATUS200:  return "STATUS200";
     case S5L8702_DISP_GEOMETRY:   return "GEOMETRY";
     case S5L8702_DISP_FORMAT:     return "FORMAT";
@@ -213,6 +219,15 @@ static void ipod_classic_disp_write(void *opaque, hwaddr offset,
 /* --------------------------------------------------------------- compose */
 
 /*
+ * A word on the addresses in the newer notes here and in the header. The 2.0.5
+ * image copies itself down at boot and runs 0xAF98 below where its file offset
+ * would put it: code at offset F runs at 0x08000000 + F - 0xAF98, which is what
+ * DISPTRACE prints and what those notes quote. Layer buffers read at the wrong
+ * base come out 35 rows and 38 pixels off, which is how this was found. The
+ * older notes are from an earlier retailOS.
+ */
+
+/*
  * Bytes per pixel by format code. From the switch at 0x08126f90, which turns
  * the format field into a multiplier r1 and then computes the source stride as
  * r1 * srcW / 2 -- so r1 is twice the bytes per pixel. VERIFIED against both
@@ -231,26 +246,104 @@ static unsigned disp_bpp(unsigned fmt)
     }
 }
 
-static bool disp_alpha_on(void)
+static inline uint16_t disp_rgb565(uint32_t rgb)
 {
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("DISP_ALPHA");
-        on = (e && *e && *e != '0') ? 1 : 0;
-        if (on) {
-            fprintf(stderr, "DISP_ALPHA: capas compuestas de delante a atras con alfa\n");
-        }
-    }
-    return on == 1;
+    return ((rgb >> 8) & 0xf800) | ((rgb >> 5) & 0x07e0) | ((rgb >> 3) & 0x001f);
 }
 
-static inline uint16_t disp_rgb565(unsigned r, unsigned g, unsigned b)
+/* One RGB565 pixel as an opaque 0xAARRGGBB; packs back to itself. */
+static inline uint32_t disp_expand565(uint16_t px)
 {
-    return ((r & 0xf8) << 8) | ((g & 0xfc) << 3) | (b >> 3);
+    unsigned r = px >> 11, g = (px >> 5) & 0x3f, b = px & 0x1f;
+
+    return 0xff000000u | ((r << 3 | r >> 2) << 16) | ((g << 2 | g >> 4) << 8) |
+           (b << 3 | b >> 2);
+}
+
+static inline unsigned disp_clamp8(int v)
+{
+    return v < 0 ? 0 : v > 255 ? 255 : v;
+}
+
+/* BT.601 limited range; see the header for how that was measured. */
+static inline uint32_t disp_ycbcr(int y, int cb, int cr)
+{
+    int c = 298 * (y - 16), d = cb - 128, e = cr - 128;
+
+    return 0xff000000u | (disp_clamp8((c + 409 * e + 128) >> 8) << 16) |
+           (disp_clamp8((c - 100 * d - 208 * e + 128) >> 8) << 8) |
+           disp_clamp8((c + 516 * d + 128) >> 8);
 }
 
 /*
- * Draw one layer. Returns true if any pixel landed on the panel.
+ * One stage's blend, as a pair of tables indexed by the source pixel's alpha.
+ * Worked out once per input per frame so the pixel loop decides nothing.
+ */
+typedef struct DispBlend {
+    uint8_t src[256];
+    uint8_t dst[256];
+} DispBlend;
+
+/* The factors the firmware's blend setter can write; see the header. */
+static unsigned disp_factor(unsigned sel, unsigned alpha, unsigned global)
+{
+    switch (sel) {
+    case 0:  return 0;
+    case 1:  return 255;
+    case 4:  return alpha;
+    case 5:  return 255 - alpha;
+    case 8:  return global;
+    case 9:  return 255 - global;
+    case 10: return alpha * global / 255;
+    case 11: return 255 - alpha * global / 255;
+    default:
+        qemu_log_mask(LOG_UNIMP, "s5l8702.disp: blend factor %u is not known; "
+                      "treating the layer as opaque\n", sel);
+        return sel & 1 ? 0 : 255;
+    }
+}
+
+static void disp_blend_init(DispBlend *b, uint32_t stage)
+{
+    unsigned df = stage >> 28, sf = (stage >> 12) & 0xf, global = stage & 0xff;
+
+    for (unsigned a = 0; a < 256; a++) {
+        b->src[a] = disp_factor(sf, a, global);
+        b->dst[a] = disp_factor(df, a, global);
+    }
+}
+
+static inline unsigned disp_mix_channel(unsigned s, unsigned d, unsigned sf,
+                                        unsigned df)
+{
+    unsigned v = (s * sf + d * df + 127) / 255;
+
+    return v > 255 ? 255 : v;
+}
+
+/* Mix a row of 0xAARRGGBB source pixels into the frame. */
+static void disp_mix_row(uint32_t *dst, const uint32_t *src, int n,
+                         const DispBlend *b)
+{
+    for (int i = 0; i < n; i++) {
+        uint32_t c = src[i], d = dst[i];
+        unsigned a = c >> 24, sf = b->src[a], df = b->dst[a];
+
+        if (sf == 255 && df == 0) {
+            dst[i] = c & 0xffffff;
+        } else if (sf != 0 || df != 255) {
+            dst[i] = disp_mix_channel((c >> 16) & 0xff, (d >> 16) & 0xff, sf, df)
+                         << 16 |
+                     disp_mix_channel((c >> 8) & 0xff, (d >> 8) & 0xff, sf, df)
+                         << 8 |
+                     disp_mix_channel(c & 0xff, d & 0xff, sf, df);
+        }
+    }
+}
+
+/*
+ * Mix one of the five RGB layers into the frame. Returns true if any pixel
+ * landed on the panel.
  *
  * PIXEL ORDER, and this is the one INFERRED thing in the whole path. A 32-bit
  * source word is read as little-endian ARGB8888, i.e. the bytes in memory are
@@ -269,9 +362,15 @@ static inline uint16_t disp_rgb565(unsigned r, unsigned g, unsigned b)
  *     that appears nowhere in this user interface.
  * It is still an inference: no datasheet, and the pipe does carry colour-matrix
  * tables it could in principle swizzle with. If better evidence turns up it is
- * two lines below and nothing else changes.
+ * a line below and nothing else changes.
+ *
+ * Which formats carry alpha is the firmware's own answer: it asks for per-pixel
+ * blending (mode 2) after programming a layer of format 4, 5 or 7 (0x0814f010 by
+ * file address) and leaves 3 and 6 alone. Format 6 is therefore opaque here.
+ * Formats 4 and 5 are 16-bit with alpha in some layout nothing has shown us; no
+ * screen uses them, and they are logged and drawn as RGB565.
  */
-static bool disp_draw_layer(IPodClassicDispState *s, int k, uint16_t *fb,
+static bool disp_draw_layer(IPodClassicDispState *s, int k, const DispBlend *blend,
                             unsigned width, unsigned height)
 {
     hwaddr base = S5L8702_DISP_SLOT_BASE + k * S5L8702_DISP_SLOT_STEP;
@@ -282,6 +381,7 @@ static bool disp_draw_layer(IPodClassicDispState *s, int k, uint16_t *fb,
     uint32_t posw   = s->reg[(base + S5L8702_DISP_SLOT_POS) >> 2];
     unsigned fmt = (fmtw >> 8) & 0xff;
     unsigned bpp = disp_bpp(fmt);
+    uint32_t opaque = fmt == 7 ? 0 : 0xff000000u;
     /* Signed: a pane sliding off the right edge is written with width -55. */
     int w = (int16_t)(sizew >> 16), h = (int16_t)(sizew & 0xffff);
     int x = (int16_t)(posw >> 16),  y = (int16_t)(posw & 0xffff);
@@ -299,13 +399,8 @@ static bool disp_draw_layer(IPodClassicDispState *s, int k, uint16_t *fb,
      *
      * See S5L8702_DISP_LAYER_EN_BIT in the header for the disassembly of the
      * setter and for the traced write order that pins each bit to its layer.
-     *
-     * Layers 3 and 4 are not gated because we do not know which bit, if any,
-     * gates them: no boot has ever written their descriptors, so they are
-     * skipped above on src == 0 and this line never decides anything for them.
      */
-    if (k < S5L8702_DISP_NLAYER_GATED &&
-        !(s->reg[S5L8702_DISP_CONTROL >> 2] & S5L8702_DISP_LAYER_EN_BIT(k))) {
+    if (!(s->reg[S5L8702_DISP_CONTROL >> 2] & S5L8702_DISP_LAYER_EN_BIT(k))) {
         return false;
     }
     if (bpp != 2 && bpp != 4) {
@@ -318,6 +413,11 @@ static bool disp_draw_layer(IPodClassicDispState *s, int k, uint16_t *fb,
                       "(%u bytes per pixel), which this model does not decode; "
                       "skipped\n", k, fmt, bpp);
         return false;
+    }
+    if (fmt == 4 || fmt == 5) {
+        qemu_log_mask(LOG_UNIMP, "s5l8702.disp: layer %d has pixel format %u, "
+                      "whose alpha this model does not decode; drawn opaque\n",
+                      k, fmt);
     }
     if (x >= (int)width || y >= (int)height || x + w <= 0 || y + h <= 0) {
         return false;
@@ -341,108 +441,211 @@ static bool disp_draw_layer(IPodClassicDispState *s, int k, uint16_t *fb,
         h = height - y;
     }
     /* The row scratch is one panel-width of 32-bit pixels; never exceed it. */
-    if ((unsigned)w * bpp > sizeof(s->rowbuf)) {
-        w = sizeof(s->rowbuf) / bpp;
+    if ((unsigned)w > ARRAY_SIZE(s->rowbuf)) {
+        w = ARRAY_SIZE(s->rowbuf);
     }
 
     for (int row = 0; row < h; row++) {
-        uint16_t *dst = fb + (y + row) * width + x;
-
         address_space_read(&address_space_memory, src + (hwaddr)row * stride,
                            MEMTXATTRS_UNSPECIFIED, s->rowbuf, w * bpp);
         if (bpp == 4) {
             for (int i = 0; i < w; i++) {
-                const uint8_t *p = s->rowbuf + i * 4;
-                /*
-                 * ALPHA (DISP_ALPHA=1). The 32-bit layer really does carry one:
-                 * dumped while Now Playing is up, its alpha byte takes 243
-                 * distinct values across the surface, which no "ignore it"
-                 * reading survives. Straight source-over onto what is already
-                 * in the framebuffer.
-                 */
-                if (disp_alpha_on()) {
-                    unsigned a = p[3];
-                    if (a == 0) {
-                        continue;
-                    }
-                    if (a != 0xff) {
-                        uint16_t d = dst[i];
-                        unsigned dr = (d >> 8) & 0xf8, dg = (d >> 3) & 0xfc;
-                        unsigned db = (d << 3) & 0xf8;
-                        dst[i] = disp_rgb565((p[2] * a + dr * (255 - a)) / 255,
-                                             (p[1] * a + dg * (255 - a)) / 255,
-                                             (p[0] * a + db * (255 - a)) / 255);
-                        continue;
-                    }
-                }
-                dst[i] = disp_rgb565(p[2], p[1], p[0]);
+                s->rowbuf[i] = ldl_le_p(&s->rowbuf[i]) | opaque;
             }
         } else {
-            for (int i = 0; i < w; i++) {
-                dst[i] = s->rowbuf[i * 2] | (s->rowbuf[i * 2 + 1] << 8);
+            /* Backwards, so a 16-bit row can grow where it landed. */
+            for (int i = w - 1; i >= 0; i--) {
+                const uint8_t *p = (const uint8_t *)s->rowbuf + i * 2;
+                s->rowbuf[i] = disp_expand565(lduw_le_p(p));
             }
         }
+        disp_mix_row(s->frame + (y + row) * width + x, s->rowbuf, w, blend);
     }
     return true;
+}
+
+/*
+ * Mix layer 5 into the frame. See the header for the registers. The hardware
+ * filters when it scales, with coefficients the guest loads; this picks the
+ * nearest sample, and chroma the sample it covers, which is what the 1:1 frames
+ * measured against. No screen we have seen scales this layer.
+ */
+static bool disp_draw_planar(IPodClassicDispState *s, const DispBlend *blend,
+                             unsigned width, unsigned height)
+{
+    uint32_t origin = s->reg[S5L8702_DISP_PLANAR_ORIGIN >> 2];
+    uint32_t limit  = s->reg[S5L8702_DISP_PLANAR_LIMIT >> 2];
+    uint32_t pos    = s->reg[S5L8702_DISP_PLANAR_POS >> 2];
+    uint32_t size   = s->reg[S5L8702_DISP_PLANAR_SIZE >> 2];
+    uint32_t step   = s->reg[S5L8702_DISP_PLANAR_STEP >> 2];
+    uint32_t stride = s->reg[S5L8702_DISP_PLANAR_STRIDE >> 2];
+    uint32_t luma   = s->reg[S5L8702_DISP_SRC_PLANE0 >> 2];
+    uint32_t cb     = s->reg[S5L8702_DISP_SRC_PLANE1 >> 2];
+    uint32_t cr     = s->reg[S5L8702_DISP_SRC_PLANE3 >> 2];
+    unsigned ox = origin >> 16, oy = origin & 0xffff;
+    unsigned sw = (limit >> 16) - ox, sh = (limit & 0xffff) - oy;
+    unsigned x = pos >> 16, y = pos & 0xffff;
+    unsigned w = (size >> 16) & 0x3ff, h = size & 0x3ff;
+    unsigned xstep = step >> 16, ystep = step & 0xffff;
+    unsigned lstride = stride & 0xffff, cstride = stride >> 16;
+
+    if (!(s->reg[S5L8702_DISP_CONTROL >> 2] & S5L8702_DISP_PLANAR_EN_BIT) ||
+        !luma || !cb || !cr) {
+        return false;
+    }
+    if (s->reg[S5L8702_DISP_PLANAR_FMT >> 2] != 0x100) {
+        qemu_log_mask(LOG_UNIMP, "s5l8702.disp: layer 5 has format word 0x%x, "
+                      "which this model does not decode; skipped\n",
+                      s->reg[S5L8702_DISP_PLANAR_FMT >> 2]);
+        return false;
+    }
+    if ((limit >> 16) <= ox || (limit & 0xffff) <= oy || !w || !h ||
+        x >= width || y >= height) {
+        return false;
+    }
+    w = MIN(w, width - x);
+    h = MIN(h, height - y);
+    /* The samples this row needs: never more than the scratch or the window. */
+    sw = MIN(sw, MIN(((w - 1) * xstep >> 12) + 1, sizeof(s->lumarow)));
+
+    for (unsigned row = 0; row < h; row++) {
+        unsigned sy = (row * ystep) >> 12;
+
+        if (sy >= sh) {
+            break;
+        }
+        sy += oy;
+        address_space_read(&address_space_memory,
+                           luma + (hwaddr)sy * lstride + ox,
+                           MEMTXATTRS_UNSPECIFIED, s->lumarow, sw);
+        address_space_read(&address_space_memory,
+                           cb + (hwaddr)(sy / 2) * cstride + ox / 2,
+                           MEMTXATTRS_UNSPECIFIED, s->cbrow, sw / 2 + 1);
+        address_space_read(&address_space_memory,
+                           cr + (hwaddr)(sy / 2) * cstride + ox / 2,
+                           MEMTXATTRS_UNSPECIFIED, s->crrow, sw / 2 + 1);
+        for (unsigned i = 0; i < w; i++) {
+            unsigned sx = MIN((i * xstep) >> 12, sw - 1);
+            unsigned cx = ((ox + sx) >> 1) - (ox >> 1);
+
+            s->rowbuf[i] = disp_ycbcr(s->lumarow[sx], s->cbrow[cx], s->crrow[cx]);
+        }
+        disp_mix_row(s->frame + (y + row) * width + x, s->rowbuf, w, blend);
+    }
+    return true;
+}
+
+/*
+ * The stage each mixer input uses, by the order in +0x0d4. The firmware's own
+ * table, read out of guest memory at 0x083f35ec. Only orders 1 and 0 have been
+ * seen in use; the rest are here because the table is.
+ */
+enum { DISP_INPUT_LAYER0, DISP_INPUT_SHARED, DISP_INPUT_PLANAR, DISP_NINPUT };
+
+static const uint8_t disp_stage_of[6][DISP_NINPUT] = {
+    { 1, 2, 0 }, { 2, 1, 0 }, { 0, 2, 1 }, { 2, 0, 1 }, { 0, 1, 2 }, { 1, 0, 2 },
+};
+
+/*
+ * Back to front within the shared input; see the header for what backs this.
+ * Layer 1 last is the guess: it has never overlapped layer 3.
+ */
+static const uint8_t disp_shared_layers[] = { 2, 3, 1 };
+
+static bool disp_draw_input(IPodClassicDispState *s, int input,
+                            const DispBlend *blend, unsigned width,
+                            unsigned height)
+{
+    bool drew = false;
+
+    switch (input) {
+    case DISP_INPUT_LAYER0:
+        drew = disp_draw_layer(s, 0, blend, width, height);
+        break;
+    case DISP_INPUT_SHARED:
+        for (unsigned i = 0; i < ARRAY_SIZE(disp_shared_layers); i++) {
+            drew |= disp_draw_layer(s, disp_shared_layers[i], blend, width,
+                                    height);
+        }
+        break;
+    case DISP_INPUT_PLANAR:
+        drew = disp_draw_planar(s, blend, width, height);
+        break;
+    }
+    return drew;
 }
 
 bool ipod_classic_disp_compose(IPodClassicDispState *s, uint16_t *fb,
                                unsigned width, unsigned height)
 {
+    uint32_t control = s->reg[S5L8702_DISP_CONTROL >> 2];
+    uint32_t background = s->reg[S5L8702_DISP_BACKGROUND >> 2] & 0xffffff;
+    unsigned order = s->reg[S5L8702_DISP_ORDER >> 2] & 0xff;
+    unsigned pixels = width * height;
+    DispBlend blend;
     bool drew = false;
 
     /*
-     * Slot order is Z order, lowest index at the back. INFERRED, but a
-     * measurement does back it, and an earlier version of this comment claimed
-     * the opposite ("no two layers have ever overlapped"), which is false:
-     * slots 0 and 1 overlap the whole time the language screen appears.
-     *
-     * MEASURED with DISPTRACE=1 over one boot with a disk. Slot 0 is 320x240 at
-     * (0,0) for the whole run. Slot 1 is a 16-bit surface whose right edge is
-     * pinned to the panel edge while its left edge slides right -- +0x084/+0x07c
-     * go (x=80, w=240), (82, 238), (95, 225), (122, 198), (168, 152), (232, 88),
-     * (310, 10), (400, -80), so x + w is 320 at every step until the surface
-     * goes negative and stops being drawn. That is a wipe, and a wipe only works
-     * if the sliding surface is IN FRONT: slot 1 holds the outgoing artwork (the
-     * bare gradient, no text -- dumped and looked at) and slot 0 the incoming
-     * one. With the Z order the other way round slot 0 would cover slot 1 from
-     * the first frame and there would be no transition at all.
-     *
-     * A layer is drawn when it has a source address, a positive size AND its
-     * enable bit set in CONTROL (+0x008): bit 6 for layer 0, bit 5 for layer 1,
-     * bit 4 for layer 2. An earlier version of this comment said "nothing else
-     * gates it" and named bits 16, 20 and 24 as the only candidates, dismissing
-     * them because they are set once during init and never touched again. That
-     * was right about 16/20/24 and wrong about the conclusion: the gate is
-     * bits 4..6, they move all the time, and ignoring them left every finished
-     * transition's surface on the panel for ever. See the header.
+     * Nothing on, nothing to do, and the panel's image memory stays as it is:
+     * this is every frame of Rockbox, which pushes its pixels through the LCD
+     * port, and of tools/ipod_classic/lcdtest.S.
      */
+    if (!(control & (S5L8702_DISP_PLANAR_EN_BIT |
+                     S5L8702_DISP_LAYER_EN_BIT(0) |
+                     S5L8702_DISP_LAYER_EN_BIT(1) |
+                     S5L8702_DISP_LAYER_EN_BIT(2) |
+                     S5L8702_DISP_LAYER_EN_BIT(3) |
+                     S5L8702_DISP_LAYER_EN_BIT(4)))) {
+        return false;
+    }
+    if (control & S5L8702_DISP_LAYER_EN_BIT(4)) {
+        qemu_log_mask(LOG_UNIMP, "s5l8702.disp: layer 4 is on, and the firmware "
+                      "gives it no mixer input; skipped\n");
+    }
+    if (order >= ARRAY_SIZE(disp_stage_of)) {
+        qemu_log_mask(LOG_UNIMP, "s5l8702.disp: stage order %u is not in the "
+                      "firmware's table; using 1\n", order);
+        order = 1;
+    }
+
     /*
-     * Z ORDER, and DISP_ALPHA=1 turns it over.
-     *
-     * The order below (slot 0 at the back) was inferred from the language
-     * screen's wipe, on the assumption that every layer is opaque. MEASURED,
-     * that assumption is false: the 32-bit layer carries a real alpha channel,
-     * and while Now Playing is on screen slot 0 holds the ENTIRE player UI --
-     * title bar, artist, album, "4 of 4", progress bar -- while slot 1 holds
-     * the album art, opaque and full-screen. Drawn back-to-front the art wipes
-     * the player out completely, which is exactly the blank right-hand side
-     * that made the screen look half-drawn.
-     *
-     * Front-to-back with source-over alpha explains BOTH: the player UI sits on
-     * top of the art, and the language wipe still works because the incoming
-     * pane is transparent where the outgoing one must show through.
+     * Every frame starts from the background, not from the last frame. The
+     * model used to draw over whatever was in fb, which with opaque layers
+     * cost nothing and with alpha turned the old frame into a layer of its own:
+     * that is the "both pane icons at once" that got qemu-wasm#9 reverted.
      */
-    if (disp_alpha_on()) {
-        for (int k = S5L8702_DISP_NSLOTS - 1; k >= 0; k--) {
-            drew |= disp_draw_layer(s, k, fb, width, height);
+    for (unsigned i = 0; i < pixels; i++) {
+        s->frame[i] = background;
+    }
+
+    /*
+     * Back to front, stage by stage. An earlier version drew the slots in
+     * index order with no alpha, so layer 0 went at the back with nothing
+     * blended, and layer 5 not at all. Layer 0 holds the user interface and
+     * belongs in front, so that one mistake was three symptoms: the main
+     * menu's translucent pane on black, with its background in layer 5 and its
+     * alpha ignored; the whole interface hidden under layer 2 while it was on;
+     * and Cover Flow's and Now Playing's text hidden under layer 1. See
+     * docs/DISPLAY_ALPHA.md in iPodWasm for the measurements.
+     */
+    for (int stage = 0; stage < S5L8702_DISP_NSTAGE; stage++) {
+        uint32_t reg = s->reg[(S5L8702_DISP_STAGE0 +
+                               stage * S5L8702_DISP_STAGE_STEP) >> 2];
+
+        disp_blend_init(&blend, reg);
+        for (int input = 0; input < DISP_NINPUT; input++) {
+            if (disp_stage_of[order][input] == stage) {
+                drew |= disp_draw_input(s, input, &blend, width, height);
+            }
         }
-        return drew;
     }
-    for (int k = 0; k < S5L8702_DISP_NSLOTS; k++) {
-        drew |= disp_draw_layer(s, k, fb, width, height);
+    if (!drew) {
+        return false;
     }
-    return drew;
+    for (unsigned i = 0; i < pixels; i++) {
+        fb[i] = disp_rgb565(s->frame[i]);
+    }
+    return true;
 }
 
 static const MemoryRegionOps ipod_classic_disp_ops = {
