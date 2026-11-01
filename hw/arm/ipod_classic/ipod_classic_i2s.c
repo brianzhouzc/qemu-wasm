@@ -18,11 +18,11 @@
  *    is appended to a 16-bit-stereo WAV whose sample rate is taken from CLKDIV.
  *    That WAV is the hito-3 artefact.
  *
- *  - Pacing (hito 2), when armed. See ipod_classic_i2s_drain(): the FIFO is
- *    drained at the sample rate by a QEMUTimer that gates DMAC0's request line,
- *    so the PL080 hands over one burst at a time and its terminal-count IRQ (16)
- *    reaches the firmware at real playback tempo instead of all at once. This is
- *    what makes the Now Playing progress bar advance with the clock.
+ *  - Pacing. See ipod_classic_i2s_drain(): the FIFO is drained at the sample
+ *    rate, in host time, so the PL080 hands over what has been clocked out and
+ *    its terminal-count IRQ (16) reaches the firmware at real playback tempo
+ *    instead of all at once, and what is drained goes to the machine's audio
+ *    output for the page to play.
  *
  * INSTRUMENTATION: I2STRACE=1 prints every access with its value and guest PC,
  * same pattern as DISPTRACE=1/ATATRACE=1. Independently of the trace, the FIRST
@@ -38,6 +38,7 @@
 #include "hw/core/cpu.h"
 #include "audio/audio.h"
 #include "hw/arm/ipod_classic/ipod_classic_i2s.h"
+#include "hw/arm/ipod_classic/ipod_classic_audio_out.h"
 #include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
 #include "hw/arm/ipod_classic/ipod_classic_hle_np.h"
 #include "hw/arm/ipod_classic/ipod_classic_np_overlay.h"
@@ -95,13 +96,15 @@ static void i2s_wav_put_le32(uint8_t *p, uint32_t v)
 }
 
 /*
- * Snap 12e6/CLKDIV to the nearest standard sample rate for the header. The PCM
- * samples themselves are stored verbatim, so an off-by-17-Hz label (272 gives
- * 44117, snapped to 44100) never touches the audio. CONVENIENCE: the 32 kHz
- * case, which the SoC clocks as 48 kHz with MCLK dropped to 8 MHz, is labelled
- * 48000 here because this helper assumes a 12 MHz MCLK; no test uses it.
+ * Snap 12e6/CLKDIV to the nearest standard sample rate. 272 gives 44117, and the
+ * codec, which is the clock master here, does run from that 12 MHz at 44118 Hz.
+ * But a song is 44100, and what matters is that it takes as long as it says it
+ * does, so the machine plays the rate the firmware meant. CONVENIENCE: the 32 kHz
+ * case, which the SoC clocks as 48 kHz with MCLK dropped to 8 MHz, comes out as
+ * 48000 here because this helper assumes a 12 MHz MCLK, and so would play fast.
+ * It takes Rockbox's "auto" frequency setting and a 32 kHz file.
  */
-static uint32_t i2s_wav_rate_from_div(uint32_t clkdiv)
+static uint32_t i2s_rate_from_div(uint32_t clkdiv)
 {
     static const uint32_t std[] = {
         8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000
@@ -179,16 +182,30 @@ static void i2s_wav_open(uint32_t rate)
             rate, path);
 }
 
+/*
+ * Asked once: this runs for every sample, and getenv is a linear scan of the
+ * environment.
+ */
+static int audiowav = -1;
+
+static bool i2s_wav_on(void)
+{
+    if (audiowav < 0) {
+        audiowav = getenv("AUDIOWAV") != NULL;
+    }
+    return audiowav == 1;
+}
+
 /* Append the low `size` bytes of a FIFO write to the WAV, little-endian. */
 static void i2s_wav_sample(IPodClassicI2SState *s, uint64_t value, unsigned size)
 {
     uint8_t b[4];
 
-    if (getenv("AUDIOWAV") == NULL) {
+    if (!i2s_wav_on()) {
         return;
     }
     if (!i2s_wav) {
-        i2s_wav_open(i2s_wav_rate_from_div(s->clkdiv));
+        i2s_wav_open(i2s_rate_from_div(s->clkdiv));
         if (!i2s_wav) {
             return;
         }
@@ -252,29 +269,40 @@ static void i2s_count_hit(hwaddr off, const char *dir, uint32_t val)
 /* -------------------------------------------------------------- pacing */
 
 /*
- * Hito 2. Draining the audio DMA at the sample rate so the DMAC's terminal-count
- * IRQ (16) reaches the firmware at real playback tempo instead of all at once,
- * which is what makes a progress bar advance with the clock rather than jump to
- * the end. Gated by AUDIOPACE=1 because it changes the timing of the audio DMA
- * and, until a playback path that produces non-silence exists (the retailOS
- * decodes on the unmodelled CalmADM2E DSP, see wiki/14 §4), its only observable
- * effect is on the boot silence push -- so it is off by default and the default
- * build is byte-for-byte the old behaviour.
+ * The drain's timer, and the whole of what the guest's sample clock is here.
+ *
+ * It cannot be virtual time.  Under -icount sleep=off that clock warps to the
+ * next deadline whenever the vCPU halts, so paced on it a song races while the
+ * guest idles between buffers and crawls while it decodes.  The sample clock is
+ * a wall-clock source like the RTC and Rockbox's tick, and takes the same rules
+ * (docs/architecture.md, "Wall-clock sources are host time").
+ *
+ * The main loop runs this no more often than it can wake, which on Windows is
+ * every 15.4 ms whatever is asked for, so nothing here assumes the period: each
+ * tick works out what the time since the last one was worth.  A late tick pays
+ * for more samples.
+ *
+ * The clock is QEMU_CLOCK_VIRTUAL_RT and not REALTIME because it stops with the
+ * VM: this writes guest state, through the DMA and its interrupt, and must not
+ * while a snapshot is being saved.  Resuming then finds no time to pay for.
  */
-static int audiopace = -1;
-
-static bool i2s_pace_on(void)
-{
-    if (audiopace < 0) {
-        const char *e = getenv("AUDIOPACE");
-        audiopace = (e && *e && *e != '0') ? 1 : 0;
-    }
-    return audiopace == 1;
-}
+#define I2S_PACE_PERIOD_NS   (10 * SCALE_MS)
+/*
+ * How far behind the clock the transmitter may be and still catch up, in the
+ * output's terms: a stall longer than this loses the time rather than sending a
+ * burst nobody can play on time, like the host tick's backlog.
+ */
+#define I2S_PACE_BACKLOG_NS  (200 * SCALE_MS)
+#define I2S_FRAME_BYTES      4
 
 static uint32_t i2s_sample_rate(IPodClassicI2SState *s)
 {
-    return s->clkdiv ? S5L8702_I2S_MCLK_HZ / s->clkdiv : 44100;
+    return i2s_rate_from_div(s->clkdiv);
+}
+
+static bool i2s_sending(IPodClassicI2SState *s)
+{
+    return s->tx_running && (s->clkcon & 1);
 }
 
 /* ----------------------------------------------------- live audio out */
@@ -456,20 +484,38 @@ static void i2s_live_sample(IPodClassicI2SState *s, uint64_t value, unsigned siz
     }
 }
 
+/* What the FIFO receives, from the DMA as a block or a sample from the CPU. */
+static void i2s_tx(void *opaque, const uint8_t *buf, unsigned bytes)
+{
+    IPodClassicI2SState *s = opaque;
+
+    s->tx_samples += bytes / 2;
+    ipod_classic_audio_out_write(buf, bytes);
+    if (i2s_wav_on() || i2s_live_on()) {
+        for (unsigned i = 0; i + 2 <= bytes; i += 2) {
+            uint16_t sample = buf[i] | (buf[i + 1] << 8);
+
+            i2s_wav_sample(s, sample, 2);
+            i2s_live_sample(s, sample, 2);
+        }
+    }
+}
+
 /*
- * One drain tick: let DMAC0 hand over one chunk to the FIFO, then schedule the
- * next tick after the wall-clock time that chunk represents at the sample rate.
- * Counting the samples the chunk actually moved (tx_samples delta) makes the
- * cadence self-correcting regardless of the chunk size the firmware chose.
+ * One drain tick: let DMAC0 hand over what the sample clock has used since the
+ * last one, then come back.  A tick that moves nothing leaves the timer off,
+ * because idling stays cheap only if nothing here wakes the main loop: Apple's
+ * firmware can leave the transmitter on with no DMA behind it.  The PL080 kicks
+ * this when a channel next has work.
  */
 static void ipod_classic_i2s_drain(void *opaque)
 {
     IPodClassicI2SState *s = opaque;
-    uint64_t before, moved;
-    int64_t delay_ns;
-    uint32_t rate;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT);
+    uint64_t rate_bytes = (uint64_t)i2s_sample_rate(s) * I2S_FRAME_BYTES;
+    uint64_t want, moved;
 
-    if (!s->tx_running || !s->dmac0) {
+    if (!i2s_sending(s) || !s->dmac0) {
         return;
     }
     /*
@@ -481,8 +527,8 @@ static void ipod_classic_i2s_drain(void *opaque)
      * drains to silence), and keeps the PCM cursor put -- a clean pause.
      */
     if (ipod_classic_hle_audio_paused()) {
-        s->next_tick_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 4000000; /* 4ms */
-        timer_mod(s->drain_timer, s->next_tick_ns);
+        s->pace_last_ns = now;
+        timer_mod(s->drain_timer, now + I2S_PACE_PERIOD_NS);
         return;
     }
     /*
@@ -493,46 +539,53 @@ static void ipod_classic_i2s_drain(void *opaque)
      */
     ipod_classic_hle_audio_fill_dma();
 
-    before = s->tx_samples;
-    pl080_pace_request(s->dmac0, S5L8702_I2S_DMA_IIS0_TX);
-    moved = s->tx_samples - before;   /* 16-bit samples this chunk */
+    s->pace_frac += MIN(now - s->pace_last_ns, I2S_PACE_BACKLOG_NS) * rate_bytes;
+    s->pace_last_ns = now;
+    s->pace_due += s->pace_frac / NANOSECONDS_PER_SECOND;
+    s->pace_frac %= NANOSECONDS_PER_SECOND;
+    s->pace_due = MIN(s->pace_due,
+                      I2S_PACE_BACKLOG_NS * rate_bytes / NANOSECONDS_PER_SECOND);
+
+    want = s->pace_due & ~(uint64_t)(I2S_FRAME_BYTES - 1);
+    moved = pl080_pace_request(s->dmac0, S5L8702_I2S_DMA_IIS0_TX, want);
+    s->pace_due -= moved;
 
     /* Advance the HLE PCM cursor by what the burst actually consumed. */
-    ipod_classic_hle_audio_commit((uint32_t)moved);
+    ipod_classic_hle_audio_commit((uint32_t)(moved / 2));
 
-    rate = i2s_sample_rate(s);
-    if (moved >= 2) {
-        /* stereo: two 16-bit samples per frame */
-        uint64_t frames = moved / 2;
-        delay_ns = (int64_t)(frames * 1000000000ULL / rate);
-        if (delay_ns < 1000) {
-            delay_ns = 1000;
-        }
-    } else {
-        /* Nothing moved: channel not enabled yet or drained. Poll again soon. */
-        delay_ns = 2000000;   /* 2 ms */
-    }
+    ipod_classic_audio_out_note_tick(moved < want);
     if (moved > 0 && i2s_trace_on()) {
-        fprintf(stderr, "I2STRACE drain: chunk %" PRIu64 " samples "
-                "(%u Hz) -> next tick in %" PRId64 " us\n",
-                moved, rate, delay_ns / 1000);
+        fprintf(stderr, "I2STRACE drain: %" PRIu64 " of %" PRIu64 " bytes "
+                "(%u Hz)\n", moved, want, i2s_sample_rate(s));
     }
-    s->next_tick_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ns;
-    timer_mod(s->drain_timer, s->next_tick_ns);
+    if (moved || !want) {
+        timer_mod(s->drain_timer, now + I2S_PACE_PERIOD_NS);
+    }
 }
 
-static void i2s_pace_arm(IPodClassicI2SState *s)
+/* A DMA channel has work and the drain has stopped asking. */
+static void i2s_pace_kick(void *opaque)
 {
-    if (!i2s_pace_on() || !s->drain_timer) {
-        return;
+    IPodClassicI2SState *s = opaque;
+
+    if (i2s_sending(s) && !timer_pending(s->drain_timer)) {
+        timer_mod(s->drain_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT));
     }
-    /* First tick soon; the drain callback then paces itself. */
-    timer_mod(s->drain_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
 }
 
-static void i2s_pace_disarm(IPodClassicI2SState *s)
+/* Follow the transmitter starting or stopping. */
+static void i2s_pace_update(IPodClassicI2SState *s, bool was_sending)
 {
-    if (s->drain_timer) {
+    bool sending = i2s_sending(s);
+
+    ipod_classic_audio_out_set_running(sending);
+    if (sending && !was_sending) {
+        /* Nothing has been clocked out yet: start from nothing owed. */
+        s->pace_last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT);
+        s->pace_frac = 0;
+        s->pace_due = 0;
+        timer_mod(s->drain_timer, s->pace_last_ns + I2S_PACE_PERIOD_NS);
+    } else if (!sending && was_sending) {
         timer_del(s->drain_timer);
     }
 }
@@ -540,13 +593,10 @@ static void i2s_pace_disarm(IPodClassicI2SState *s)
 void ipod_classic_i2s_set_dmac0(IPodClassicI2SState *s, PL080State *dmac0)
 {
     s->dmac0 = dmac0;
-    /*
-     * Mark the IIS0_TX request line paced on DMAC0 so mem->peri transfers to the
-     * FIFO wait for our drain ticks. Only under AUDIOPACE; otherwise the line is
-     * never marked and the PL080 behaves exactly as before.
-     */
-    if (dmac0 && i2s_pace_on()) {
-        pl080_set_paced_line(dmac0, S5L8702_I2S_DMA_IIS0_TX, true);
+    /* Mem->peri transfers to the FIFO wait for our drain ticks. */
+    if (dmac0) {
+        pl080_set_paced_line(dmac0, S5L8702_I2S_DMA_IIS0_TX, i2s_tx,
+                             i2s_pace_kick, s);
     }
 }
 
@@ -621,7 +671,10 @@ static void ipod_classic_i2s_write(void *opaque, hwaddr offset,
     switch (offset) {
     case S5L8702_I2S_CLKCON: {
         bool was_en = s->clkcon & 1;
+        bool was_sending = i2s_sending(s);
+
         s->clkcon = value;
+        i2s_pace_update(s, was_sending);
         /* Disable edge = the retailOS re-configuring the clock for a real play
          * (boot's silence init never disables). Signal the HLE play trigger. */
         if (was_en && !(value & 1)) {
@@ -632,27 +685,31 @@ static void ipod_classic_i2s_write(void *opaque, hwaddr offset,
     case S5L8702_I2S_TXCON:  s->txcon = value;  break;
     case S5L8702_I2S_TXCOM: {
         bool was_running = s->tx_running;
+        bool was_sending = i2s_sending(s);
+
         s->txcom = value;
         s->tx_running = (value & S5L8702_I2S_TXCOM_RUN) != 0;
+        i2s_pace_update(s, was_sending);
         if (s->tx_running && !was_running) {
-            i2s_pace_arm(s);
             ipod_classic_hle_audio_notify_play_start();
             ipod_classic_hle_np_notify_play_start();
             ipod_classic_np_overlay_notify_play_start();
-        } else if (!s->tx_running && was_running) {
-            i2s_pace_disarm(s);
         }
         break;
     }
     case S5L8702_I2S_RXCON:  s->rxcon = value;  break;
     case S5L8702_I2S_RXCOM:  s->rxcom = value;  break;
-    case S5L8702_I2S_CLKDIV: s->clkdiv = value; break;
-    case S5L8702_I2S_TXDB0:
-        /* A PCM sample from the DMA (or the CPU). Clock it out. */
-        s->tx_samples++;
-        i2s_wav_sample(s, value, size);
-        i2s_live_sample(s, value, size);
+    case S5L8702_I2S_CLKDIV:
+        s->clkdiv = value;
+        ipod_classic_audio_out_set_rate(i2s_sample_rate(s));
         break;
+    case S5L8702_I2S_TXDB0: {
+        /* A PCM sample from the CPU, or from DMA that is not a plain block. */
+        uint32_t le = cpu_to_le32(value);
+
+        i2s_tx(s, (const uint8_t *)&le, MIN(size, sizeof(le)));
+        break;
+    }
     default:
         break;
     }
@@ -692,6 +749,8 @@ static void ipod_classic_i2s_reset(DeviceState *dev)
     if (s->drain_timer) {
         timer_del(s->drain_timer);
     }
+    ipod_classic_audio_out_set_running(false);
+    ipod_classic_audio_out_flush();
     /* Silence the live-audio voice on reset and re-arm priming; the cushion
      * rebuilds from the next PCM samples. */
     if (i2s_live.voice) {
@@ -711,7 +770,7 @@ static void ipod_classic_i2s_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
 
-    s->drain_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+    s->drain_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL_RT,
                                   ipod_classic_i2s_drain, s);
 
     /*
@@ -724,10 +783,27 @@ static void ipod_classic_i2s_realize(DeviceState *dev, Error **errp)
     i2s_live_open(I2S_LIVE_DEFAULT_RATE);
 }
 
+/*
+ * The timer and the clock's arithmetic are not state: a restored machine owes
+ * nothing, and starts sending again from now.  What was queued for the old one
+ * must not play.
+ */
+static int ipod_classic_i2s_post_load(void *opaque, int version_id)
+{
+    IPodClassicI2SState *s = opaque;
+
+    ipod_classic_audio_out_flush();
+    ipod_classic_audio_out_set_rate(i2s_sample_rate(s));
+    timer_del(s->drain_timer);
+    i2s_pace_update(s, false);
+    return 0;
+}
+
 static const VMStateDescription vmstate_ipod_classic_i2s = {
     .name = TYPE_IPOD_CLASSIC_I2S,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = ipod_classic_i2s_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(clkcon, IPodClassicI2SState),
         VMSTATE_UINT32(txcon, IPodClassicI2SState),

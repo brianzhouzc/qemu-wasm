@@ -42,6 +42,11 @@ typedef struct {
     uint32_t conf;
 } pl080_channel;
 
+/* Takes the bytes a paced channel moved, in place of writing the device. */
+typedef void PL080PacedSink(void *opaque, const uint8_t *buf, unsigned bytes);
+/* A paced channel has work and nobody is asking for it. */
+typedef void PL080PacedKick(void *opaque);
+
 #define TYPE_PL080 "pl080"
 #define TYPE_PL081 "pl081"
 OBJECT_DECLARE_SIMPLE_TYPE(PL080State, PL080)
@@ -68,12 +73,21 @@ struct PL080State {
      * bit per line. Default 0: a line not listed here transfers at full speed
      * exactly as before, so this is a no-op unless a peripheral opts in. When a
      * line IS listed, a mem->peri (flow 1) or peri->mem (flow 2) transfer on it
-     * only advances while the peripheral has asserted a request, and the
-     * request is consumed at each terminal-count -- one chunk per request pulse.
-     * This is what lets the iPod's I2S drain the audio DMA at the sample rate
-     * instead of all at once. See hw/arm/ipod_classic/ipod_classic_i2s.c.
+     * only advances by what the peripheral asks for, in bytes, however many
+     * descriptors that crosses. This is what lets the iPod's I2S take the audio
+     * DMA at the sample rate instead of all at once, and raise each
+     * terminal-count when its last sample has gone rather than the moment the
+     * chunk was handed over. See hw/arm/ipod_classic/ipod_classic_i2s.c.
      */
     uint32_t paced_lines;
+    /* The current pl080_pace_request(): nothing here outlives it. */
+    int paced_line;
+    uint32_t paced_budget;
+    bool pacing;
+    bool paced_stalled;     /* a paced channel had work and no budget */
+    PL080PacedSink *paced_sink;
+    PL080PacedKick *paced_kick;
+    void *paced_opaque;
     /*
      * Bitmap of paced channels that have completed their terminal LLI (link==0)
      * but are kept ENABLED instead of auto-disabling, so a concurrent guest
@@ -99,17 +113,18 @@ struct PL080State {
 };
 
 /*
- * Mark a DMA request line as paced (or not). A paced line only advances a
- * mem<->peri transfer when the peripheral has asserted a request via
- * pl080_pace_request(). No effect on any other line.
+ * Mark a DMA request line as paced: a mem<->peri transfer on it only advances
+ * by what pl080_pace_request() allows. No effect on any other line. `sink`
+ * takes the data as a block where it can, instead of a device write per element
+ * (either may be NULL), and `kick` runs when a stalled channel has work.
  */
-void pl080_set_paced_line(PL080State *s, int line, bool on);
+void pl080_set_paced_line(PL080State *s, int line, PL080PacedSink *sink,
+                          PL080PacedKick *kick, void *opaque);
 
 /*
- * The peripheral asserts a burst request on a paced line: let the controller
- * hand over up to one chunk (until the next terminal-count), then stall again.
- * Call once per drain tick.
+ * The peripheral takes up to `bytes` from a paced line, crossing descriptors as
+ * it goes.  Returns how much moved: less means the guest had no more to send.
  */
-void pl080_pace_request(PL080State *s, int line);
+uint32_t pl080_pace_request(PL080State *s, int line, uint32_t bytes);
 
 #endif

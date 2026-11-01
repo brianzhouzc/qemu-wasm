@@ -162,6 +162,9 @@ static void pl080_run(PL080State *s)
     int src_id;
     int dest_id;
     int size;
+    int moved;
+    int paced_id;
+    bool paced;
     uint8_t buff[4];
     uint32_t req;
 
@@ -224,29 +227,25 @@ again:
             dest_id = (ch->conf >> 6) & 0x1f;
             size = ch->ctrl & 0xfff;
             req = s->req_single | s->req_burst;
+            /*
+             * The stock model transferred mem -> peripheral unconditionally
+             * (the request check was commented out), which drains the whole
+             * buffer at once. A line a peripheral has marked paced moves only
+             * what pl080_pace_request() allows; every other line keeps the old
+             * full-speed behaviour, so this cannot change any DMA that worked
+             * before. See paced_lines in the header.
+             */
+            paced_id = flow == 1 ? dest_id : flow == 2 ? src_id : -1;
+            paced = paced_id >= 0 && (s->paced_lines & (1u << paced_id));
+            if (paced && (paced_id != s->paced_line
+                          || s->paced_budget < (1u << ((ch->ctrl >> 18) & 7)))) {
+                s->paced_stalled |= size != 0;
+                continue;
+            }
             switch (flow) {
             case 0:
-                break;
             case 1:
-                /*
-                 * mem -> peripheral, DMAC is the flow controller. The stock
-                 * model transferred unconditionally (the request check was
-                 * commented out), which drains the whole buffer at once. We now
-                 * honour the request, but ONLY for lines a peripheral has marked
-                 * paced -- every other line keeps the old full-speed behaviour,
-                 * so this cannot change any DMA that worked before. See
-                 * paced_lines in the header.
-                 */
-                if ((s->paced_lines & (1u << dest_id))
-                        && (req & (1u << dest_id)) == 0) {
-                    size = 0;
-                }
-                break;
             case 2:
-                if ((s->paced_lines & (1u << src_id))
-                        && (req & (1u << src_id)) == 0) {
-                    size = 0;
-                }
                 break;
             case 3:
                 if ((req & (1u << src_id)) == 0
@@ -264,28 +263,60 @@ again:
                destination widths are different.  */
             swidth = 1 << ((ch->ctrl >> 18) & 7);
             dwidth = 1 << ((ch->ctrl >> 21) & 7);
-            for (n = 0; n < dwidth; n+= swidth) {
+            moved = 1;
+            if (paced && s->paced_sink && swidth == dwidth
+                    && (ch->ctrl & PL080_CCTRL_SI)
+                    && !(ch->ctrl & PL080_CCTRL_DI)) {
+                /*
+                 * 88,200 samples a second, each a read and a device write with
+                 * the BQL held against the vCPU: hand them over in one go.
+                 */
+                uint8_t block[4096];
+
+                moved = MIN(size, s->paced_budget / swidth);
+                moved = MIN(moved, sizeof(block) / swidth);
                 address_space_read(&s->downstream_as, ch->src,
-                                   MEMTXATTRS_UNSPECIFIED, buff + n, swidth);
-                if (ch->ctrl & PL080_CCTRL_SI)
-                    ch->src += swidth;
+                                   MEMTXATTRS_UNSPECIFIED, block,
+                                   moved * swidth);
+                ch->src += moved * swidth;
+                s->paced_sink(s->paced_opaque, block, moved * swidth);
+            } else {
+                for (n = 0; n < dwidth; n+= swidth) {
+                    address_space_read(&s->downstream_as, ch->src,
+                                       MEMTXATTRS_UNSPECIFIED, buff + n, swidth);
+                    if (ch->ctrl & PL080_CCTRL_SI)
+                        ch->src += swidth;
+                }
+                xsize = (dwidth < swidth) ? swidth : dwidth;
+                /* ??? This may pad the value incorrectly for dwidth < 32.  */
+                for (n = 0; n < xsize; n += dwidth) {
+                    address_space_write(&s->downstream_as, ch->dest + n,
+                                        MEMTXATTRS_UNSPECIFIED, buff + n,
+                                        dwidth);
+                    if (ch->ctrl & PL080_CCTRL_DI)
+                        ch->dest += swidth;
+                }
             }
-            xsize = (dwidth < swidth) ? swidth : dwidth;
-            /* ??? This may pad the value incorrectly for dwidth < 32.  */
-            for (n = 0; n < xsize; n += dwidth) {
-                address_space_write(&s->downstream_as, ch->dest + n,
-                                    MEMTXATTRS_UNSPECIFIED, buff + n, dwidth);
-                if (ch->ctrl & PL080_CCTRL_DI)
-                    ch->dest += swidth;
+            if (paced) {
+                s->paced_budget -= moved * swidth;
             }
 
-            size--;
+            size -= moved;
             ch->ctrl = (ch->ctrl & 0xfffff000) | size;
             if (size == 0) {
+                /*
+                 * The interrupt is the finished descriptor's to raise.  The
+                 * test below reads the next one's, which is how this model has
+                 * always behaved, and it stays so for every line that worked
+                 * that way; on a paced line the interrupt is how the guest
+                 * learns what has really been played.
+                 */
+                uint32_t done_ctrl = ch->ctrl;
+
                 /* Transfer complete.  */
                 if (ch->lli) {
                     pl080_ch_load_lli(s, ch, ch->lli);
-                } else if (s->paced_lines & ((1u << dest_id) | (1u << src_id))) {
+                } else if (paced) {
                     /*
                      * Terminal LLI (no link) on a PACED channel. Do NOT clear
                      * the enable bit here. Rockbox's audio driver keeps a single
@@ -304,14 +335,13 @@ again:
                      * when the guest explicitly aborts (writes CONFIG.E=0). This
                      * removes the race for ANY relative timing: a late relink now
                      * costs at most a brief underrun, never a panic. Non-paced
-                     * channels (all retailOS/5G DMA, and everything when AUDIOPACE
-                     * is off) keep the exact stock auto-disable below.
+                     * channels keep the exact stock auto-disable below.
                      */
                     s->paced_pending |= (1u << c);
                 } else {
                     ch->conf &= ~PL080_CCONF_E;
                 }
-                if (ch->ctrl & PL080_CCTRL_I) {
+                if ((paced ? done_ctrl : ch->ctrl) & PL080_CCTRL_I) {
                     s->tc_int |= 1 << c;
                     if (pl080_trace_on()) {
                         s->tc_count[c]++;
@@ -325,19 +355,6 @@ again:
                                     ch->lli);
                         }
                     }
-                    /*
-                     * A paced peripheral gets exactly one chunk per request
-                     * pulse: consume the request so the next iteration stalls
-                     * until the peripheral asks again. Only touches paced lines.
-                     */
-                    if (s->paced_lines & (1u << dest_id)) {
-                        s->req_burst &= ~(1u << dest_id);
-                        s->req_single &= ~(1u << dest_id);
-                    }
-                    if (s->paced_lines & (1u << src_id)) {
-                        s->req_burst &= ~(1u << src_id);
-                        s->req_single &= ~(1u << src_id);
-                    }
                 }
             }
             goto again;
@@ -346,40 +363,47 @@ again:
             s->running = 1;
     }
     pl080_update(s);
-}
-
-void pl080_set_paced_line(PL080State *s, int line, bool on)
-{
-    if (on) {
-        s->paced_lines |= (1u << line);
-    } else {
-        s->paced_lines &= ~(1u << line);
+    /*
+     * The peripheral stops asking when it has nothing to do, so a channel that
+     * has just been given work has to say so.
+     */
+    if (s->paced_stalled && !s->pacing) {
+        s->paced_stalled = false;
+        if (s->paced_kick) {
+            s->paced_kick(s->paced_opaque);
+        }
     }
 }
 
-void pl080_pace_request(PL080State *s, int line)
+void pl080_set_paced_line(PL080State *s, int line, PL080PacedSink *sink,
+                          PL080PacedKick *kick, void *opaque)
 {
-    /*
-     * Assert a burst request and let the controller run. pl080_run transfers
-     * until the next terminal-count on this line, then the consume logic above
-     * clears the bit and the channel stalls until the next call.
-     */
-    s->req_burst |= (1u << line);
+    s->paced_lines |= (1u << line);
+    s->paced_sink = sink;
+    s->paced_kick = kick;
+    s->paced_opaque = opaque;
+}
+
+uint32_t pl080_pace_request(PL080State *s, int line, uint32_t bytes)
+{
+    uint32_t left;
+
+    s->paced_line = line;
+    s->paced_budget = bytes;
+    s->pacing = true;
     pl080_run(s);
+    s->pacing = false;
+    left = s->paced_budget;
     /*
-     * One-shot request. pl080_run's consume logic clears the request bit at a
-     * terminal-count, but if this pulse moved nothing -- the channel was not
-     * enabled yet, or was stalled between tasks -- the bit would LINGER. A
-     * lingering request then drains a whole task the instant the guest enables
-     * the channel (measured: Rockbox's dmac_ch_run for the first audio task,
-     * followed at once by a terminal-count that clears the channel E-bit, so
-     * the guest's very next dmac_ch_queue_2d link check sees E=0 and panics
-     * "DMA ch link error"). Dropping the pulse here keeps pacing honest: the
-     * channel only advances on a live request, so it stays enabled between
-     * ticks and the guest can extend the LLI chain in time. Paced lines only.
+     * Nothing outlives the call.  A budget left over would drain a whole task
+     * the instant the guest enables the channel (measured: Rockbox's dmac_ch_run
+     * for the first audio task, followed at once by a terminal-count that clears
+     * the channel E-bit, so the guest's very next dmac_ch_queue_2d link check
+     * sees E=0 and panics "DMA ch link error").
      */
-    s->req_burst &= ~(1u << line);
-    s->req_single &= ~(1u << line);
+    s->paced_budget = 0;
+    s->paced_stalled = false;
+    return bytes - left;
 }
 
 static uint64_t pl080_read_inner(void *opaque, hwaddr offset,
