@@ -289,6 +289,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicWheelState, IPOD_CLASSIC_WHEEL)
 #define S5L8702_WHEEL_BTN_REPEAT_MS 400
 
 /*
+ * How much of a browser press the guest must read before it can end. Four
+ * packets is what the 150 ms press behind the table above lands, per the note
+ * under it: the retailOS needs its wheel task to run with the bit set, and one
+ * packet does not promise that. The cap is host time past the end of the hold,
+ * long enough to outlast the two seconds the page waits for an ack, and the poll
+ * is how often the release looks; see wasm_release_timer_cb().
+ */
+#define S5L8702_WHEEL_PRESS_PACKETS     4
+#define S5L8702_WHEEL_RELEASE_CAP_MS    3000
+#define S5L8702_WHEEL_RELEASE_POLL_MS   5
+
+/*
  * Deep enough that a burst of keystrokes cannot overrun it, shallow enough
  * that if the guest is NOT draining we find out quickly through the dropped
  * counter rather than by guessing.
@@ -309,6 +321,7 @@ struct IPodClassicWheelState {
     uint32_t wasm_press_mask;
     uint32_t wasm_consumed;      /* presses the guest has consumed */
     uint32_t wasm_consumed0;     /* counter value when the press started */
+    int64_t wasm_release_cap;    /* host ns: release now, taken or not */
     QEMUTimer *wasm_release_timer;
     /* Mailbox: the page queues a key, the main loop's BH performs it (Q11). */
     QEMUBH *wasm_key_bh;

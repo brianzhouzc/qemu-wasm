@@ -281,10 +281,40 @@ static void wheel_kick(IPodClassicWheelState *s)
 }
 
 #ifdef EMSCRIPTEN
+/* Whether the guest has had enough of the press in flight to let it go. */
+static bool wasm_press_taken(IPodClassicWheelState *s)
+{
+    uint32_t seen = qatomic_read(&s->wasm_consumed) - s->wasm_consumed0;
+
+    return seen >= (s->wasm_press_mask ? S5L8702_WHEEL_PRESS_PACKETS : 1);
+}
+
+/*
+ * THE HOLD IS HOST TIME AND THE WHEEL IS GUEST TIME, so a hold can end before
+ * the wheel has told the guest anything. One tick is 40 ms of guest time, 2.5 M
+ * instructions, and a busy guest takes 100 ms and more of host time over that.
+ *
+ * Releasing at the end of the hold regardless cost two things, MEASURED on
+ * stock 2.0.5 at about 20 M instructions a second. The ack: it is only counted
+ * while this timer is pending, so a detent paid out after a 60 ms hold went
+ * unacknowledged, 8 to 12 of 120, and each one cost the caller a timeout. And
+ * the press: a button down and up inside one tick never makes a packet, because
+ * the tick sends the state it finds. 16 of 16 presses held for 1 ms did nothing.
+ *
+ * So the hold is a floor: the key stays down until the guest has read the press
+ * as well, with a cap, because a guest that has stopped draining must not leave
+ * a button down for good.
+ */
 static void wasm_release_timer_cb(void *opaque)
 {
     IPodClassicWheelState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 
+    if (!wasm_press_taken(s) && now < s->wasm_release_cap) {
+        timer_mod_ns(s->wasm_release_timer,
+                     now + S5L8702_WHEEL_RELEASE_POLL_MS * 1000000);
+        return;
+    }
     s->wasm_press_mask = 0;
     wheel_key_event(s, s->wasm_keycode | 0x80);
 }
@@ -723,11 +753,14 @@ static IPodClassicWheelState *wasm_wheel_state;
 static void wasm_key_do_press(IPodClassicWheelState *s, int keycode,
                               int hold_ms)
 {
+    int64_t hold_end;
+
     /*
      * Every press gets its own down and up.  The up is on a dedicated
      * realtime timer: with Rockbox's tick on host time, nothing near keeps an
      * idle guest from warping straight past a virtual hold, so the key would
-     * go down and up before the guest had run at all.
+     * go down and up before the guest had run at all.  It does not fire blind:
+     * see wasm_release_timer_cb().
      */
     if (s->wasm_release_timer && timer_pending(s->wasm_release_timer)) {
         timer_del(s->wasm_release_timer);
@@ -737,9 +770,10 @@ static void wasm_key_do_press(IPodClassicWheelState *s, int keycode,
     s->wasm_keycode = keycode;
     s->wasm_press_mask = s->buttons;
     s->wasm_consumed0 = qatomic_read(&s->wasm_consumed);
-    timer_mod_ns(s->wasm_release_timer,
-                 qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
-                 (int64_t)MAX(hold_ms, 0) * 1000000);
+    hold_end = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+               (int64_t)MAX(hold_ms, 0) * 1000000;
+    s->wasm_release_cap = hold_end + S5L8702_WHEEL_RELEASE_CAP_MS * 1000000;
+    timer_mod_ns(s->wasm_release_timer, hold_end);
 }
 
 static void wasm_key_bh_fn(void *opaque)
@@ -809,9 +843,9 @@ static void wasm_key_queue(int op, int keycode, int hold_ms)
 }
 
 /*
- * Press a key and release it after hold_ms of host time.  The down and the
- * up are both queued as packets, so a guest that is busy for the whole hold
- * still sees the press; see wasm_key_do_press() for why this is not guest time.
+ * Press a key and release it after hold_ms of host time, or once the guest has
+ * read the press if that is later: see wasm_release_timer_cb().  See
+ * wasm_key_do_press() for why this is not guest time.
  */
 EMSCRIPTEN_KEEPALIVE void ipod_wasm_key_press(int keycode, int hold_ms)
 {
