@@ -185,7 +185,7 @@ struct IPodClassicSM1State {
     /*
      * The I2S the playback position tracks. The engine's stream position
      * advances as audio is clocked out, and in this model the I2S transmitter is
-     * what actually clocks PCM out (paced by AUDIOPACE), so +0xa48 is derived
+     * what actually clocks PCM out (paced), so +0xa48 is derived
      * from its tx_samples. Set by the machine after both devices exist; may be
      * NULL (then the position stays 0, i.e. the old behaviour).
      */

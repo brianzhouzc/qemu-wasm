@@ -77,6 +77,7 @@ arm_ss.add(when: 'CONFIG_IPOD_CLASSIC_6G', if_true: files(
   'ipod_classic/ipod_classic_disp.c',
   'ipod_classic/ipod_classic_wheel.c',
   'ipod_classic/ipod_classic_i2s.c',
+  'ipod_classic/ipod_classic_audio_out.c',
   'ipod_classic/ipod_classic_cs42l55.c',
   'ipod_classic/ipod_classic_sm1.c',
   'ipod_classic/ipod_classic_hle_audio.c',
