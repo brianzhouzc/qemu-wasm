@@ -533,7 +533,16 @@ static void pl080_write(void *opaque, hwaddr offset,
              * later and corrupt its book-keeping. Because the enable bit was
              * never dropped, the guest's follow-up CONFIG.E read passes instead
              * of panicking "DMA ch link error".
+             *
+             * This is also how a channel that has run dry gets going again:
+             * the write runs nothing here, so the peripheral has to be told.
+             * MEASURED: Rockbox's first two tasks are 12 ms between them, its
+             * handler ran after they had gone, and without this the drain
+             * stayed off for good.
              */
+            if ((s->paced_pending & (1u << i)) && value && s->paced_kick) {
+                s->paced_kick(s->paced_opaque);
+            }
             break;
         case 3: /* Control */
             s->chan[i].ctrl = value;
