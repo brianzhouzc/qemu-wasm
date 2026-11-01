@@ -393,7 +393,32 @@ static void wheel_tick(void *opaque)
 #define KEY_A       0x1e
 #define KEY_S       0x1f
 #define KEY_D       0x20
+#define KEY_H       0x23
 #define KEY_ENTER   0x1c
+
+/*
+ * The GPIO block says whether the guest has cut the wheel's pins. A gesture
+ * that was under way when it did dies with the link: the wheel must not come
+ * back later and pay out movement from before the hold.
+ */
+static void wheel_link_event(void *opaque, int n, int cut)
+{
+    IPodClassicWheelState *s = opaque;
+
+    if (s->link_cut == !!cut) {
+        return;
+    }
+    s->link_cut = cut;
+    if (cut) {
+        s->buttons = 0;
+        s->sent_buttons = 0;
+        s->button_repeat_until = 0;
+        s->pending_steps = 0;
+        s->touched = false;
+        s->armed = false;
+        timer_del(s->tick);
+    }
+}
 
 static void wheel_key_event(void *opaque, int keycode)
 {
@@ -401,6 +426,15 @@ static void wheel_key_event(void *opaque, int keycode)
     IPodClassicWheelState *s = opaque;
     bool released = (keycode & 0x80) != 0;
     uint32_t bit;
+
+    /*
+     * Before the overlay's tee: with the link cut this press went nowhere, and
+     * no wasm_press_mask or pending step means nobody acknowledges it either,
+     * so a script's press() says the guest never took it, which is true.
+     */
+    if (s->link_cut) {
+        return;
+    }
 
     if (wheel_trace_verbose() ||
         (!key_traced && wheel_trace_on())) {
@@ -486,9 +520,19 @@ static void wheel_key_event(void *opaque, int keycode)
  * the firmware that is still spinning in its power-off path (nor the one that
  * boots next).  The wasm raw-key path makes the same check; this one covers the
  * native keyboard handler, which is called directly.
+ *
+ * h slides the hold switch.  It latches, so only the press counts, and it is
+ * not a wheel key: the switch still moves with the machine off.
  */
 static void wheel_kbd_event(void *opaque, int keycode)
 {
+    if (keycode == KEY_H) {
+        ipod_classic_set_hold(!ipod_classic_get_hold());
+        return;
+    }
+    if (keycode == (KEY_H | 0x80)) {
+        return;
+    }
     if (ipod_classic_power_key_event(keycode)) {
         return;
     }
@@ -627,6 +671,7 @@ static void ipod_classic_wheel_reset(DeviceState *dev)
     s->button_repeat_until = 0;
     s->sent_buttons = 0;
     s->irq_level = false;
+    s->link_cut = false;
     timer_del(s->tick);
 #ifdef EMSCRIPTEN
     if (s->wasm_release_timer) {
@@ -699,6 +744,11 @@ static void wasm_key_bh_fn(void *opaque)
 {
     IPodClassicWheelState *s = opaque;
     uint32_t tail = qatomic_read(&s->wasm_key_tail);
+    int32_t hold_request = qatomic_xchg(&s->wasm_hold_request, -1);
+
+    if (hold_request >= 0) {
+        ipod_classic_set_hold(hold_request);
+    }
 
     while (tail != qatomic_load_acquire(&s->wasm_key_head)) {
         uint32_t slot = tail % 8;
@@ -778,6 +828,29 @@ EMSCRIPTEN_KEEPALIVE void ipod_wasm_key(int keycode)
     wasm_key_queue(2, keycode, 0);
 }
 
+/*
+ * Slide the hold switch.  Off the page's thread like every other input (Q11):
+ * the bottom half does it.  Called before the machine exists it does nothing,
+ * which is why the page sets the position again once a boot has finished.
+ */
+EMSCRIPTEN_KEEPALIVE void ipod_wasm_hold(int on)
+{
+    IPodClassicWheelState *s = wasm_wheel_state;
+
+    if (!s || !s->wasm_key_bh) {
+        return;
+    }
+    qatomic_set(&s->wasm_hold_request, on ? 1 : 0);
+    qemu_bh_schedule(s->wasm_key_bh);
+    qemu_notify_event();
+}
+
+/* Where the switch is as the machine sees it: a restore can move it. */
+EMSCRIPTEN_KEEPALIVE int ipod_wasm_hold_state(void)
+{
+    return ipod_classic_get_hold();
+}
+
 #endif
 
 static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
@@ -788,6 +861,7 @@ static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
                           TYPE_IPOD_CLASSIC_WHEEL, S5L8702_WHEEL_MEM_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
+    qdev_init_gpio_in_named(dev, wheel_link_event, "link-cut", 1);
 
     /*
      * The firmware delivers the FIRST movement of a gesture only if it is
@@ -815,6 +889,7 @@ static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
     qemu_add_kbd_event_handler(wheel_kbd_event, s);
 #ifdef EMSCRIPTEN
     wasm_wheel_state = s;
+    s->wasm_hold_request = -1;
     s->wasm_key_bh = qemu_bh_new(wasm_key_bh_fn, s);
     s->wasm_release_timer =
         timer_new_ns(QEMU_CLOCK_REALTIME, wasm_release_timer_cb, s);
@@ -867,11 +942,12 @@ static const VMStateDescription vmstate_ipod_classic_wheel_wasm = {
 static const VMStateDescription vmstate_ipod_classic_wheel = {
     .name = TYPE_IPOD_CLASSIC_WHEEL,
     /*
-     * Bumped to 2 when button_repeat_until joined the field list. Nothing
-     * migrates this machine today, so the old format is not kept alive.
+     * Bumped to 2 when button_repeat_until joined the field list, and to 4 for
+     * link_cut. Nothing migrates this machine today, so the old format is not
+     * kept alive.
      */
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .post_load = wheel_post_load,
 #ifdef EMSCRIPTEN
     /*
@@ -905,6 +981,7 @@ static const VMStateDescription vmstate_ipod_classic_wheel = {
         VMSTATE_INT64(untouch_at, IPodClassicWheelState),
         VMSTATE_INT64(button_repeat_until, IPodClassicWheelState),
         VMSTATE_TIMER_PTR(tick, IPodClassicWheelState),
+        VMSTATE_BOOL(link_cut, IPodClassicWheelState),
         VMSTATE_END_OF_LIST()
     },
 };

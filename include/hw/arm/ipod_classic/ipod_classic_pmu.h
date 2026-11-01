@@ -94,8 +94,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicPMUState, IPOD_CLASSIC_PMU)
  * keycode dispatcher reaches the same conclusion from the other direction --
  * see the long note at the reset function. Clear it and no button on the
  * click wheel does anything at all.
+ *
+ * INT6 bit 1 is the same pin's change interrupt, PCF50635_INT6_GPIO2 in
+ * pmu-target.h:37: Rockbox only reads GPIOSTAT again when it fires.
  */
 #define PCF50635_GPIOSTAT_HOLD_OFF  0x02
+#define PCF50635_INT6_HOLD          0x02
 
 /*
  * ASSUMED. 844 of 1023 is 3900 mV through Rockbox's own conversion in
@@ -123,6 +127,17 @@ struct IPodClassicPMUState {
 
     /* The PCF50635 raises INT1_SECOND once a second. */
     QEMUTimer *rtc_second;
+
+    /* The chip's interrupt output: 1 while an unmasked INT bit is pending. */
+    qemu_irq nirq;
+    /*
+     * The hold switch. A physical position, not a register: a reset does not
+     * move it, and GPIOSTAT reads follow it whatever the guest wrote there.
+     */
+    bool hold;
 };
+
+/* Slide the switch; the guest hears about it through INT6 and nIRQ. */
+void ipod_classic_pmu_set_hold(IPodClassicPMUState *s, bool on);
 
 #endif

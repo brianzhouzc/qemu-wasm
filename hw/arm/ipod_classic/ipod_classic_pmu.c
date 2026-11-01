@@ -28,6 +28,12 @@
  *   - The interrupt status registers INT1..INT5 and INT6, which are
  *     read-to-clear on the real chip and therefore must not be a plain
  *     register file: a driver that reads them expects the bits to go away.
+ *   - The chip's interrupt output, nIRQ, which is GPIO 0x7b at the SoC: both
+ *     firmwares register that pin as a level-low external interrupt (Rockbox
+ *     GPIO_EINT_PMU, pmu-6g.c:203; Apple's 2.0.5 at 0x083952a4). The EIC side
+ *     is in ipod_classic.c. Both also mask INT1_SECOND, so the tick below does
+ *     not pull the line down (measured on 2.0.5, INT1M = 0xb0).
+ *   - The hold switch, GPIOSTAT bit 1, and its change interrupt, INT6 bit 1.
  *
  * WHAT IS NOT
  *
@@ -36,7 +42,6 @@
  *     Rockbox decided an alarm had gone off on every boot.
  *   - Charging, the ON/OFF controller and the regulators. Writing them changes
  *     nothing, because there is no voltage in here for a voltage to mean.
- *   - The chip's interrupt output. Nothing is wired to it yet.
  *
  * ASSUMED, and marked as such because nothing derives them:
  *
@@ -55,6 +60,7 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/i2c/i2c.h"
+#include "hw/irq.h"
 #include "migration/vmstate.h"
 #include "sysemu/rtc.h"
 #include "hw/arm/ipod_classic/ipod_classic_pmu.h"
@@ -100,6 +106,31 @@ static void pmu_start_adc(IPodClassicPMUState *s)
     s->reg[PCF5063X_REG_ADCS3] = PCF5063X_ADCS3_ADCRDY | (raw & 0x03);
 }
 
+/*
+ * nIRQ is low while any status bit is pending and not masked. INT6 and its
+ * mask sit apart from the other five, at the undocumented 0x85/0x86.
+ */
+static void pmu_update_irq(IPodClassicPMUState *s)
+{
+    bool pending = s->reg[PCF50635_REG_INT6] & ~s->reg[PCF50635_REG_INT6M];
+
+    for (int i = 0; i < 5; i++) {
+        pending |= s->reg[PCF5063X_REG_INT1 + i] &
+                   ~s->reg[PCF5063X_REG_INT1M + i];
+    }
+    qemu_set_irq(s->nirq, pending);
+}
+
+void ipod_classic_pmu_set_hold(IPodClassicPMUState *s, bool on)
+{
+    if (s->hold == on) {
+        return;
+    }
+    s->hold = on;
+    s->reg[PCF50635_REG_INT6] |= PCF50635_INT6_HOLD;
+    pmu_update_irq(s);
+}
+
 static uint8_t pmu_reg_read(IPodClassicPMUState *s, uint8_t addr)
 {
     uint8_t val = s->reg[addr];
@@ -113,18 +144,17 @@ static uint8_t pmu_reg_read(IPodClassicPMUState *s, uint8_t addr)
     case PCF50635_REG_INT6:
         /* Read to clear, which is what makes an interrupt line drop. */
         s->reg[addr] = 0;
+        pmu_update_irq(s);
         break;
     case PCF50635_REG_GPIOSTAT:
         /*
-         * The hold switch, reported OPEN unconditionally. See the long note at
-         * the reset function for why "open" is the only usable value on a
-         * machine with no switch to flip -- and why it MUST NOT depend on
-         * whatever a write has left in s->reg[0x87]. Apple's own GPIO code
-         * writes this register (measured: a byte 0x87 goes to reg 0x87), so the
-         * stored value is not reliably HOLD_OFF; forcing the read makes the
-         * keycode dispatcher's gate see "open" no matter what was written.
+         * The hold switch. See the long note at the reset function, and why
+         * this MUST NOT depend on whatever a write has left in s->reg[0x87]:
+         * Apple's own GPIO code writes this register (measured: a byte 0x87
+         * goes to reg 0x87), so the stored value means nothing and the read
+         * comes from the switch no matter what was written.
          */
-        val = PCF50635_GPIOSTAT_HOLD_OFF;
+        val = s->hold ? 0 : PCF50635_GPIOSTAT_HOLD_OFF;
         break;
     case PCF5063X_REG_OOCSTAT:
         /*
@@ -259,6 +289,15 @@ static void pmu_reg_write(IPodClassicPMUState *s, uint8_t addr, uint8_t val)
         qemu_log_mask(LOG_GUEST_ERROR, "%s: INT%d is read-only\n", __func__,
                       addr == PCF50635_REG_INT6 ? 6 : addr - 1);
         return;
+    case PCF5063X_REG_INT1M:
+    case PCF5063X_REG_INT2M:
+    case PCF5063X_REG_INT3M:
+    case PCF5063X_REG_INT4M:
+    case PCF5063X_REG_INT5M:
+    case PCF50635_REG_INT6M:
+        s->reg[addr] = val;
+        pmu_update_irq(s);
+        return;
     case PCF5063X_REG_OOCSHDWN:
         /*
          * The ON/OFF controller's shutdown.  Rockbox writes 0x01 here at the
@@ -341,9 +380,10 @@ static int ipod_classic_pmu_event(I2CSlave *i2c, enum i2c_event event)
  * On real hardware the firmware serialises PMU access so the write never
  * interleaves; our timing does not reproduce that serialisation, so the model
  * compensates: a register write restores the pointer at STOP (above), which
- * un-clobbers whatever pointer a pending read had set. Combined with the forced
- * HOLD_OFF / healthy-status reads, the three status reads are now stable
- * regardless of interleaving. The pointer still auto-advances within a
+ * un-clobbers whatever pointer a pending read had set. Combined with GPIOSTAT
+ * coming from the switch and the forced healthy-status reads, the three status
+ * reads are now stable regardless of interleaving. The pointer still
+ * auto-advances within a
  * transaction, so multi-byte reads and writes are unchanged.
  */
 /*
@@ -402,6 +442,7 @@ static void pmu_rtc_second_tick(void *opaque)
     IPodClassicPMUState *s = opaque;
 
     s->reg[PCF5063X_REG_INT1] |= 0x80; /* INT1_SECOND */
+    pmu_update_irq(s);
     ipod_classic_wake_vcpu();
     timer_mod_ns(s->rtc_second,
                  qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 1000000000LL);
@@ -459,11 +500,15 @@ static void ipod_classic_pmu_reset(DeviceState *dev)
      * 0x0803f390 at all, which is exactly why it was not affected and why the
      * failure looked like a wheel bug rather than a hold switch.
      *
-     * CONVENIENCE VALUE, and marked as one: a machine with no hold switch to
-     * flip has to boot with it off or it cannot be used. The other two bits
-     * stay zero -- Rockbox marks both "TBC" and nothing we have reads them.
+     * NOT RESET HERE: s->hold is where the switch physically is, and a reset
+     * does not move a switch. It starts off, because the object starts zeroed.
+     * The other two GPIOSTAT bits stay zero -- Rockbox marks both "TBC" and
+     * nothing we have reads them.
+     *
+     * Reading the pin is half of it. Neither firmware polls it for the wheel:
+     * both wait for INT6, then cut the wheel's pins themselves. See
+     * S5L8702_GPIO_WHEEL_GROUP in ipod_classic_gpio.h.
      */
-    s->reg[PCF50635_REG_GPIOSTAT] = PCF50635_GPIOSTAT_HOLD_OFF;
 
     /*
      * Power-status registers seeded to their healthy powered values so a
@@ -474,12 +519,27 @@ static void ipod_classic_pmu_reset(DeviceState *dev)
      */
     s->reg[PCF5063X_REG_OOCSTAT] = PCF5063X_OOCSTAT_HEALTHY;
     s->reg[PCF5063X_REG_MBCS1] = PCF5063X_MBCS1_HEALTHY;
+
+    pmu_update_irq(s);
 }
 
+static void ipod_classic_pmu_init(Object *obj)
+{
+    IPodClassicPMUState *s = IPOD_CLASSIC_PMU(obj);
+
+    qdev_init_gpio_out(DEVICE(obj), &s->nirq, 1);
+}
+
+/*
+ * The switch is saved with the machine: the guest has already acted on it, so
+ * a restore that came back with it elsewhere would leave the wheel's pins and
+ * GPIOSTAT disagreeing with no interrupt to reconcile them. nIRQ itself is not
+ * state here; what it last drove is kept at the EIC end.
+ */
 static const VMStateDescription vmstate_ipod_classic_pmu = {
     .name = TYPE_IPOD_CLASSIC_PMU,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (VMStateField[]) {
         VMSTATE_I2C_SLAVE(parent_obj, IPodClassicPMUState),
         VMSTATE_UINT8_ARRAY(reg, IPodClassicPMUState, S5L8702_PMU_NUM_REGS),
@@ -488,6 +548,7 @@ static const VMStateDescription vmstate_ipod_classic_pmu = {
         VMSTATE_UINT8(addr_saved, IPodClassicPMUState),
         VMSTATE_BOOL(wrote_data, IPodClassicPMUState),
         VMSTATE_TIMER_PTR(rtc_second, IPodClassicPMUState),
+        VMSTATE_BOOL(hold, IPodClassicPMUState),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -509,6 +570,7 @@ static const TypeInfo ipod_classic_pmu_info = {
     .name          = TYPE_IPOD_CLASSIC_PMU,
     .parent        = TYPE_I2C_SLAVE,
     .instance_size = sizeof(IPodClassicPMUState),
+    .instance_init = ipod_classic_pmu_init,
     .class_init    = ipod_classic_pmu_class_init,
 };
 
