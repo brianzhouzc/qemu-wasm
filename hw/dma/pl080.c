@@ -78,6 +78,9 @@ static const VMStateDescription vmstate_pl080 = {
     }
 };
 
+/* Empty descriptors one pass of pl080_run() will follow in a row. */
+#define PL080_EMPTY_LINKS 16
+
 static const unsigned char pl080_id[] =
 { 0x80, 0x10, 0x04, 0x0a, 0x0d, 0xf0, 0x05, 0xb1 };
 
@@ -164,6 +167,7 @@ static void pl080_run(PL080State *s)
     int size;
     int moved;
     int paced_id;
+    int empty_links = 0;
     bool paced;
     uint8_t buff[4];
     uint32_t req;
@@ -249,6 +253,22 @@ again:
             if (paced && (s->tc_int & (1u << c))) {
                 s->paced_held |= 1u << c;
                 continue;
+            }
+            /*
+             * An empty descriptor with a link is finished before it starts, and
+             * the controller goes straight to the link.  It is how Apple's
+             * driver starts a stream: MEASURED on 2.0.5, play enables channel 1
+             * with a count of 0 and the chain in the link register, and with
+             * this model waiting for a count that was never coming the DMA
+             * stayed idle, no terminal count ever came, and the engine above it
+             * waited for buffers to come back for ever.  The limit is for a
+             * guest whose empty descriptor links to itself.
+             */
+            if (paced && !size && ch->lli && empty_links < PL080_EMPTY_LINKS) {
+                empty_links++;
+                pl080_ch_load_lli(s, ch, ch->lli);
+                s->paced_pending &= ~(1u << c);
+                goto again;
             }
             if (paced && (paced_id != s->paced_line
                           || s->paced_budget < (1u << ((ch->ctrl >> 18) & 7)))) {
@@ -573,10 +593,11 @@ static void pl080_write(void *opaque, hwaddr offset,
             s->chan[i].conf = value;
             if (pl080_trace_on() && (value & PL080_CCONF_E)) {
                 fprintf(stderr,
-                        "DMATRACE %s ch%d ENABLE conf=0x%08x flow=%d "
-                        "srcid=%d dstid=%d src=0x%08x dst=0x%08x lli=0x%08x "
-                        "xsize=%u\n",
+                        "DMATRACE %s ch%d ENABLE conf=0x%08x ctrl=0x%08x "
+                        "flow=%d srcid=%d dstid=%d src=0x%08x dst=0x%08x "
+                        "lli=0x%08x xsize=%u\n",
                         pl080_trace_tag(s), i, (uint32_t)value,
+                        s->chan[i].ctrl,
                         (int)((value >> 11) & 7), (int)((value >> 1) & 0x1f),
                         (int)((value >> 6) & 0x1f), s->chan[i].src,
                         s->chan[i].dest, s->chan[i].lli,
