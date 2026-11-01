@@ -563,13 +563,18 @@ static void ipod_classic_i2s_drain(void *opaque)
     }
 }
 
-/* A DMA channel has work and the drain has stopped asking. */
+/*
+ * A DMA channel can move again.  Not only when the drain has stopped asking: a
+ * channel that waited for the guest to take an interrupt carries on with what
+ * this tick already paid for, or tasks shorter than a tick would play slow.
+ */
 static void i2s_pace_kick(void *opaque)
 {
     IPodClassicI2SState *s = opaque;
 
-    if (i2s_sending(s) && !timer_pending(s->drain_timer)) {
-        timer_mod(s->drain_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT));
+    if (i2s_sending(s)) {
+        timer_mod_anticipate(s->drain_timer,
+                             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT));
     }
 }
 

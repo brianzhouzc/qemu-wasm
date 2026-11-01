@@ -242,6 +242,19 @@ again:
                 s->paced_stalled |= size != 0;
                 continue;
             }
+            /*
+             * One interrupt per terminal count.  On the hardware the next one
+             * is a whole task away, and Rockbox counts a task for each
+             * interrupt.  Here a tick pays for 15 ms at once and its first
+             * tasks are 2.9 ms: MEASURED, two fell inside one tick, their
+             * interrupts merged, and the driver took the callback of one for
+             * the other and stopped queueing.  So the channel waits for the
+             * guest to take each one, and the clear kicks the peripheral.
+             */
+            if (paced && (s->tc_int & (1u << c))) {
+                s->paced_held |= 1u << c;
+                continue;
+            }
             switch (flow) {
             case 0:
             case 1:
@@ -577,6 +590,10 @@ static void pl080_write(void *opaque, hwaddr offset,
     switch (offset >> 2) {
     case 2: /* IntTCClear */
         s->tc_int &= ~value;
+        if ((s->paced_held & value) && s->paced_kick) {
+            s->paced_held &= ~value;
+            s->paced_kick(s->paced_opaque);
+        }
         break;
     case 4: /* IntErrorClear */
         s->err_int &= ~value;
@@ -628,6 +645,7 @@ static void pl080_reset(DeviceState *dev)
     s->req_burst = 0;
     s->running = 0;
     s->paced_pending = 0;
+    s->paced_held = 0;
 
     for (i = 0; i < s->nchannels; i++) {
         s->chan[i].src = 0;

@@ -85,6 +85,7 @@ struct PL080State {
     uint32_t paced_budget;
     bool pacing;
     bool paced_stalled;     /* a paced channel had work and no budget */
+    uint32_t paced_held;    /* channels waiting for a terminal count's clear */
     PL080PacedSink *paced_sink;
     PL080PacedKick *paced_kick;
     void *paced_opaque;
