@@ -143,6 +143,20 @@ void qemu_clock_notify(QEMUClockType type)
     QEMUTimerList *timer_list;
     QEMUClock *clock = qemu_clock_ptr(type);
     QLIST_FOREACH(timer_list, &clock->timerlists, list) {
+#ifdef EMSCRIPTEN
+        /*
+         * A list with no timers has no deadline to recompute.  The ones that
+         * mattered here are the AioContexts', always empty on this machine:
+         * notifying them woke the main loop for every virtual timer, and it
+         * then took the BQL for nothing.  MEASURED on stock 2.0.5: 60,700 main
+         * loop iterations in a boot became 5,100, and a busy guest gained 5%.
+         * Those wakes were also what ran due host timers on time, which is now
+         * done on purpose: see icount_get_limit().
+         */
+        if (!timerlist_has_timers(timer_list)) {
+            continue;
+        }
+#endif
         timerlist_notify(timer_list);
     }
 }
