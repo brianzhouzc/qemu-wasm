@@ -63,10 +63,31 @@
  *                 every attempt). Leaving it 0 is what the machine has always
  *                 done.
  *
- * GPIOCMD, +0x200, is written about 850 times in a diskless boot and is NOT
- * modelled: the writes are logged and dropped, exactly as they were when this
- * window was an unimplemented device. What it does is UNDETERMINED; Rockbox
- * names the register (s5l87xx.h:1426) and nothing more.
+ * GPIOCMD, +0x200, sets one pin's function: (group << 16) | (pin << 8) | cmd,
+ * which is how Rockbox's gpio_init() writes it (0xe070e) and what Apple's
+ * 0x0836cf7c builds on 2.0.5. cmd is the pin's PCON nibble, with 0xe and 0xf
+ * being output low and high. The rest of its behaviour is UNDETERMINED: the
+ * output level goes nowhere, as for a PDAT write.
+ *
+ * THE WHEEL'S LINK, and it is why GPIOCMD is modelled at all. The wheel talks
+ * over E2..E5 (group 14), function 2 in both firmwares, and the hold switch
+ * reaches it only through them. Nothing in the hardware path gates the wheel:
+ * each firmware disconnects it by hand when the PMU says hold went on.
+ *
+ *   Rockbox, button-clickwheel.c:463:
+ *       PCON14 = (PCON14 & ~0x00ffff00) | 0x000e0e00;   back to 0x00222200
+ *   Apple 2.0.5, 0x08060ad0, on PMU event 0x200 (INT6 bit 1):
+ *       hold on:  GPIOCMD 0xe040e, 0xe020e              back to 0xe0202, 0xe0402
+ *
+ * Both drive E2 and E4 low, so that is what the block reports. It is not "not
+ * function 2": the machine starts with no bootrom and PCON14 at 0, and a guest
+ * that never set the pins up must keep its wheel, as it always has.
+ *
+ * LOW PINS ALONE ARE NOT A CUT LINK, and the wheel checks the switch as well.
+ * Apple parks the same two pins when it sleeps (measured on 2.0.5 after a
+ * 240 s idle: 0xe040e and 0xe020e, then back on wake), and a press still has
+ * to wake it. How that gets out on the hardware is UNDETERMINED; the wheel has
+ * always delivered it here, so with hold off it still does.
  */
 
 #ifndef HW_ARM_IPOD_CLASSIC_GPIO_H
@@ -88,14 +109,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicGPIOState, IPOD_CLASSIC_GPIO)
 #define S5L8702_GPIO_PUNA       0x08
 #define S5L8702_GPIO_PUNB       0x0C
 #define S5L8702_GPIO_PUNC       0x10
+#define S5L8702_GPIO_CMD        0x200
 
 /* The one pin this device exists for. See the note above. */
 #define S5L8702_GPIO_PIN_MEDIA  86
+
+/* The wheel's link. See the note above. */
+#define S5L8702_GPIO_WHEEL_GROUP  14
+#define S5L8702_GPIO_WHEEL_PIN_A  2
+#define S5L8702_GPIO_WHEEL_PIN_B  4
 
 struct IPodClassicGPIOState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
+    /* 1 while the guest holds the wheel's pins low; goes to the wheel. */
+    qemu_irq wheel_pins_low;
 
     uint32_t pcon[S5L8702_GPIO_GROUPS];
     uint32_t puna[S5L8702_GPIO_GROUPS];

@@ -121,6 +121,7 @@
 #define ADM_MEM_BASE      0x3F000000   /* ADM_BASE */
 
 /* IRQ numbers, from the IRQ_* macros in s5l87xx.h. */
+#define S5L8702_EXT3_IRQ     3
 #define S5L8702_TIMER32_IRQ  7
 #define S5L8702_TIMER_IRQ    8
 #define S5L8702_SPI0_IRQ     9
@@ -227,6 +228,7 @@ typedef struct {
     IPodClassicClkState *clock0;
     IPodClassicTimerState *timer;
     IPodClassicI2CState *i2c0;
+    IPodClassicPMUState *pmu;
     IPodClassicATAState *ata;
     IPodClassicLCDState *lcd;
     IPodClassicDispState *disp;
@@ -292,5 +294,11 @@ bool ipod_classic_power_key_event(int keycode);
 /* The PMU was told to cut the power; the next key press resets the machine. */
 void ipod_classic_power_off(void);
 void ipod_classic_power_on(void);
+/*
+ * The hold switch. It moves with the machine in any state, and while it is on
+ * a key cannot power the machine on. With the BQL held, as with the rest.
+ */
+void ipod_classic_set_hold(bool on);
+bool ipod_classic_get_hold(void);
 
 #endif

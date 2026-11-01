@@ -324,7 +324,19 @@ struct IPodClassicWheelState {
     } wasm_key_ring[8];
     uint32_t wasm_key_head;      /* written by the page thread */
     uint32_t wasm_key_tail;      /* written by the bottom half */
+    /*
+     * The switch position the page asked for, or -1 once applied.  A level
+     * and not a ring entry: it must survive a full ring, and only the last
+     * position matters.
+     */
+    int32_t wasm_hold_request;
 #endif
+
+    /*
+     * The guest has driven the wheel's pins low. With hold on that cuts the
+     * wheel off; on its own it may only be sleep. See ipod_classic_gpio.h.
+     */
+    bool pins_low;
 
     MemoryRegion iomem;
     qemu_irq irq;

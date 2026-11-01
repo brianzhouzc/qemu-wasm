@@ -641,9 +641,34 @@ static const MemoryRegionOps ipod_classic_rng_ops = {
  * the acknowledgement bits itself and must read them back, which is what the
  * real hardware does.  The rest of the window still reads 0 (no write ever
  * says otherwise), so nothing the guest relied on before this changes.
+ *
+ * The same window holds the EIC, the SoC's external interrupt controller, and
+ * only one of its lines is wired: GPIO 0x7b, the PMU's nIRQ, which is how the
+ * hold switch reaches the guest.  Register map from s5l87xx.h:2037, seven
+ * groups of 32: INTLEVEL +0x80, INTSTAT +0xa0, INTEN +0xc0, INTTYPE +0xe0.
+ * Pin 0x7b is group 3, bit 3 (EIC_GROUP/EIC_INDEX, and Apple's 0x0836d064
+ * computes the same), and group 3 is VIC line 3, IRQ_EXT3.
+ *
+ * Both firmwares ask for that pin as level, active low (Rockbox's pmu_eint;
+ * Apple's 2.0.5 at 0x0804b484 and 0x0836d000), so that is all that is modelled:
+ * INTSTAT shows the line while it is active, and Rockbox's note in
+ * gpio-s5l8702.c is the reason a write cannot clear it, only reading the PMU's
+ * INT registers can.  Everything else in INTSTAT is write-one-to-clear.  That
+ * matters even with nothing to latch: both drivers write it (Rockbox clears
+ * every group with ~0 at boot) and a plain register file would then read back
+ * as an interrupt that never ends.
  */
 #define S5L8702_SYSALV_MEM_SIZE  0x100000
 #define S5L8702_SYSALV_WORDS     0x400      /* 4 KB of registers modelled */
+
+#define S5L8702_EIC_GROUPS       7
+#define S5L8702_EIC_INTLEVEL     0x80
+#define S5L8702_EIC_INTSTAT      0xa0
+#define S5L8702_EIC_INTEN        0xc0
+#define S5L8702_EIC_INTTYPE      0xe0
+#define S5L8702_EIC_REG(r, g)    (((r) + 4 * (g)) / 4)
+#define S5L8702_EIC_PMU_GROUP    3
+#define S5L8702_EIC_PMU_BIT      (1u << 3)
 
 typedef struct {
     uint32_t reg[S5L8702_SYSALV_WORDS];
@@ -653,6 +678,9 @@ typedef struct {
      */
     void *machine;
     QEMUTimer *wake;
+    /* The PMU is pulling nIRQ low, and the VIC line that group 3 drives. */
+    bool pmu_irq;
+    qemu_irq ext3;
     /*
      * How many times the handshake has completed.  Printed in the heartbeat:
      * a firmware that finds no reason for the wake and immediately asks to
@@ -673,7 +701,7 @@ static IPodClassicMachineState *ipod_machine;
  * Resume a halted vCPU without taking an exception.  Two things need it: the
  * power-transition handshake below, and the wheel, because a detent is a wake
  * source on the hardware and the sleep the firmware enters has interrupts
- * masked while it waits for the EIC/PMU, which this machine does not model.
+ * masked while it waits for a PMU wake event this machine does not raise.
  * CPU_INTERRUPT_EXITTB is the one request that is in arm_cpu_has_work() and is
  * cleared in cpu_handle_interrupt() without dispatching to a vector.
  */
@@ -705,7 +733,9 @@ void ipod_classic_wake_vcpu(void)
 bool ipod_classic_input_wake(void)
 {
     if (ipod_machine && ipod_machine->powered_off) {
-        ipod_classic_power_on();
+        if (!ipod_classic_get_hold()) {
+            ipod_classic_power_on();
+        }
         return true;
     }
     ipod_classic_wake_vcpu();
@@ -730,7 +760,7 @@ bool ipod_classic_power_key_event(int keycode)
         return false;
     }
     if (ipod_machine->powered_off) {
-        if (!release) {
+        if (!release && !ipod_classic_get_hold()) {
             ipod_machine->power_release_pending = true;
             ipod_classic_power_on();
         }
@@ -777,6 +807,70 @@ void ipod_classic_power_on(void)
     qemu_system_reset_request(SHUTDOWN_CAUSE_HOST_QMP_SYSTEM_RESET);
 }
 
+/*
+ * The hold switch.  The machine only passes it on to the PMU; the guest reacts
+ * in its own time, through the interrupt, as it does on the hardware.  The wake
+ * is for a guest in its sleep WFI: the wheel is not the only wake source.
+ *
+ * A key cannot power on a machine with hold on, which is the classic reason a
+ * real iPod "will not turn on".  The two callers above check it.
+ */
+void ipod_classic_set_hold(bool on)
+{
+    if (!ipod_machine) {
+        return;
+    }
+    ipod_classic_pmu_set_hold(ipod_machine->pmu, on);
+    ipod_classic_wake_vcpu();
+}
+
+bool ipod_classic_get_hold(void)
+{
+    return ipod_machine && ipod_machine->pmu && ipod_machine->pmu->hold;
+}
+
+/* INTSTAT of the PMU's group, with the line in it. See the note on the window. */
+static uint32_t ipod_classic_eic_stat(S5L8702SysalvState *s)
+{
+    uint32_t stat = s->reg[S5L8702_EIC_REG(S5L8702_EIC_INTSTAT,
+                                           S5L8702_EIC_PMU_GROUP)];
+    uint32_t type = s->reg[S5L8702_EIC_REG(S5L8702_EIC_INTTYPE,
+                                           S5L8702_EIC_PMU_GROUP)];
+    uint32_t level = s->reg[S5L8702_EIC_REG(S5L8702_EIC_INTLEVEL,
+                                            S5L8702_EIC_PMU_GROUP)];
+
+    if (s->pmu_irq && (type & ~level & S5L8702_EIC_PMU_BIT)) {
+        stat |= S5L8702_EIC_PMU_BIT;
+    }
+    return stat;
+}
+
+static void ipod_classic_eic_update(S5L8702SysalvState *s)
+{
+    uint32_t en = s->reg[S5L8702_EIC_REG(S5L8702_EIC_INTEN,
+                                         S5L8702_EIC_PMU_GROUP)];
+
+    qemu_set_irq(s->ext3, (ipod_classic_eic_stat(s) & en) != 0);
+}
+
+/* The EIC is off after a reset; the window's other registers keep their value. */
+static void ipod_classic_eic_reset(void *opaque)
+{
+    S5L8702SysalvState *s = opaque;
+
+    memset(&s->reg[S5L8702_EIC_INTLEVEL / 4], 0,
+           S5L8702_EIC_INTTYPE + 4 * S5L8702_EIC_GROUPS - S5L8702_EIC_INTLEVEL);
+    ipod_classic_eic_update(s);
+}
+
+static void ipod_classic_eic_pmu_irq(void *opaque, int n, int level)
+{
+    S5L8702SysalvState *s = opaque;
+
+    s->pmu_irq = level;
+    ipod_classic_eic_update(s);
+}
+
 static void ipod_classic_sysalv_wake(void *opaque)
 {
     S5L8702SysalvState *s = opaque;
@@ -804,6 +898,9 @@ static uint64_t ipod_classic_sysalv_read(void *opaque, hwaddr offset,
                       HWADDR_PRIx "\n", offset);
         return 0;
     }
+    if (offset == S5L8702_EIC_INTSTAT + 4 * S5L8702_EIC_PMU_GROUP) {
+        return ipod_classic_eic_stat(s);
+    }
     return s->reg[offset / 4];
 }
 
@@ -819,15 +916,24 @@ static void ipod_classic_sysalv_write(void *opaque, hwaddr offset,
         return;
     }
     old = s->reg[offset / 4];
-    s->reg[offset / 4] = value;
+    if (offset >= S5L8702_EIC_INTSTAT &&
+        offset < S5L8702_EIC_INTSTAT + 4 * S5L8702_EIC_GROUPS) {
+        s->reg[offset / 4] = old & ~(uint32_t)value;
+    } else {
+        s->reg[offset / 4] = value;
+    }
+    if (offset >= S5L8702_EIC_INTLEVEL &&
+        offset < S5L8702_EIC_INTTYPE + 4 * S5L8702_EIC_GROUPS) {
+        ipod_classic_eic_update(s);
+    }
 
     /*
      * Bit 0 is the power-transition request at +0.  The guest polls it (which
      * the write-back register above satisfies), then executes WFI and waits
      * for the transition-complete interrupt that the PMU would raise on real
-     * hardware.  Nothing raises it here (the PMU's interrupt output is not
-     * wired and the EIC is not modelled), so the vCPU would stay halted for
-     * good, with the UI frozen on its last frame -- the sleep bug.
+     * hardware.  Nothing raises it here (the PMU model has no such event), so
+     * the vCPU would stay halted for good, with the UI frozen on its last
+     * frame -- the sleep bug.
      *
      * The machine has no power to sequence, so the transition completes one
      * millisecond of virtual time after it is requested.  The wake has to be
@@ -875,12 +981,13 @@ static const MemoryRegionOps ipod_classic_sysalv_ops = {
  */
 static const VMStateDescription vmstate_ipod_classic_sysalv = {
     .name = "s5l8702.sysalv",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32_ARRAY(reg, S5L8702SysalvState, S5L8702_SYSALV_WORDS),
         VMSTATE_TIMER_PTR(wake, S5L8702SysalvState),
         VMSTATE_UINT64(wakes, S5L8702SysalvState),
+        VMSTATE_BOOL(pmu_irq, S5L8702SysalvState),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1270,8 +1377,9 @@ static void ipod_classic_machine_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, I2C0_MEM_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        s5l8702_get_irq(nms, S5L8702_I2C0_IRQ));
-    i2c_slave_create_simple(nms->i2c0->bus, TYPE_IPOD_CLASSIC_PMU,
-                            S5L8702_PMU_I2C_ADDR);
+    nms->pmu = IPOD_CLASSIC_PMU(
+        i2c_slave_create_simple(nms->i2c0->bus, TYPE_IPOD_CLASSIC_PMU,
+                                S5L8702_PMU_I2C_ADDR));
 
     /*
      * The CS42L55 audio codec, also on I2C0, at 7-bit 0x4A. The retailOS talks
@@ -1405,10 +1513,10 @@ static void ipod_classic_machine_init(MachineState *machine)
      * The pin follows whether a drive is attached, so a boot with no -drive is
      * unchanged.
      */
-    dev = qdev_new(TYPE_IPOD_CLASSIC_GPIO);
-    qdev_prop_set_bit(dev, "media-present", drive_get(IF_IDE, 0, 0) != NULL);
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, GPIO_MEM_BASE);
+    DeviceState *gpio = qdev_new(TYPE_IPOD_CLASSIC_GPIO);
+    qdev_prop_set_bit(gpio, "media-present", drive_get(IF_IDE, 0, 0) != NULL);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(gpio), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(gpio), 0, GPIO_MEM_BASE);
 
     /*
      * The click wheel at 0x3C200000, and with it the keyboard. This is what
@@ -1437,6 +1545,9 @@ static void ipod_classic_machine_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, WHEEL_MEM_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        s5l8702_get_irq(nms, S5L8702_WHEEL_IRQ));
+    /* The pins the guest drives low on hold; see ipod_classic_gpio.h. */
+    qdev_connect_gpio_out_named(gpio, "wheel-pins-low", 0,
+                                qdev_get_gpio_in_named(dev, "pins-low", 0));
 
     /*
      * The I2S transmitter at 0x3CA00000, the audio data path. It was
@@ -1475,8 +1586,13 @@ static void ipod_classic_machine_init(MachineState *machine)
     sysalv->machine = nms;
     sysalv->wake = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                 ipod_classic_sysalv_wake, sysalv);
+    sysalv->ext3 = s5l8702_get_irq(nms, S5L8702_EXT3_IRQ);
     ipod_sysalv_state = sysalv;
     vmstate_register(NULL, 0, &vmstate_ipod_classic_sysalv, sysalv);
+    qemu_register_reset(ipod_classic_eic_reset, sysalv);
+    qdev_connect_gpio_out(DEVICE(nms->pmu), 0,
+                          qemu_allocate_irq(ipod_classic_eic_pmu_irq, sysalv,
+                                            0));
     memory_region_init_io(sysalv_mr, NULL, &ipod_classic_sysalv_ops, sysalv,
                           "s5l8702.sysalv", S5L8702_SYSALV_MEM_SIZE);
     memory_region_add_subregion(sysmem, EIC_MEM_BASE, sysalv_mr);
