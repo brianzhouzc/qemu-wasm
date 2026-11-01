@@ -275,9 +275,28 @@ static void wheel_run_command(IPodClassicWheelState *s)
 
 static void wheel_key_event(void *opaque, int keycode);
 
+/*
+ * The next tick is a tick of guest time or of host time, whichever comes first.
+ *
+ * Guest time alone is what makes scrolling fast: an idle guest warps straight to
+ * the tick, and a detent takes 5 ms.  But on a busy guest that clock crawls, and
+ * Rockbox's button handling is host time.  A press lasts four packets, its
+ * release a tick more, and MEASURED while decoding an MP3 that came to more than
+ * the 300 ms at which Rockbox calls a press a hold: a tap on MENU opened the Quick
+ * Screen, a tap on PLAY did nothing and a tap on NEXT seeked, because the actions
+ * that fire on a short press's release never saw a short press.  With the host
+ * clock as a backstop a press takes the same time however busy the guest is.
+ *
+ * The backstop is not moved on every kick: that would wake the main loop for
+ * every packet of a scroll.  It stays where it is and looks again when it fires.
+ */
 static void wheel_kick(IPodClassicWheelState *s)
 {
     timer_mod(s->tick, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->tick_ns);
+    if (!timer_pending(s->tick_rt)) {
+        timer_mod(s->tick_rt,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT) + s->tick_ns);
+    }
 }
 
 #ifdef EMSCRIPTEN
@@ -325,6 +344,8 @@ static void wheel_tick(void *opaque)
     IPodClassicWheelState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     bool busy;
+
+    s->tick_rt_last = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT);
 
     /*
      * If the guest has not drained what it already has, do not add to it.
@@ -398,6 +419,23 @@ static void wheel_tick(void *opaque)
     if (busy) {
         wheel_kick(s);
     }
+}
+
+/* A tick of host time has gone by: see wheel_kick(). */
+static void wheel_tick_rt(void *opaque)
+{
+    IPodClassicWheelState *s = opaque;
+    int64_t due = s->tick_rt_last + s->tick_ns;
+
+    if (!timer_pending(s->tick)) {
+        return;
+    }
+    if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT) < due) {
+        timer_mod(s->tick_rt, due);
+        return;
+    }
+    timer_del(s->tick);
+    wheel_tick(s);
 }
 
 /* ------------------------------------------------------------------ */
@@ -705,6 +743,7 @@ static void ipod_classic_wheel_reset(DeviceState *dev)
     s->sent_buttons = 0;
     s->irq_level = false;
     timer_del(s->tick);
+    timer_del(s->tick_rt);
 #ifdef EMSCRIPTEN
     if (s->wasm_release_timer) {
         timer_del(s->wasm_release_timer);
@@ -922,6 +961,7 @@ static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
                                                     0, 5000);
 
     s->tick = timer_new_ns(QEMU_CLOCK_VIRTUAL, wheel_tick, s);
+    s->tick_rt = timer_new_ns(QEMU_CLOCK_VIRTUAL_RT, wheel_tick_rt, s);
     qemu_add_kbd_event_handler(wheel_kbd_event, s);
 #ifdef EMSCRIPTEN
     wasm_wheel_state = s;

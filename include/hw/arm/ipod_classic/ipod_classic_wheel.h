@@ -390,6 +390,8 @@ struct IPodClassicWheelState {
     uint32_t sent_buttons;
 
     QEMUTimer *tick;
+    QEMUTimer *tick_rt;     /* the host-time backstop: see wheel_kick() */
+    int64_t tick_rt_last;   /* when the last tick ran, on that timer's clock */
     uint32_t key_step;
     int64_t tick_ns;
     int64_t untouch_ns;
