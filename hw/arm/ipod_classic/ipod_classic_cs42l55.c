@@ -23,10 +23,23 @@
 #include "qemu/bitops.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "hw/core/cpu.h"
 #include "hw/i2c/i2c.h"
 #include "migration/vmstate.h"
 #include "hw/arm/ipod_classic/ipod_classic_cs42l55.h"
 #include "hw/arm/ipod_classic/ipod_classic_audio_out.h"
+
+/* CS42TRACE=1 prints every register write, the same pattern as I2STRACE. */
+static int cs42trace = -1;
+
+static bool cs42_trace_on(void)
+{
+    if (cs42trace < 0) {
+        const char *e = getenv("CS42TRACE");
+        cs42trace = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return cs42trace == 1;
+}
 
 /* The volume registers are two's complement, of 7 bits or of 8. */
 static double cs42l55_db(uint8_t raw, int bits, double step)
@@ -102,6 +115,12 @@ static int ipod_classic_cs42l55_send(I2CSlave *i2c, uint8_t data)
         s->addr = data;
         s->addr_pending = false;
     } else {
+        if (cs42_trace_on()) {
+            CPUState *cs = current_cpu;
+
+            fprintf(stderr, "CS42TRACE wr 0x%02x = 0x%02x  pc~0x%08x\n", s->addr,
+                    data, cs ? (uint32_t)CPU_GET_CLASS(cs)->get_pc(cs) : 0);
+        }
         s->reg[s->addr & (S5L8702_CS42L55_NUM_REGS - 1)] = data;
         s->addr++;
         cs42l55_publish_gain(s);

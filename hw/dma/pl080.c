@@ -237,11 +237,6 @@ again:
              */
             paced_id = flow == 1 ? dest_id : flow == 2 ? src_id : -1;
             paced = paced_id >= 0 && (s->paced_lines & (1u << paced_id));
-            if (paced && (paced_id != s->paced_line
-                          || s->paced_budget < (1u << ((ch->ctrl >> 18) & 7)))) {
-                s->paced_stalled |= size != 0;
-                continue;
-            }
             /*
              * One interrupt per terminal count.  On the hardware the next one
              * is a whole task away, and Rockbox counts a task for each
@@ -253,6 +248,11 @@ again:
              */
             if (paced && (s->tc_int & (1u << c))) {
                 s->paced_held |= 1u << c;
+                continue;
+            }
+            if (paced && (paced_id != s->paced_line
+                          || s->paced_budget < (1u << ((ch->ctrl >> 18) & 7)))) {
+                s->paced_stalled |= size != 0;
                 continue;
             }
             switch (flow) {
