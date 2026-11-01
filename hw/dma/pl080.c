@@ -256,13 +256,11 @@ again:
             }
             /*
              * An empty descriptor with a link is finished before it starts, and
-             * the controller goes straight to the link.  It is how Apple's
-             * driver starts a stream: MEASURED on 2.0.5, play enables channel 1
-             * with a count of 0 and the chain in the link register, and with
-             * this model waiting for a count that was never coming the DMA
-             * stayed idle, no terminal count ever came, and the engine above it
-             * waited for buffers to come back for ever.  The limit is for a
-             * guest whose empty descriptor links to itself.
+             * the controller goes straight to the link.  MEASURED on 2.0.5: the
+             * audio channel gets to a count of 0 with a link set after its
+             * first three chunks, and with this model waiting for a count that
+             * was never coming the DMA stayed idle from there.  The limit is
+             * for a guest whose empty descriptor links to itself.
              */
             if (paced && !size && ch->lli && empty_links < PL080_EMPTY_LINKS) {
                 empty_links++;

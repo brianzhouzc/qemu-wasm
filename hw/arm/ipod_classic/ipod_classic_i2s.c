@@ -504,15 +504,15 @@ static void i2s_tx(void *opaque, const uint8_t *buf, unsigned bytes)
 /*
  * One drain tick: let DMAC0 hand over what the sample clock has used since the
  * last one, then come back.  A tick that moves nothing leaves the timer off,
- * because idling stays cheap only if nothing here wakes the main loop: Apple's
- * firmware can leave the transmitter on with no DMA behind it.  The PL080 kicks
- * this when a channel next has work.
+ * because a transmitter that is on with no DMA behind it must not wake the main
+ * loop for nothing.  The PL080 kicks this when a channel next has work.
  */
 static void ipod_classic_i2s_drain(void *opaque)
 {
     IPodClassicI2SState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT);
     uint64_t rate_bytes = (uint64_t)i2s_sample_rate(s) * I2S_FRAME_BYTES;
+    int64_t elapsed = MIN(now - s->pace_last_ns, I2S_PACE_BACKLOG_NS);
     uint64_t want, moved;
 
     if (!i2s_sending(s) || !s->dmac0) {
@@ -539,7 +539,8 @@ static void ipod_classic_i2s_drain(void *opaque)
      */
     ipod_classic_hle_audio_fill_dma();
 
-    s->pace_frac += MIN(now - s->pace_last_ns, I2S_PACE_BACKLOG_NS) * rate_bytes;
+    /* Not below zero: this clock can step when a machine is restored. */
+    s->pace_frac += MAX(elapsed, 0) * rate_bytes;
     s->pace_last_ns = now;
     s->pace_due += s->pace_frac / NANOSECONDS_PER_SECOND;
     s->pace_frac %= NANOSECONDS_PER_SECOND;
