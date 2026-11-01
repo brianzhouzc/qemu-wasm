@@ -396,20 +396,23 @@ static void wheel_tick(void *opaque)
 #define KEY_H       0x23
 #define KEY_ENTER   0x1c
 
+/* Hold on and the firmware has acted on it. See ipod_classic_gpio.h. */
+static bool wheel_cut_off(IPodClassicWheelState *s)
+{
+    return s->pins_low && ipod_classic_get_hold();
+}
+
 /*
- * The GPIO block says whether the guest has cut the wheel's pins. A gesture
- * that was under way when it did dies with the link: the wheel must not come
+ * The GPIO block saying where the guest has put the wheel's pins. A gesture
+ * that was under way when they cut it off dies there: the wheel must not come
  * back later and pay out movement from before the hold.
  */
-static void wheel_link_event(void *opaque, int n, int cut)
+static void wheel_pins_event(void *opaque, int n, int low)
 {
     IPodClassicWheelState *s = opaque;
 
-    if (s->link_cut == !!cut) {
-        return;
-    }
-    s->link_cut = cut;
-    if (cut) {
+    s->pins_low = low;
+    if (wheel_cut_off(s)) {
         s->buttons = 0;
         s->sent_buttons = 0;
         s->button_repeat_until = 0;
@@ -428,11 +431,11 @@ static void wheel_key_event(void *opaque, int keycode)
     uint32_t bit;
 
     /*
-     * Before the overlay's tee: with the link cut this press went nowhere, and
-     * no wasm_press_mask or pending step means nobody acknowledges it either,
-     * so a script's press() says the guest never took it, which is true.
+     * Before the overlay's tee: this press goes nowhere, and no wasm_press_mask
+     * or pending step means nobody acknowledges it either, so a script's
+     * press() says the guest never took it, which is true.
      */
-    if (s->link_cut) {
+    if (wheel_cut_off(s)) {
         return;
     }
 
@@ -671,7 +674,6 @@ static void ipod_classic_wheel_reset(DeviceState *dev)
     s->button_repeat_until = 0;
     s->sent_buttons = 0;
     s->irq_level = false;
-    s->link_cut = false;
     timer_del(s->tick);
 #ifdef EMSCRIPTEN
     if (s->wasm_release_timer) {
@@ -861,7 +863,7 @@ static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
                           TYPE_IPOD_CLASSIC_WHEEL, S5L8702_WHEEL_MEM_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
-    qdev_init_gpio_in_named(dev, wheel_link_event, "link-cut", 1);
+    qdev_init_gpio_in_named(dev, wheel_pins_event, "pins-low", 1);
 
     /*
      * The firmware delivers the FIRST movement of a gesture only if it is
@@ -943,7 +945,7 @@ static const VMStateDescription vmstate_ipod_classic_wheel = {
     .name = TYPE_IPOD_CLASSIC_WHEEL,
     /*
      * Bumped to 2 when button_repeat_until joined the field list, and to 4 for
-     * link_cut. Nothing migrates this machine today, so the old format is not
+     * pins_low. Nothing migrates this machine today, so the old format is not
      * kept alive.
      */
     .version_id = 4,
@@ -981,7 +983,7 @@ static const VMStateDescription vmstate_ipod_classic_wheel = {
         VMSTATE_INT64(untouch_at, IPodClassicWheelState),
         VMSTATE_INT64(button_repeat_until, IPodClassicWheelState),
         VMSTATE_TIMER_PTR(tick, IPodClassicWheelState),
-        VMSTATE_BOOL(link_cut, IPodClassicWheelState),
+        VMSTATE_BOOL(pins_low, IPodClassicWheelState),
         VMSTATE_END_OF_LIST()
     },
 };

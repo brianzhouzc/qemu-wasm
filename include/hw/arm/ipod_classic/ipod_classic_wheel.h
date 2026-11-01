@@ -333,10 +333,10 @@ struct IPodClassicWheelState {
 #endif
 
     /*
-     * The guest has driven the wheel's pins low (hold; see ipod_classic_gpio.h).
-     * The link is gone, so nothing the wheel does reaches the guest.
+     * The guest has driven the wheel's pins low. With hold on that cuts the
+     * wheel off; on its own it may only be sleep. See ipod_classic_gpio.h.
      */
-    bool link_cut;
+    bool pins_low;
 
     MemoryRegion iomem;
     qemu_irq irq;

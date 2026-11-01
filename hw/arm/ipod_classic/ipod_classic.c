@@ -1545,9 +1545,9 @@ static void ipod_classic_machine_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, WHEEL_MEM_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        s5l8702_get_irq(nms, S5L8702_WHEEL_IRQ));
-    /* The pins the guest cuts on hold; see ipod_classic_gpio.h. */
-    qdev_connect_gpio_out_named(gpio, "wheel-cut", 0,
-                                qdev_get_gpio_in_named(dev, "link-cut", 0));
+    /* The pins the guest drives low on hold; see ipod_classic_gpio.h. */
+    qdev_connect_gpio_out_named(gpio, "wheel-pins-low", 0,
+                                qdev_get_gpio_in_named(dev, "pins-low", 0));
 
     /*
      * The I2S transmitter at 0x3CA00000, the audio data path. It was

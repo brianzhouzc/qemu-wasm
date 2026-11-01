@@ -8,8 +8,8 @@
  * Deliberately minimal. Reads of PDAT return modelled INPUT levels, which are
  * all zero except pin 86; that is bit-for-bit what create_unimplemented_device()
  * used to return, so nothing else in the machine can have changed behaviour.
- * The other thing it does is tell the wheel when the guest cuts its link, which
- * is how the hold switch reaches the wheel; see the header.
+ * The other thing it does is tell the wheel when the guest drives its pins low,
+ * which is how the hold switch reaches the wheel; see the header.
  *
  * GPIOTRACE=1 prints every access with the guest PC, like ATATRACE and
  * LCDTRACE.
@@ -96,9 +96,9 @@ static bool gpio_pin_output(IPodClassicGPIOState *s, unsigned group,
     return func == 0x1 || func == 0xe || func == 0xf;
 }
 
-static void gpio_update_wheel_link(IPodClassicGPIOState *s)
+static void gpio_update_wheel_pins(IPodClassicGPIOState *s)
 {
-    qemu_set_irq(s->wheel_cut,
+    qemu_set_irq(s->wheel_pins_low,
                  gpio_pin_output(s, S5L8702_GPIO_WHEEL_GROUP,
                                  S5L8702_GPIO_WHEEL_PIN_A) &&
                  gpio_pin_output(s, S5L8702_GPIO_WHEEL_GROUP,
@@ -116,7 +116,7 @@ static void ipod_classic_gpio_cmd(IPodClassicGPIOState *s, uint32_t value)
         return;
     }
     s->pcon[group] = deposit32(s->pcon[group], pin * 4, 4, value & 0xf);
-    gpio_update_wheel_link(s);
+    gpio_update_wheel_pins(s);
 }
 
 static void ipod_classic_gpio_write(void *opaque, hwaddr offset,
@@ -145,7 +145,7 @@ static void ipod_classic_gpio_write(void *opaque, hwaddr offset,
     switch (reg) {
     case S5L8702_GPIO_PCON:
         s->pcon[group] = value;
-        gpio_update_wheel_link(s);
+        gpio_update_wheel_pins(s);
         break;
     case S5L8702_GPIO_PUNA:
         s->puna[group] = value;
@@ -205,7 +205,7 @@ static void ipod_classic_gpio_reset(DeviceState *dev)
         s->pdat[S5L8702_GPIO_PIN_MEDIA / 8] |=
             1u << (S5L8702_GPIO_PIN_MEDIA % 8);
     }
-    gpio_update_wheel_link(s);
+    gpio_update_wheel_pins(s);
 }
 
 static Property ipod_classic_gpio_props[] = {
@@ -221,7 +221,7 @@ static void ipod_classic_gpio_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(s), &ipod_classic_gpio_ops, s,
                           TYPE_IPOD_CLASSIC_GPIO, S5L8702_GPIO_MEM_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
-    qdev_init_gpio_out_named(dev, &s->wheel_cut, "wheel-cut", 1);
+    qdev_init_gpio_out_named(dev, &s->wheel_pins_low, "wheel-pins-low", 1);
 }
 
 static const VMStateDescription vmstate_ipod_classic_gpio = {

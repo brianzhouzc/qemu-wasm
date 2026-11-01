@@ -79,9 +79,15 @@
  *   Apple 2.0.5, 0x08060ad0, on PMU event 0x200 (INT6 bit 1):
  *       hold on:  GPIOCMD 0xe040e, 0xe020e              back to 0xe0202, 0xe0402
  *
- * Both drive E2 and E4 low, so that is what cuts the link here. It is not "not
+ * Both drive E2 and E4 low, so that is what the block reports. It is not "not
  * function 2": the machine starts with no bootrom and PCON14 at 0, and a guest
  * that never set the pins up must keep its wheel, as it always has.
+ *
+ * LOW PINS ALONE ARE NOT A CUT LINK, and the wheel checks the switch as well.
+ * Apple parks the same two pins when it sleeps (measured on 2.0.5 after a
+ * 240 s idle: 0xe040e and 0xe020e, then back on wake), and a press still has
+ * to wake it. How that gets out on the hardware is UNDETERMINED; the wheel has
+ * always delivered it here, so with hold off it still does.
  */
 
 #ifndef HW_ARM_IPOD_CLASSIC_GPIO_H
@@ -118,7 +124,7 @@ struct IPodClassicGPIOState {
 
     MemoryRegion iomem;
     /* 1 while the guest holds the wheel's pins low; goes to the wheel. */
-    qemu_irq wheel_cut;
+    qemu_irq wheel_pins_low;
 
     uint32_t pcon[S5L8702_GPIO_GROUPS];
     uint32_t puna[S5L8702_GPIO_GROUPS];
