@@ -312,7 +312,7 @@ static void wasm_release_timer_cb(void *opaque)
 
     if (!wasm_press_taken(s) && now < s->wasm_release_cap) {
         timer_mod_ns(s->wasm_release_timer,
-                     now + S5L8702_WHEEL_RELEASE_POLL_MS * 1000000);
+                     now + S5L8702_WHEEL_RELEASE_POLL_MS * 1000000LL);
         return;
     }
     s->wasm_press_mask = 0;
@@ -772,7 +772,7 @@ static void wasm_key_do_press(IPodClassicWheelState *s, int keycode,
     s->wasm_consumed0 = qatomic_read(&s->wasm_consumed);
     hold_end = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
                (int64_t)MAX(hold_ms, 0) * 1000000;
-    s->wasm_release_cap = hold_end + S5L8702_WHEEL_RELEASE_CAP_MS * 1000000;
+    s->wasm_release_cap = hold_end + S5L8702_WHEEL_RELEASE_CAP_MS * 1000000LL;
     timer_mod_ns(s->wasm_release_timer, hold_end);
 }
 
