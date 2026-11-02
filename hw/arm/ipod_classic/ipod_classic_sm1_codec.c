@@ -140,12 +140,17 @@ static unsigned decode_aac(IPodClassicSM1Codec *c, const uint8_t *frame,
     if (!info.error && info.channels) {
         c->channels = MIN(info.channels, 2);
     }
-    if (!out || info.error || !info.samples || !info.channels) {
-        /* The first frame of a stream is only ever overlap. */
+    if (!out || info.error || !info.channels) {
         return silence(pcm, AAC_FRAME_FRAMES);
     }
     c->aac_decoded = true;
-    frames = info.samples / info.channels;
+    /*
+     * FAAD2 counts no samples for the first frame it sees, taking that for
+     * encoder priming, and writes them all the same.  Here they are audio: the
+     * firmware honours an edit list by starting after the priming, at frame 1
+     * of what ffmpeg writes, and that is the start of the song.
+     */
+    frames = info.samples ? info.samples / info.channels : AAC_FRAME_FRAMES;
     if (frames > IPOD_SM1_CODEC_MAX_FRAMES) {
         return silence(pcm, AAC_FRAME_FRAMES);
     }
