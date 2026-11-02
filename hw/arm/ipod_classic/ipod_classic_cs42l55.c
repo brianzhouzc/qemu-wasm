@@ -11,14 +11,73 @@
  * (read reg, change some bits, write it back) come out right. While this slave
  * did not exist the retailOS's writes to 0x4A were NACKed and every cscodec_read
  * returned bus garbage.
+ *
+ * Gain is worked out here and applied where the sound is played: the path from
+ * here to the speakers already holds a tenth of a second of audio, so a change
+ * cannot take effect any sooner than that either way, and the guest's DMA should
+ * not spend time multiplying samples for a page that may be muted.
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
+#include "qemu/bitops.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "hw/core/cpu.h"
 #include "hw/i2c/i2c.h"
 #include "migration/vmstate.h"
 #include "hw/arm/ipod_classic/ipod_classic_cs42l55.h"
+#include "hw/arm/ipod_classic/ipod_classic_audio_out.h"
+
+/* CS42TRACE=1 prints every register write, the same pattern as I2STRACE. */
+static int cs42trace = -1;
+
+static bool cs42_trace_on(void)
+{
+    if (cs42trace < 0) {
+        const char *e = getenv("CS42TRACE");
+        cs42trace = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return cs42trace == 1;
+}
+
+/* The volume registers are two's complement, of 7 bits or of 8. */
+static double cs42l55_db(uint8_t raw, int bits, double step)
+{
+    return sextract32(raw, 0, bits) * step;
+}
+
+static uint32_t cs42l55_channel_gain(IPodClassicCS42L55State *s, int channel)
+{
+    uint8_t power = s->reg[CS42L55_REG_PWRCTL1];
+    uint8_t amp = s->reg[CS42L55_REG_PWRCTL2];
+    uint8_t play = s->reg[CS42L55_REG_PLAYCTL];
+    uint8_t hp = s->reg[CS42L55_REG_HPACTL + channel];
+    uint8_t pmix = s->reg[CS42L55_REG_PMIXACTL + channel];
+    uint8_t amp_off = channel ? CS42L55_PWRCTL2_PDN_HPB
+                              : CS42L55_PWRCTL2_PDN_HPA;
+    uint8_t mute = channel ? CS42L55_PLAYCTL_MSTBMUTE
+                           : CS42L55_PLAYCTL_MSTAMUTE;
+    double db;
+
+    if ((power & CS42L55_PWRCTL1_PDN_CODEC) || (amp & amp_off) == amp_off ||
+        (play & mute) || (hp & CS42L55_VOL_MUTE) ||
+        (pmix & CS42L55_VOL_MUTE)) {
+        return 0;
+    }
+    db = cs42l55_db(hp, 7, 1.0) + cs42l55_db(pmix, 7, 0.5);
+    /* The master volume is in the signal processing engine. */
+    if (!(play & CS42L55_PLAYCTL_PDN_DSP)) {
+        db += cs42l55_db(s->reg[CS42L55_REG_MSTAVOL + channel], 8, 0.5);
+    }
+    return lrint(pow(10.0, db / 20.0) * IPOD_AUDIO_OUT_UNITY);
+}
+
+static void cs42l55_publish_gain(IPodClassicCS42L55State *s)
+{
+    ipod_classic_audio_out_set_gain(cs42l55_channel_gain(s, 0),
+                                    cs42l55_channel_gain(s, 1));
+}
 
 static int ipod_classic_cs42l55_event(I2CSlave *i2c, enum i2c_event event)
 {
@@ -56,8 +115,15 @@ static int ipod_classic_cs42l55_send(I2CSlave *i2c, uint8_t data)
         s->addr = data;
         s->addr_pending = false;
     } else {
+        if (cs42_trace_on()) {
+            CPUState *cs = current_cpu;
+
+            fprintf(stderr, "CS42TRACE wr 0x%02x = 0x%02x  pc~0x%08x\n", s->addr,
+                    data, cs ? (uint32_t)CPU_GET_CLASS(cs)->get_pc(cs) : 0);
+        }
         s->reg[s->addr & (S5L8702_CS42L55_NUM_REGS - 1)] = data;
         s->addr++;
+        cs42l55_publish_gain(s);
     }
     return 0;
 }
@@ -70,12 +136,20 @@ static void ipod_classic_cs42l55_reset(DeviceState *dev)
     s->addr = 0;
     s->addr_pending = false;
     s->reg[CS42L55_REG_CHIPVERSION] = S5L8702_CS42L55_CHIP_ID;
+    cs42l55_publish_gain(s);
+}
+
+static int ipod_classic_cs42l55_post_load(void *opaque, int version_id)
+{
+    cs42l55_publish_gain(opaque);
+    return 0;
 }
 
 static const VMStateDescription vmstate_ipod_classic_cs42l55 = {
     .name = TYPE_IPOD_CLASSIC_CS42L55,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = ipod_classic_cs42l55_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_I2C_SLAVE(parent_obj, IPodClassicCS42L55State),
         VMSTATE_UINT8_ARRAY(reg, IPodClassicCS42L55State,

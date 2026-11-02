@@ -182,6 +182,15 @@ static void ipod_classic_i2c_write(void *opaque, hwaddr offset,
 
     case S5L8702_IICSTAT: {
         uint32_t mode = value & S5L8702_IICSTAT_MODE_MASK;
+        /*
+         * Before the write below: the busy bit is inside the mode field, so
+         * the stop's own value clears it, and a test after that never ended a
+         * transfer at all.  The bus then kept the first slave it had found and
+         * never scanned again, so everything addressed to the codec went to
+         * the PMU, and what Rockbox and Apple read back from it was the PMU's.
+         * MEASURED: every codec write on the wire, none reaching the codec.
+         */
+        bool busy = s->iicstat & S5L8702_IICSTAT_BUSY;
 
         s->iicstat = (s->iicstat & ~(S5L8702_IICSTAT_MODE_MASK |
                                      S5L8702_IICSTAT_SOE)) |
@@ -190,7 +199,7 @@ static void ipod_classic_i2c_write(void *opaque, hwaddr offset,
 
         if (!(value & S5L8702_IICSTAT_SOE)) {
             /* Serial output off: whatever was going on is over. */
-            if (s->iicstat & S5L8702_IICSTAT_BUSY) {
+            if (busy) {
                 i2c_end_transfer(s->bus);
                 s->iicstat &= ~S5L8702_IICSTAT_BUSY;
             }
@@ -214,7 +223,7 @@ static void ipod_classic_i2c_write(void *opaque, hwaddr offset,
             break;
         case S5L8702_IICSTAT_STOP_TX:
         case S5L8702_IICSTAT_STOP_RX:
-            if (s->iicstat & S5L8702_IICSTAT_BUSY) {
+            if (busy) {
                 i2c_end_transfer(s->bus);
                 s->iicstat &= ~S5L8702_IICSTAT_BUSY;
             }

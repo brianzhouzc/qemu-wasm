@@ -54,8 +54,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicI2SState, IPOD_CLASSIC_I2S)
  * bit that tells start from stop is bit 2 (0x4): start 0x6 and 0xe set it, stop
  * 0xa clears it. Bit 1 (0x2) is set even in Rockbox's stop word 0xa, so it is
  * NOT the run bit -- an earlier version used 0x2 here and would have read a
- * Rockbox stop as "still running". Only consulted under AUDIOPACE (pacing is off
- * by default), so this never affects the stock build either way.
+ * Rockbox stop as "still running".
  */
 #define S5L8702_I2S_TXCOM_RUN  0x4
 
@@ -86,15 +85,17 @@ struct IPodClassicI2SState {
     uint32_t clkdiv;
 
     /*
-     * Pacing (hito 2). The FIFO is drained at the sample rate by this timer,
-     * which asserts the DMA request on DMAC0 so the PL080 hands over one burst
-     * at a time instead of emptying the whole buffer at once. Only armed while
-     * the transmitter is running.
+     * Pacing. The FIFO is drained at the sample rate by this timer, which lets
+     * DMAC0 move what the clock has used so the PL080 hands over the audio as
+     * it plays instead of emptying the whole buffer at once. Only armed while
+     * the transmitter is running and has something to send.
      */
     QEMUTimer *drain_timer;
     PL080State *dmac0;      /* set by the machine; may be NULL */
     bool tx_running;
-    int64_t next_tick_ns;
+    int64_t pace_last_ns;   /* the sample clock has been paid for up to here */
+    uint64_t pace_frac;     /* what did not make a whole byte, in ns*bytes/s */
+    uint64_t pace_due;      /* bytes owed: clocked out and not yet moved */
 
     /* Running count of 16-bit samples clocked out, for diagnostics. */
     uint64_t tx_samples;
