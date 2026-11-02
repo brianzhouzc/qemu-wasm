@@ -1,0 +1,22 @@
+The audio decoders behind the SM1 engine, for ipod_classic_sm1_codec.c.
+
+Upstream's files, unchanged, apart from minimp3/minimp3.c, which is a few lines
+of ours that turn the header into an object file.  The meson library that builds
+them is in hw/arm/meson.build.
+
+minimp3/
+    https://github.com/lieff/minimp3
+    commit ea99364f61c14656440e8d77e9c233ccf3124633
+    CC0 1.0, see minimp3/LICENSE
+
+faad2/
+    https://github.com/knik0/faad2
+    release 2.11.4
+    GNU GPL version 2 or later, see faad2/COPYING
+
+    Code from FAAD2 is copyright (c) Nero AG, www.nero.com
+
+    libfaad/ and include/neaacdec.h, flattened into one directory and cut to what
+    a build for AAC LC compiles, as gcc -MM reports it for the flags in meson.build.
+    Those leave out Main, LTP, SSR, the error resilient profiles, DRM and SBR, so
+    HE-AAC plays as its LC core.
