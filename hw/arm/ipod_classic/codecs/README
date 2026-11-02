@@ -18,5 +18,5 @@ faad2/
 
     libfaad/ and include/neaacdec.h, flattened into one directory and cut to what
     a build for AAC LC compiles, as gcc -MM reports it for the flags in meson.build.
-    Those leave out Main, LTP, SSR, the error resilient profiles, DRM and SBR, so
-    HE-AAC plays as its LC core.
+    Those leave out Main, LTP, SSR, the error resilient profiles, DRM and SBR.
+    What the firmware does with an HE-AAC file on these has not been tried.
