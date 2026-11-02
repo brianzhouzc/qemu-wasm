@@ -84,6 +84,33 @@ arm_ss.add(when: 'CONFIG_IPOD_CLASSIC_6G', if_true: files(
   'ipod_classic/ipod_classic_hle_audio.c',
   'ipod_classic/ipod_classic_hle_np.c',
   'ipod_classic/ipod_classic_np_overlay.c'))
+# The decoders behind the SM1 engine: upstream's code, built with its own flags
+# and none of QEMU's warnings.  codecs/README says what they are.
+ipod_classic_codecs = static_library('ipod_classic_codecs', files(
+  'ipod_classic/codecs/minimp3/minimp3.c',
+  'ipod_classic/codecs/faad2/bits.c',
+  'ipod_classic/codecs/faad2/cfft.c',
+  'ipod_classic/codecs/faad2/common.c',
+  'ipod_classic/codecs/faad2/decoder.c',
+  'ipod_classic/codecs/faad2/drc.c',
+  'ipod_classic/codecs/faad2/error.c',
+  'ipod_classic/codecs/faad2/filtbank.c',
+  'ipod_classic/codecs/faad2/huffman.c',
+  'ipod_classic/codecs/faad2/is.c',
+  'ipod_classic/codecs/faad2/mdct.c',
+  'ipod_classic/codecs/faad2/mp4.c',
+  'ipod_classic/codecs/faad2/ms.c',
+  'ipod_classic/codecs/faad2/output.c',
+  'ipod_classic/codecs/faad2/pns.c',
+  'ipod_classic/codecs/faad2/pulse.c',
+  'ipod_classic/codecs/faad2/specrec.c',
+  'ipod_classic/codecs/faad2/syntax.c',
+  'ipod_classic/codecs/faad2/tns.c'),
+  c_args: ['-w', '-DLC_ONLY_DECODER', '-DDISABLE_SBR', '-DHAVE_STDINT_H=1',
+           '-DHAVE_STRING_H=1', '-DHAVE_STDLIB_H=1', '-DSTDC_HEADERS=1',
+           '-DHAVE_LRINTF=1', '-DPACKAGE_VERSION="2.11.4"'])
+arm_ss.add(when: 'CONFIG_IPOD_CLASSIC_6G', if_true:
+           declare_dependency(link_with: ipod_classic_codecs))
 # Only the SHA-1 block is shared with the iPod Touch 2G sources; the rest of
 # that machine is unused here and needs OpenSSL's bignum code.
 arm_ss.add(when: 'CONFIG_IPOD_TOUCH_SHA1', if_true: files('ipod_touch_sha1.c'))
