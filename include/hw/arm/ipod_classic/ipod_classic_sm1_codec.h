@@ -33,11 +33,11 @@ IPodClassicSM1Codec *ipod_classic_sm1_codec_new(IPodClassicSM1CodecType type,
 void ipod_classic_sm1_codec_free(IPodClassicSM1Codec *c);
 
 /*
- * Decode exactly one frame into interleaved stereo, mono included.  Returns the
- * frames written, always at least one frame's worth: a frame that yields
- * nothing (the start of a stream, a damaged frame) comes out as that much
- * silence, so that time keeps moving and the player does not take it for the
- * end of the stream.  `channels` is what the stream has, 1 or 2.
+ * Decode exactly one frame, interleaved if it is stereo.  Returns the frames
+ * written, always at least one frame's worth: a frame that yields nothing (the
+ * start of a stream, a damaged frame) comes out as that much silence, so that
+ * time keeps moving and the player does not take it for the end of the stream.
+ * `channels` is what the stream has and what was written, 1 or 2.
  */
 unsigned ipod_classic_sm1_codec_decode(IPodClassicSM1Codec *c,
                                        const uint8_t *frame, size_t bytes,

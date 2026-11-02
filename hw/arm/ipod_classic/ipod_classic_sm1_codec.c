@@ -94,14 +94,6 @@ static unsigned silence(int16_t *pcm, unsigned frames)
     return frames;
 }
 
-/* Mono to stereo, in place: from the end, since the two overlap. */
-static void spread_mono(int16_t *pcm, unsigned frames)
-{
-    for (unsigned i = frames; i-- > 0;) {
-        pcm[i * 2 + 1] = pcm[i * 2] = pcm[i];
-    }
-}
-
 static unsigned decode_mp3(IPodClassicSM1Codec *c, const uint8_t *frame,
                            size_t bytes, int16_t *pcm)
 {
@@ -124,9 +116,6 @@ static unsigned decode_mp3(IPodClassicSM1Codec *c, const uint8_t *frame,
         /* Layer 3 is 1152 frames in MPEG-1 and 576 below it, as is silence. */
         return silence(pcm, bytes >= 2 && !(frame[1] & 0x08)
                        ? MP3_FRAME_FRAMES / 2 : MP3_FRAME_FRAMES);
-    }
-    if (info.channels == 1) {
-        spread_mono(pcm, frames);
     }
     return frames;
 }
@@ -162,7 +151,6 @@ static unsigned decode_aac(IPodClassicSM1Codec *c, const uint8_t *frame,
     }
     if (info.channels == 1) {
         memcpy(pcm, out, frames * sizeof(*pcm));
-        spread_mono(pcm, frames);
     } else if (info.channels == 2) {
         memcpy(pcm, out, frames * 2 * sizeof(*pcm));
     } else {
