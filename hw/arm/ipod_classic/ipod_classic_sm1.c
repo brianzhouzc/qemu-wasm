@@ -160,7 +160,7 @@ static void sm1_frame(void *opaque)
     static uint8_t frame[S5L8702_SM1_FRAME_MAX];
     static int16_t pcm[IPOD_SM1_CODEC_MAX_FRAMES * 2];
     uint32_t bytes;
-    unsigned frames;
+    unsigned frames, channels;
 
     if (!s->chain || s->codec_type == IPOD_SM1_CODEC_NONE) {
         return;
@@ -183,7 +183,8 @@ static void sm1_frame(void *opaque)
     cpu_physical_memory_read(le32_to_cpu(desc[S5L8702_SM1_DESC_ADDR]), frame,
                              bytes);
 
-    frames = ipod_classic_sm1_codec_decode(s->codec, frame, bytes, pcm);
+    frames = ipod_classic_sm1_codec_decode(s->codec, frame, bytes, pcm,
+                                           &channels);
     frames = MIN(frames, s->slot_samples / 2);
     for (unsigned i = 0; i < frames * 2; i++) {
         pcm[i] = cpu_to_le16(pcm[i]);
@@ -192,7 +193,7 @@ static void sm1_frame(void *opaque)
                               s->slot * s->slot_samples * sizeof(pcm[0]),
                               pcm, frames * 2 * sizeof(pcm[0]));
     /* The flag last: it is what says the rest is there. */
-    sm1_mem_write16(S5L8702_SM1_SLOT_SAMPLES(s->slot), frames * 2);
+    sm1_mem_write16(S5L8702_SM1_SLOT_SAMPLES(s->slot), frames * channels);
     sm1_mem_write16(S5L8702_SM1_SLOT_FLAG(s->slot), 1);
     s->slot = (s->slot + 1) % S5L8702_SM1_SLOT_COUNT;
     sm1_set_event(s);

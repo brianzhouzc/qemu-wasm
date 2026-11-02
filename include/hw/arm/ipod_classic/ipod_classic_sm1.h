@@ -93,6 +93,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicSM1State, IPOD_CLASSIC_SM1)
  * 0x080bdda8 is the reader.  It takes slots in order from 0, clears the flag
  * and wraps at the count.
  *
+ * The PCM is always interleaved stereo, and the samples in a slot are frames
+ * times the stream's channels all the same, so a mono frame says half what it
+ * holds.  0x22006430 divides by the channels it knows, [state+0x14], and copies
+ * four bytes a frame.  Saying 2304 for mono overran the OS's buffers of 1152
+ * frames: half pitch, and a 60 s MP3 gone in 6.5 s.  The mailbox does not give
+ * the channels, so they come from the stream.
+ *
  * The geometry is not in any register, and two slots of a whole frame each is
  * read off the firmware.  It saves the engine's data around this ring, and that
  * save resumes at 0x2203a500 for MP3 and 0x2203a100 for AAC: from PCM that is

@@ -20,6 +20,7 @@
 
 struct IPodClassicSM1Codec {
     IPodClassicSM1CodecType type;
+    unsigned channels;
     mp3dec_t mp3;
     NeAACDecHandle aac;
     unsigned aac_rate_index;
@@ -59,6 +60,7 @@ IPodClassicSM1Codec *ipod_classic_sm1_codec_new(IPodClassicSM1CodecType type,
     IPodClassicSM1Codec *c = g_new0(IPodClassicSM1Codec, 1);
 
     c->type = type;
+    c->channels = 2;
     switch (type) {
     case IPOD_SM1_CODEC_MP3:
         mp3dec_init(&c->mp3);
@@ -115,6 +117,7 @@ static unsigned decode_mp3(IPodClassicSM1Codec *c, const uint8_t *frame,
      */
     if (bytes >= 4 && frame[0] == 0xff && (frame[1] & 0xe0) == 0xe0) {
         memcpy(c->mp3.header, frame, sizeof(c->mp3.header));
+        c->channels = (frame[3] >> 6) == 3 ? 1 : 2;
     }
     frames = mp3dec_decode_frame(&c->mp3, frame, bytes, pcm, &info);
     if (frames <= 0) {
@@ -145,6 +148,9 @@ static unsigned decode_aac(IPodClassicSM1Codec *c, const uint8_t *frame,
             out = NeAACDecDecode(c->aac, &info, (unsigned char *)frame, bytes);
         }
     }
+    if (!info.error && info.channels) {
+        c->channels = MIN(info.channels, 2);
+    }
     if (!out || info.error || !info.samples || !info.channels) {
         /* The first frame of a stream is only ever overlap. */
         return silence(pcm, AAC_FRAME_FRAMES);
@@ -173,8 +179,12 @@ static unsigned decode_aac(IPodClassicSM1Codec *c, const uint8_t *frame,
 
 unsigned ipod_classic_sm1_codec_decode(IPodClassicSM1Codec *c,
                                        const uint8_t *frame, size_t bytes,
-                                       int16_t *pcm)
+                                       int16_t *pcm, unsigned *channels)
 {
-    return c->type == IPOD_SM1_CODEC_MP3 ? decode_mp3(c, frame, bytes, pcm)
-                                         : decode_aac(c, frame, bytes, pcm);
+    unsigned frames = c->type == IPOD_SM1_CODEC_MP3
+                      ? decode_mp3(c, frame, bytes, pcm)
+                      : decode_aac(c, frame, bytes, pcm);
+
+    *channels = c->channels;
+    return frames;
 }
