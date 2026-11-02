@@ -1600,12 +1600,9 @@ static void ipod_classic_machine_init(MachineState *machine)
     memory_region_add_subregion(sysmem, EIC_MEM_BASE, sysalv_mr);
 
     /*
-     * SM1 (0x38500000): the audio clock/stream engine. A stateful device that
-     * models the run/power handshake the retailOS audio bring-up drives (block
-     * identity, clock-ready, per-channel state machine, run latch). It was an
-     * unimplemented zero window until the play path was found to hang on it; see
-     * ipod_classic_sm1.c and wiki/19 section 11. Full 1 MB window so every
-     * undecoded offset still reads 0 like the device it replaces.
+     * SM1 (0x38500000): the audio decoder engine, where stock firmware sends
+     * MP3 and AAC.  Rockbox never touches it.  See ipod_classic_sm1.c.  Full
+     * 1 MB window, so every offset it does not use still reads 0.
      */
     /*
      * The SHA-1 accelerator (0x38000000).
@@ -1654,16 +1651,9 @@ static void ipod_classic_machine_init(MachineState *machine)
     dev = qdev_new(TYPE_IPOD_CLASSIC_SM1);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SM1_MEM_BASE);
-    /* The engine's playback position tracks what the I2S clocks out. */
-    ipod_classic_sm1_set_i2s(IPOD_CLASSIC_SM1(dev), nms->i2s);
     /*
-     * The engine's interrupt, VIC0 line 18. Our IRQ map came from Rockbox's
-     * s5l87xx.h, which has a GAP at 18 -- Rockbox decodes on the ARM and never
-     * drives this engine, so it never needed the name. Apple's retailOS does:
-     * it installs a handler at 0x08017378 for index 18, and that handler is the
-     * only thing that signals the event its native render pump waits on. The
-     * line is wired unconditionally; SM1 only raises it under SM1_IRQ=1.
-     * See wiki/19 section 11.25.
+     * The engine's interrupt, VIC0 line 18.  Our IRQ map came from Rockbox's
+     * s5l87xx.h, which has a gap at 18, since Rockbox never drives this engine.
      */
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        s5l8702_get_irq(nms, S5L8702_SM1_IRQ));

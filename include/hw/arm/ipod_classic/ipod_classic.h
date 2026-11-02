@@ -75,7 +75,7 @@
 #define DMAC0_MEM_BASE    0x38200000   /* DMA0_BASE, PL080 */
 #define LCD_MEM_BASE      0x38300000   /* LCD_BASE */
 #define USBOTG_MEM_BASE   0x38400000   /* OTGBASE, Synopsys DWC */
-#define SM1_MEM_BASE      0x38500000   /* SM1_BASE, clock divider */
+#define SM1_MEM_BASE      0x38500000   /* the audio decoder engine */
 #define USB_HC_MEM_BASE   0x38600000   /* USB_HC_BASE */
 #define ATA_MEM_BASE      0x38700000   /* ATA_BASE, the hard disk */
 #define USB_FC_MEM_BASE   0x38800000   /* USB_FC_BASE */

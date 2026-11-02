@@ -80,6 +80,7 @@ arm_ss.add(when: 'CONFIG_IPOD_CLASSIC_6G', if_true: files(
   'ipod_classic/ipod_classic_audio_out.c',
   'ipod_classic/ipod_classic_cs42l55.c',
   'ipod_classic/ipod_classic_sm1.c',
+  'ipod_classic/ipod_classic_sm1_codec.c',
   'ipod_classic/ipod_classic_hle_audio.c',
   'ipod_classic/ipod_classic_hle_np.c',
   'ipod_classic/ipod_classic_np_overlay.c'))
