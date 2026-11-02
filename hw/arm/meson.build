@@ -106,6 +106,7 @@ ipod_classic_codecs = static_library('ipod_classic_codecs', files(
   'ipod_classic/codecs/faad2/specrec.c',
   'ipod_classic/codecs/faad2/syntax.c',
   'ipod_classic/codecs/faad2/tns.c'),
+  include_directories: include_directories('ipod_classic/codecs/faad2'),
   c_args: ['-w', '-DLC_ONLY_DECODER', '-DDISABLE_SBR', '-DHAVE_STDINT_H=1',
            '-DHAVE_STRING_H=1', '-DHAVE_STDLIB_H=1', '-DSTDC_HEADERS=1',
            '-DHAVE_LRINTF=1', '-DPACKAGE_VERSION="2.11.4"'])
