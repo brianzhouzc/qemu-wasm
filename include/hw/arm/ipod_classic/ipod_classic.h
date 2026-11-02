@@ -204,14 +204,26 @@
  *          wipes out the VA 0 -> IRAM0 entry, and a heap whose top is below
  *          its base.
  *
+ *   +0x104 which audio codec is fitted.  On 2.0.5 0x0806dbd0 walks a table of
+ *          two drivers, one for each chip the OS knows, for the entry with this
+ *          id: 0x4253 is the CS42L55 at I2C 0x4a, 0x8970 a Wolfson at 0x1a.  Zero
+ *          falls back to the first entry, the Wolfson.  MEASURED, with this left
+ *          zero: nothing ever reached the codec this machine has, from power-on
+ *          to a playing track, and every volume change was NACKed at 0x1a.  With
+ *          it set the OS runs the CS42L55 init (0x00 = 0x99, then its table) and
+ *          the wheel moves the gain, +2 dB at the top of the range.  The value
+ *          is the id of the chip this machine has, not one read from hardware.
+ *
  * Everything else stays zero on purpose. 0x08323aa4's callers also read +0x18,
- * +0x38, +0x3c, +0x48, +0x4c, +0x94, +0xe8 and +0x104; what those mean is
- * UNDETERMINED, and filling them from a plausible-looking guess would be
- * inventing with the appearance of rigour.
+ * +0x38, +0x3c, +0x48, +0x4c, +0x94 and +0xe8; what those mean is UNDETERMINED,
+ * and filling them from a plausible-looking guess would be inventing with the
+ * appearance of rigour.
  */
 #define S5L8702_SYSINFO_HW_ID_OFF     0x84
 #define S5L8702_SYSINFO_DRAM_SIZE_OFF 0xe0
 #define S5L8702_SYSINFO_DRAM_BASE_OFF 0xe4
+#define S5L8702_SYSINFO_CODEC_OFF     0x104
+#define S5L8702_SYSINFO_CODEC_CS42L55 0x4253
 #define S5L8702_HW_ID                 0x00130000
 
 typedef struct {

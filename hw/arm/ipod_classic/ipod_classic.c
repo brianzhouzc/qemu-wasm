@@ -97,6 +97,8 @@ static void ipod_classic_write_bootinfo(IPodClassicMachineState *nms)
         [S5L8702_SYSINFO_HW_ID_OFF / 4]     = cpu_to_le32(nms->hw_id),
         [S5L8702_SYSINFO_DRAM_SIZE_OFF / 4] = cpu_to_le32(SDRAM_MEM_SIZE),
         [S5L8702_SYSINFO_DRAM_BASE_OFF / 4] = cpu_to_le32(SDRAM_MEM_BASE),
+        [S5L8702_SYSINFO_CODEC_OFF / 4]     =
+            cpu_to_le32(S5L8702_SYSINFO_CODEC_CS42L55),
     };
     uint32_t tag = cpu_to_le32(S5L8702_SYSINFO_MAGIC);
     uint32_t ptr = cpu_to_le32(S5L8702_SYSINFO_BASE);
