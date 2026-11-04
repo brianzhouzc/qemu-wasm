@@ -36,7 +36,6 @@ static int ata_lba_mode(void)
     }
     return mode;
 }
-#include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
 
 /* Which IDE core port a device-register offset corresponds to. */
 static int ata_ioport(hwaddr offset)
@@ -266,20 +265,6 @@ static int32_t ipod_classic_ata_dma_prepare_buf(const IDEDMA *dma,
                         qemu_clock_get_us(QEMU_CLOCK_VIRTUAL), n, sec,
                         sec * 512, (unsigned)len, (uint32_t)(s->dma_cur - len),
                         rd_bytes / 1024);
-            }
-        }
-
-        /*
-         * DATA-PATH HLE track identification: tell the audio shim which disk
-         * bytes the guest is reading, so it can tell which audio file is being
-         * streamed and decode that same song host-side. Reads only; a no-op
-         * unless HLE_AUDIO_DATAPATH is set. See ipod_classic_hle_audio.c.
-         */
-        if (ipod_classic_hle_audio_enabled() &&
-            !(s->reg[S5L8702_ATA_CFG / 4] & S5L8702_ATA_CFG_WRITE)) {
-            int64_t sec = ide_get_sector(is);
-            if (sec >= 0) {
-                ipod_classic_hle_audio_note_disk_read((uint64_t)sec * 512, len);
             }
         }
     }

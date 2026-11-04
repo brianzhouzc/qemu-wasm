@@ -36,7 +36,6 @@
 #include "migration/vmstate.h"
 #include "ui/console.h"
 #include "hw/arm/ipod_classic/ipod_classic_wheel.h"
-#include "hw/arm/ipod_classic/ipod_classic_np_overlay.h"
 /* ipod_classic_wake_vcpu() / ipod_classic_input_wake(): see the machine header. */
 #include "hw/arm/ipod_classic/ipod_classic.h"
 
@@ -512,14 +511,6 @@ static void wheel_key_event(void *opaque, int keycode)
         fprintf(stderr, "WHEELTRACE key 0x%02x\n", keycode);
         key_traced = true;
     }
-
-    /*
-     * Tee every keycode to the HLE Now Playing overlay's control handler first
-     * (play/pause, prev/next, seek, show/hide). No-op unless HLE_NP_OVERLAY is
-     * set; the key still flows to the guest below, so navtest/Rockbox and the
-     * default build are unaffected.
-     */
-    ipod_classic_np_overlay_key(keycode);
 
     switch (keycode & 0x7f) {
     case KEY_ENTER: bit = S5L8702_WHEEL_BTN_SELECT; break;

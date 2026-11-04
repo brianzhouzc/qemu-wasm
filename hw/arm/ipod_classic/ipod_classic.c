@@ -28,9 +28,6 @@
 #include "hw/dma/pl080.h"
 #include "hw/arm/ipod_classic/ipod_classic.h"
 #include "hw/arm/ipod_classic/ipod_classic_cs42l55.h"
-#include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
-#include "hw/arm/ipod_classic/ipod_classic_hle_np.h"
-#include "hw/arm/ipod_classic/ipod_classic_np_overlay.h"
 #include "hw/arm/ipod_classic/ipod_classic_timer.h"
 /* The S5L8720's SHA-1 block; the S5L8702 drives the same register map. */
 #include "hw/arm/ipod_touch_sha1.h"
@@ -1657,25 +1654,6 @@ static void ipod_classic_machine_init(MachineState *machine)
      */
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        s5l8702_get_irq(nms, S5L8702_SM1_IRQ));
-
-    /*
-     * The audio data-path HLE. A no-op unless HLE_AUDIO_DATAPATH is set; when it
-     * is, the host decodes the guest's own song (from the same disk image) and
-     * feeds the PCM into DMAC0 channel 1 -- the channel that drains the audio
-     * ping-pong to the I2S FIFO -- so the retailOS plays its real song through
-     * its own I2S despite the MeCCA decode deadlock. See ipod_classic_hle_audio.c
-     * and wiki/19 section 11.19. Default build is byte-identical.
-     */
-    ipod_classic_hle_audio_init(cpu, dmac0, nms->i2s);
-
-    /* HLE "Now Playing" bootstrap (wiki/19 s.11.20): break the MeCCA decode
-     * deadlock so the guest's own engine renders. No-op unless HLE_NP is set. */
-    ipod_classic_hle_np_init(cpu);
-
-    /* HLE "Now Playing" host overlay (wiki/19 s.11.23): a visible, controllable
-     * player drawn over the framebuffer, driven by the data-path audio. No-op
-     * unless HLE_NP_OVERLAY is set. */
-    ipod_classic_np_overlay_init();
 
     /* Serial console. */
     exynos4210_uart_create(UART0_MEM_BASE, 256, 0, serial_hd(0),

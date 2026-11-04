@@ -57,7 +57,6 @@
 #include "hw/arm/ipod_classic/ipod_classic_lcd.h"
 #include "hw/arm/ipod_classic/ipod_classic_disp.h"
 #include "hw/arm/ipod_classic/ipod_classic_bootscreen.h"
-#include "hw/arm/ipod_classic/ipod_classic_np_overlay.h"
 
 /*
  * INSTRUMENTATION ONLY -- LCDTRACE=1 in the environment prints every access to
@@ -588,7 +587,7 @@ void ipod_classic_lcd_set_boot_screen(IPodClassicLCDState *s, bool on)
 }
 
 /*
- * Compose the panel from the display pipe and the HLE overlay, and report
+ * Compose the panel from the display pipe, and report
  * whether a new frame is available.  Split out for the browser build, which
  * composes on its own timer and has no console frontend to update.
  */
@@ -626,17 +625,6 @@ static bool ipod_classic_lcd_compose(IPodClassicLCDState *s)
         s->dirty = true;
         /* Guest content is on the panel: the boot screen is gone. */
         qatomic_set(&s->boot_screen_active, 0);
-    }
-
-    /*
-     * HLE Now Playing overlay (wiki/19 s11.23): paint the player UI over the
-     * composed guest frame. Kept dirty every refresh while visible so the clock
-     * and progress bar advance. No-op unless HLE_NP_OVERLAY is set.
-     */
-    if (ipod_classic_np_overlay_active()) {
-        ipod_classic_np_overlay_draw(s->fb, S5L8702_PANEL_WIDTH,
-                                     S5L8702_PANEL_HEIGHT);
-        s->dirty = true;
     }
 
     if (!s->dirty) {
