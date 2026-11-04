@@ -168,7 +168,6 @@ struct IPodClassicLCDState {
 
     /* Counters, for the trace only. */
     uint64_t pixels_this_frame;
-    uint64_t composed_frames;
 
     /*
      * The panel comes up on the firmware's boot screen instead of black.  Set

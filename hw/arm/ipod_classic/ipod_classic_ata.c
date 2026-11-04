@@ -14,8 +14,6 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
-#include "hw/core/cpu.h"
-#include "target/arm/cpu.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
 #include "exec/address-spaces.h"

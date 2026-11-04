@@ -571,7 +571,6 @@ static bool ipod_classic_lcd_compose(IPodClassicLCDState *s)
     if (s->disp && ipod_classic_disp_compose(s->disp, s->fb,
                                              S5L8702_PANEL_WIDTH,
                                              S5L8702_PANEL_HEIGHT)) {
-        s->composed_frames++;
         lcd_composed_frames++;
         s->dirty = true;
         /* Guest content is on the panel: the boot screen is gone. */
@@ -745,7 +744,6 @@ static void ipod_classic_lcd_reset(DeviceState *dev)
     s->fr_unk7c = 0;
     s->fr_hold = 0;
     s->fr_unk88 = 0;
-    s->composed_frames = 0;
 
     memset(s->fb, 0, sizeof(s->fb));
     if (s->boot_screen) {
