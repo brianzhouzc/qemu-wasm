@@ -96,9 +96,6 @@ struct IPodClassicI2SState {
     int64_t pace_last_ns;   /* the sample clock has been paid for up to here */
     uint64_t pace_frac;     /* what did not make a whole byte, in ns*bytes/s */
     uint64_t pace_due;      /* bytes owed: clocked out and not yet moved */
-
-    /* Running count of 16-bit samples clocked out, for diagnostics. */
-    uint64_t tx_samples;
 };
 
 /* Give the I2S the DMAC0 it paces. Called from the machine after both exist. */

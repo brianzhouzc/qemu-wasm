@@ -15,8 +15,8 @@
  *    While the block was unimplemented ~6144 samples per boot fell to the floor.
  *
  *  - PCM capture. With AUDIOWAV=/path.wav set, every sample written to the FIFO
- *    is appended to a 16-bit-stereo WAV whose sample rate is taken from CLKDIV.
- *    That WAV is the hito-3 artefact.
+ *    is appended to a 16-bit-stereo WAV whose sample rate is taken from CLKDIV,
+ *    and the first non-zero sample of the run is announced on stderr.
  *
  *  - Pacing. See ipod_classic_i2s_drain(): the FIFO is drained at the sample
  *    rate, in host time, so the PL080 hands over what has been clocked out and
@@ -25,9 +25,7 @@
  *    output for the page to play.
  *
  * INSTRUMENTATION: I2STRACE=1 prints every access with its value and guest PC,
- * same pattern as DISPTRACE=1/ATATRACE=1. Independently of the trace, the FIRST
- * non-zero PCM sample of a run is announced on stderr -- that is the event the
- * whole audio investigation waited for.
+ * same pattern as DISPTRACE=1/ATATRACE=1.
  */
 
 #include "qemu/osdep.h"
@@ -36,7 +34,6 @@
 #include "hw/irq.h"
 #include "migration/vmstate.h"
 #include "hw/core/cpu.h"
-#include "audio/audio.h"
 #include "hw/arm/ipod_classic/ipod_classic_i2s.h"
 #include "hw/arm/ipod_classic/ipod_classic_audio_out.h"
 
@@ -305,198 +302,17 @@ static bool i2s_sending(IPodClassicI2SState *s)
     return s->tx_running && (s->clkcon & 1);
 }
 
-/* ----------------------------------------------------- live audio out */
-/*
- * AUDIOLIVE=1: besides (or instead of) the WAV, feed the same FIFO PCM to a
- * QEMU SWVoiceOut so playback comes out of the host speakers through whatever
- * -audio/-audiodev backend is active (pa/PulseAudio under WSLg). Template:
- * hw/audio/lm4549.c -- register a card, AUD_open_out a 16-bit-stereo voice,
- * push PCM with AUD_write.
- *
- * TWO rules copied from lm4549 that are load-bearing:
- *  (1) The voice MUST be opened at device realize, BEFORE the VM starts running.
- *      AUD_set_active_out() only arms the mixer timer when s->vm_running is set
- *      (audio/audio.c AUD_set_active_out, "if (s->vm_running) audio_reset_timer")
- *      and that flag is set by the audio vm-change-state handler, which fires
- *      once at VM start. A card first registered LAZILY during playback misses
- *      that transition, its timer never starts, and not one sample is clocked
- *      out (the wav backend then holds a 44-byte header; pa stays silent).
- *  (2) Push with AUD_write from the write path (i2s_live_sample) and from the
- *      out callback; AUD_write takes only what the mixer can hold now, the rest
- *      waits in the ring for the next push.
- * One I2S instance exists, so a file-scope struct is enough (like i2s_wav).
- */
-static struct {
-    QEMUSoundCard card;
-    SWVoiceOut *voice;
-    bool registered;
-    bool primed;             /* jitter cushion built; mixer output active */
-    uint32_t rate;
-    uint8_t buf[1u << 20];   /* 1 MiB ~= 5.4 s @ 48000 stereo 16-bit */
-    uint32_t rd, wr;         /* free-running byte counters */
-} i2s_live;
-
-#define I2S_LIVE_MASK ((uint32_t)(sizeof(i2s_live.buf) - 1))
-#define I2S_LIVE_DEFAULT_RATE 44100u
-/*
- * Startup jitter cushion. The audio DMA is paced on the VIRTUAL clock (one burst
- * per drain tick) while the host mixer pulls on the REAL clock, so their rates
- * match only on average and per-burst jitter would starve the mixer the instant
- * the ring runs dry. We hold the first I2S_LIVE_PRIME_MS of PCM in the ring
- * WITHOUT activating output (an inactive voice does not pull, so the ring keeps
- * filling); once the cushion is built we activate and then let the out callback
- * drain the ring, keeping this much slack permanently in hand. 300 ms adds 300 ms
- * of audio latency (inaudible for music) and the 1 MiB ring holds ~5 s, far above
- * the cushion. Measured: without priming the mixer underran ~90 times/s on this
- * host; with priming a clean run shows 0 underruns and 0 drops.
- *
- * The cushion absorbs JITTER, not a sustained rate deficit: it cannot conjure
- * samples the ARM has not decoded yet. On a host that cannot decode this MP3 at
- * >=1x real time the cushion drains over a few seconds and underruns resume --
- * that is a host-performance ceiling, not a bug (the same PCM still reaches the
- * backend, byte-identical to the WAV; see wiki/16).
- */
-#define I2S_LIVE_PRIME_MS 300u
-
-static uint32_t i2s_live_prime_bytes(void)
-{
-    uint32_t rate = i2s_live.rate ? i2s_live.rate : I2S_LIVE_DEFAULT_RATE;
-    uint32_t bytes = (uint32_t)((uint64_t)rate * 4 * I2S_LIVE_PRIME_MS / 1000);
-    /* Never ask for a cushion the ring cannot hold. */
-    if (bytes > sizeof(i2s_live.buf) / 2) {
-        bytes = sizeof(i2s_live.buf) / 2;
-    }
-    return bytes;
-}
-
-static int audiolive = -1;
-
-static bool i2s_live_on(void)
-{
-    if (audiolive < 0) {
-        const char *e = getenv("AUDIOLIVE");
-        audiolive = (e && *e && *e != '0') ? 1 : 0;
-    }
-    return audiolive == 1;
-}
-
-static uint32_t i2s_live_used(void)
-{
-    return i2s_live.wr - i2s_live.rd;
-}
-
-/* Hand as much of the ring as the mixer will take right now. */
-static void i2s_live_drain(void)
-{
-    while (i2s_live.voice && i2s_live_used() > 0) {
-        uint32_t rdpos = i2s_live.rd & I2S_LIVE_MASK;
-        uint32_t contig = (uint32_t)sizeof(i2s_live.buf) - rdpos;
-        uint32_t used = i2s_live_used();
-        uint32_t chunk = used < contig ? used : contig;
-        size_t wrote = AUD_write(i2s_live.voice, &i2s_live.buf[rdpos], chunk);
-
-        if (wrote == 0) {
-            break;      /* mixer full; the rest waits for the next push */
-        }
-        i2s_live.rd += (uint32_t)wrote;
-    }
-}
-
-/* The mixer has room; hand it what we have. */
-static void i2s_live_out_cb(void *opaque, int avail)
-{
-    (void)avail;
-    i2s_live_drain();
-}
-
-/* Open (or reconfigure) the voice for `rate`. Called at realize and on a rate
- * change. No-op unless AUDIOLIVE is set. */
-static void i2s_live_open(uint32_t rate)
-{
-    struct audsettings as = {
-        .freq = (int)rate,
-        .nchannels = 2,
-        .fmt = AUDIO_FORMAT_S16,
-        .endianness = 0,
-    };
-
-    if (!i2s_live_on()) {
-        return;
-    }
-    if (!i2s_live.registered) {
-        if (!AUD_register_card("s5l8702.i2s", &i2s_live.card, NULL)) {
-            return;
-        }
-        i2s_live.registered = true;
-    }
-    i2s_live.voice = AUD_open_out(&i2s_live.card, i2s_live.voice,
-                                  "s5l8702.i2s.out", NULL,
-                                  i2s_live_out_cb, &as);
-    if (i2s_live.voice) {
-        i2s_live.rate = rate;
-    }
-}
-
-/* Append the low `size` bytes of a FIFO write to the ring, same bytes as the
- * WAV, then push. The voice was already opened at realize. */
-static void i2s_live_sample(IPodClassicI2SState *s, uint64_t value, unsigned size)
-{
-    uint32_t rate;
-
-    if (!i2s_live_on() || !i2s_live.voice) {
-        return;
-    }
-    rate = i2s_sample_rate(s);
-    if (rate != i2s_live.rate) {
-        i2s_live_open(rate);          /* retune to the real sample rate */
-        if (!i2s_live.voice) {
-            return;
-        }
-    }
-    if (size > 4) {
-        size = 4;
-    }
-    for (unsigned i = 0; i < size; i++) {
-        if (i2s_live_used() < sizeof(i2s_live.buf)) {
-            i2s_live.buf[i2s_live.wr & I2S_LIVE_MASK] = (value >> (8 * i)) & 0xff;
-            i2s_live.wr++;
-        }
-    }
-    /*
-     * Priming: while building the startup cushion, hold PCM in the ring and do
-     * NOT activate the mixer (an inactive voice does not pull, so the ring keeps
-     * filling). Once the cushion is built, activate output ONCE. From then on the
-     * mixer's out callback drains the ring at its own real-time cadence.
-     *
-     * The hot path here runs once per PCM frame (~48000/s), so it must stay cheap:
-     * we only append to the ring and never call AUD_write or AUD_set_active_out
-     * per sample. Draining from the callback instead keeps this write handler
-     * light, which matters because MP3 decode on the emulated ARM is already close
-     * to the real-time budget -- extra per-sample work here directly steals the
-     * decoder's headroom and causes underruns.
-     */
-    if (!i2s_live.primed) {
-        if (i2s_live_used() < i2s_live_prime_bytes()) {
-            return;
-        }
-        i2s_live.primed = true;
-        AUD_set_active_out(i2s_live.voice, 1);
-    }
-}
-
 /* What the FIFO receives, from the DMA as a block or a sample from the CPU. */
 static void i2s_tx(void *opaque, const uint8_t *buf, unsigned bytes)
 {
     IPodClassicI2SState *s = opaque;
 
-    s->tx_samples += bytes / 2;
     ipod_classic_audio_out_write(buf, bytes);
-    if (i2s_wav_on() || i2s_live_on()) {
+    if (i2s_wav_on()) {
         for (unsigned i = 0; i + 2 <= bytes; i += 2) {
             uint16_t sample = buf[i] | (buf[i + 1] << 8);
 
             i2s_wav_sample(s, sample, 2);
-            i2s_live_sample(s, sample, 2);
         }
     }
 }
@@ -717,20 +533,11 @@ static void ipod_classic_i2s_reset(DeviceState *dev)
     s->rxdb = 0;
     s->clkdiv = 0;
     s->tx_running = false;
-    s->tx_samples = 0;
     if (s->drain_timer) {
         timer_del(s->drain_timer);
     }
     ipod_classic_audio_out_set_running(false);
     ipod_classic_audio_out_flush();
-    /* Silence the live-audio voice on reset and re-arm priming; the cushion
-     * rebuilds from the next PCM samples. */
-    if (i2s_live.voice) {
-        AUD_set_active_out(i2s_live.voice, 0);
-    }
-    i2s_live.primed = false;
-    i2s_live.rd = 0;
-    i2s_live.wr = 0;
 }
 
 static void ipod_classic_i2s_realize(DeviceState *dev, Error **errp)
@@ -744,15 +551,6 @@ static void ipod_classic_i2s_realize(DeviceState *dev, Error **errp)
 
     s->drain_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL_RT,
                                   ipod_classic_i2s_drain, s);
-
-    /*
-     * Open the live-audio voice HERE, at realize, before the VM starts running,
-     * so the audio subsystem's vm-change-state handler sets s->vm_running and
-     * AUD_set_active_out() later arms the mixer timer (see i2s_live_open). A
-     * default rate is fine; i2s_live_sample retunes to the real I2SCLKDIV rate
-     * on the first PCM sample. No-op unless AUDIOLIVE is set.
-     */
-    i2s_live_open(I2S_LIVE_DEFAULT_RATE);
 }
 
 /*
