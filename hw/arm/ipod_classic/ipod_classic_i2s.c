@@ -144,6 +144,12 @@ static void i2s_wav_close(void)
             i2s_wav_data_bytes, i2s_wav_data_bytes / 4);
 }
 
+/*
+ * Asked once: this runs for every sample, and getenv is a linear scan of the
+ * environment.  An empty AUDIOWAV, or one that cannot be opened, is off.
+ */
+static int audiowav = -1;
+
 static void i2s_wav_open(uint32_t rate)
 {
     const char *path = getenv("AUDIOWAV");
@@ -156,6 +162,7 @@ static void i2s_wav_open(uint32_t rate)
     i2s_wav = fopen(path, "wb");
     if (!i2s_wav) {
         fprintf(stderr, "AUDIOWAV: cannot open %s\n", path);
+        audiowav = 0;   /* once, not again for every sample */
         return;
     }
     /* Canonical 44-byte PCM WAV header; sizes patched at close. */
@@ -179,16 +186,12 @@ static void i2s_wav_open(uint32_t rate)
             rate, path);
 }
 
-/*
- * Asked once: this runs for every sample, and getenv is a linear scan of the
- * environment.
- */
-static int audiowav = -1;
-
 static bool i2s_wav_on(void)
 {
     if (audiowav < 0) {
-        audiowav = getenv("AUDIOWAV") != NULL;
+        const char *e = getenv("AUDIOWAV");
+
+        audiowav = e && *e;
     }
     return audiowav == 1;
 }

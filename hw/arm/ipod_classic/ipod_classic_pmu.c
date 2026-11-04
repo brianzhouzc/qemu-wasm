@@ -88,15 +88,41 @@ void ipod_classic_wake_vcpu(void);
  */
 static uint32_t pmu_battery_raw(void)
 {
-    const char *e = getenv("PMUBATT");
-    if (e && *e) {
-        unsigned long v = strtoul(e, NULL, 0);
-        if (v > 1023) {
-            v = 1023;
+    /* Read once, like the trace switches (Q18). */
+    static int64_t raw = -1;
+
+    if (raw < 0) {
+        const char *e = getenv("PMUBATT");
+
+        raw = S5L8702_PMU_ADC_BATTERY_RAW;
+        if (e && *e) {
+            raw = MIN(strtoul(e, NULL, 0), 1023);
         }
-        return (uint32_t)v;
     }
-    return S5L8702_PMU_ADC_BATTERY_RAW;
+    return (uint32_t)raw;
+}
+
+/* PMUCHARGER: 0 unset, 1 USB, 2 adapter.  Read once (Q18). */
+static int pmu_charger(void)
+{
+    static int kind = -1;
+
+    if (kind < 0) {
+        const char *e = getenv("PMUCHARGER");
+
+        kind = !e || !*e ? 0 : !strcmp(e, "adapter") ? 2 : 1;
+    }
+    return kind;
+}
+
+static bool pmu_trace_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("PMUTRACE") != NULL;
+    }
+    return on;
 }
 
 static void pmu_start_adc(IPodClassicPMUState *s)
@@ -191,8 +217,8 @@ static uint8_t pmu_reg_read(IPodClassicPMUState *s, uint8_t addr)
          * it is plugged into, and we are plugged into nothing.
          */
         {
-            const char *e = getenv("PMUCHARGER");
-            if (e && *e) {
+            int kind = pmu_charger();
+            if (kind) {
                 /*
                  * WHICH KIND of external power matters, and getting it wrong
                  * was MEASURED: reporting the wall ADAPTER puts the device
@@ -202,7 +228,7 @@ static uint8_t pmu_reg_read(IPodClassicPMUState *s, uint8_t addr)
                  * leaves it usable. Default is USB; PMUCHARGER=adapter keeps
                  * the other one reachable for testing that screen on purpose.
                  */
-                if (!strcmp(e, "adapter")) {
+                if (kind == 2) {
                     val |= PCF5063X_MBCS1_ADAPTPRES | PCF5063X_MBCS1_ADAPTOK;
                 } else {
                     val |= PCF5063X_MBCS1_USBPRES | PCF5063X_MBCS1_USBOK;
@@ -269,7 +295,7 @@ static uint8_t pmu_reg_read(IPodClassicPMUState *s, uint8_t addr)
      * each, says which ones without burying the firmware's own semihosting
      * output on the same stream.
      */
-    if (getenv("PMUTRACE")) {
+    if (pmu_trace_on()) {
         static uint32_t seen[256];
         if (seen[addr]++ < 3) {
             fprintf(stderr, "PMUTRACE: read reg 0x%02x -> 0x%02x\n", addr, val);
