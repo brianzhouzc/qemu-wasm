@@ -23,7 +23,6 @@
 
 #include "qemu/osdep.h"
 #include "exec/cpu_ldst.h"
-#include "sysemu/cpu-timers.h"
 #include "tcg/tcg-op.h"
 #include "tcg/tcg-ldst.h"
 #include <string.h>
@@ -33,17 +32,28 @@
 
 unsigned long wasm_tb_compiled_count;
 
-static int instantiate_num = INSTANTIATE_NUM;
 /*
- * Set when the machine explicitly asked for a JIT threshold (the
- * wasm-instantiate property).  An explicit value wins over the icount
- * default below (Q8).
+ * How many times a block runs in the interpreter before it is compiled into
+ * a Wasm module.  INT32_MAX is "never": the counter cannot pass it, and
+ * tcg_qemu_tb_exec() then skips the per-block bookkeeping entirely.
+ *
+ * The JIT runs under -icount too.  It used to be held off there (92956d4)
+ * because the guest branched into data a few million instructions into the
+ * boot; that was code generation bugs, not icount (a6bd842, 9893dbf, and the
+ * widening multiplies after them, which only Rockbox's decoders reached), and
+ * the icount-specific paths check out: the budget check and its exit are TCG
+ * ops the backend compiles like any other, a block that loops to itself runs
+ * that check on every pass, and an I/O access in the middle of a block hands
+ * cpu_io_recompile() the same bytecode position the interpreter would, so the
+ * restore finds the same instruction.  Measured in iPodWasm's PERF_LOG.
+ *
+ * Only the machine sets this (wasm-instantiate, wasm-jit), during machine
+ * init: the vCPU thread does not run a block before the machine starts.
  */
-static bool instantiate_set;
+static int instantiate_num = INSTANTIATE_NUM;
 
 void wasm_set_instantiate_num(int n)
 {
-    instantiate_set = true;
     if (n > 0) {
         instantiate_num = n;
     }
@@ -268,18 +278,6 @@ void init_wasm32()
         ctx.tci_tb_ptr = (uint32_t*)&tci_tb_ptr;
         init_wasm32_js((int)&ctx.tb_ptr, cur_core_num, (int)to_remove_instance, (int)&to_remove_instance_idx);
         initdone = true;
-
-        /*
-         * Under -icount the JIT is off by default: an audit of the JIT under
-         * icount never happened (the earlier failures may or may not be
-         * fixed by a6bd842 and 9893dbf), and icount is what makes the wheel
-         * and the timers usable, so correctness wins over speed.  An
-         * explicit wasm-instantiate=N still wins, so the JIT can be tried
-         * without patching the tree (Q8).
-         */
-        if (icount_enabled() && !instantiate_set) {
-            instantiate_num = INT32_MAX;
-        }
     }
 }
 
@@ -1246,13 +1244,13 @@ static inline uintptr_t tcg_qemu_tb_exec_tci(CPUArchState *env)
                 tb_ptr = *(uint32_t **)ptr;
                 ctx.tb_ptr = tb_ptr;
                 /*
-                 * -icount sets instantiate_num to INT32_MAX (init_wasm32) to
-                 * keep the unaudited JIT out of that configuration.  The hit
+                 * wasm-jit=off sets instantiate_num to INT32_MAX to keep
+                 * every block in the interpreter.  The hit
                  * counter below is a per-TB word that starts at zero and only
                  * counts up, so a TB that runs often enough eventually reaches
                  * INT32_MAX, which makes this return "enter to wasm TB" and
                  * compiles it after all.  With the threshold out of reach the
-                 * counter can never pass it, so skip it: icount then really
+                 * counter can never pass it, so skip it: the JIT then really
                  * never compiles a TB, and the branch is cheaper too.
                  */
                 if (instantiate_num != INT32_MAX) {
@@ -1379,12 +1377,12 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
     while (true) {
         uint32_t res;
         /*
-         * Under -icount the JIT is off (instantiate_num == INT32_MAX), so no
+         * With the JIT off (instantiate_num == INT32_MAX), no
          * instance can exist and the hit counter can never reach its
          * threshold: run the interpreter without the per-TB instance lookup
          * and counter bookkeeping.  This also keeps the counter from
          * overflowing into "instantiate now" after 2^31 TB entries, which is
-         * how the JIT could otherwise be entered under -icount.
+         * how the JIT could otherwise be entered with it off.
          */
         if (instantiate_num == INT32_MAX) {
             res = tcg_qemu_tb_exec_tci(env);

@@ -345,6 +345,16 @@ static void ipod_classic_set_semihosting(Object *obj, bool value, Error **errp)
     IPOD_CLASSIC_MACHINE(obj)->semihosting = value;
 }
 
+static bool ipod_classic_get_wasm_jit(Object *obj, Error **errp)
+{
+    return IPOD_CLASSIC_MACHINE(obj)->wasm_jit;
+}
+
+static void ipod_classic_set_wasm_jit(Object *obj, bool value, Error **errp)
+{
+    IPOD_CLASSIC_MACHINE(obj)->wasm_jit = value;
+}
+
 static void ipod_classic_instance_init(Object *obj)
 {
     object_property_add_str(obj, "bootrom", ipod_classic_get_bootrom_path,
@@ -401,6 +411,14 @@ static void ipod_classic_instance_init(Object *obj)
     object_property_set_description(obj, "wasm-instantiate",
         "Wasm build only: translate a translation block into a Wasm module "
         "after it has run N times, instead of the built-in 1500. 0 keeps 1500.");
+
+    IPOD_CLASSIC_MACHINE(obj)->wasm_jit = true;
+    object_property_add_bool(obj, "wasm-jit", ipod_classic_get_wasm_jit,
+                             ipod_classic_set_wasm_jit);
+    object_property_set_description(obj, "wasm-jit",
+        "Wasm build only: compile hot translation blocks into Wasm modules "
+        "(the default). Off runs every block in the TCI interpreter, which is "
+        "slower but the reference to compare the JIT against.");
 }
 
 static inline qemu_irq s5l8702_get_irq(IPodClassicMachineState *s, int n)
@@ -1305,8 +1323,14 @@ static void ipod_classic_machine_init(MachineState *machine)
                                        ipod_snapshot_bh_fn, NULL);
 #endif
 #if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
-    if (nms->wasm_instantiate > 0) {
-        wasm_set_instantiate_num(nms->wasm_instantiate);
+    /*
+     * Before the machine starts, so the vCPU thread sees it before its
+     * first block.  INT32_MAX is the threshold no counter reaches.
+     */
+    if (!nms->wasm_jit) {
+        wasm_set_instantiate_num(INT32_MAX);
+    } else if (nms->wasm_instantiate > 0) {
+        wasm_set_instantiate_num(MIN(nms->wasm_instantiate, INT32_MAX - 1));
     }
 #endif
 
