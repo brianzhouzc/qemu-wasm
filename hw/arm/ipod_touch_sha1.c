@@ -1,5 +1,6 @@
 #include "hw/arm/ipod_touch_sha1.h"
 #include "qemu/log.h"
+#include "migration/vmstate.h"
 
 /* getenv() on the digest read path is measurable under TCI (Q18). */
 static bool sha1_trace_on(void)
@@ -7,15 +8,6 @@ static bool sha1_trace_on(void)
     static int on = -1;
     if (on < 0) {
         on = getenv("SHA1TRACE") != NULL;
-    }
-    return on;
-}
-
-static bool sha1_zero_on(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        on = getenv("SHA1_ZERO") != NULL;
     }
     return on;
 }
@@ -124,6 +116,10 @@ static void ipod_sha1_update(IPodTouchSHA1Ctx *ctx, const void *data, size_t len
  */
 static void sha1_feed(IPodTouchSHA1State *s, const void *data, size_t len)
 {
+    if (s->ctx.bytes == 0) {
+        memset(s->head, 0, sizeof(s->head));
+        memcpy(s->head, data, MIN(len, sizeof(s->head)));
+    }
     ipod_sha1_update(&s->ctx, data, len);
     s->hash_computed = false;
 }
@@ -133,11 +129,6 @@ static void flush_hw_buffer(IPodTouchSHA1State *s) {
 
     memcpy(block, s->hw_buffer, sizeof(block));
     sha1_feed(s, block, sizeof(block));
-
-    if (s->buffer_ind + 0x40 <= SHA1_BUFFER_SIZE) {
-        memcpy(s->buffer + s->buffer_ind, block, sizeof(block));
-        s->buffer_ind += 0x40;
-    }
     memset(s->hw_buffer, 0, 0x40);
     s->hw_buffer_dirty = false;
 }
@@ -148,9 +139,8 @@ static void sha1_reset(IPodTouchSHA1State *s)
 	s->memory_start = 0;
 	s->memory_mode = 0;
 	s->insize = 0;
-	memset(&s->buffer, 0, SHA1_BUFFER_SIZE);
 	memset(&s->hw_buffer, 0, 0x10 * sizeof(uint32_t));
-	s->buffer_ind = 0;
+	memset(&s->head, 0, sizeof(s->head));
 	memset(&s->hashout, 0, 0x14);
 	s->hw_buffer_dirty = false;
 	s->hash_computed = false;
@@ -160,8 +150,6 @@ static void sha1_reset(IPodTouchSHA1State *s)
 static uint64_t ipod_touch_sha1_read(void *opaque, hwaddr offset, unsigned size)
 {
 	IPodTouchSHA1State *s = (IPodTouchSHA1State *)opaque;
-
-    //fprintf(stderr, "%s: offset 0x%08x\n", __FUNCTION__, offset);
 
 	switch(offset) {
 		case SHA_CONFIG:
@@ -184,7 +172,6 @@ static uint64_t ipod_touch_sha1_read(void *opaque, hwaddr offset, unsigned size)
 				              size, (unsigned)offset);
 				return 0;
 			}
-			//fprintf(stderr, "Hash out %08x\n",  *(uint32_t *)&s->hashout[offset - 0x20]);
             if(!s->hash_computed) {
                 int i;
 
@@ -205,16 +192,11 @@ static uint64_t ipod_touch_sha1_read(void *opaque, hwaddr offset, unsigned size)
                 s->hash_computed = true;
 
                 /*
-                 * SHA1TRACE=1: what is the firmware actually hashing?
-                 *
-                 * This matters because with this engine wired the firmware
-                 * rejects the iTunesDB outright (0 songs), and there are two
-                 * very different reasons that could happen: the database really
-                 * fails a signature check, or THIS MODEL returns the wrong
-                 * digest and nothing could ever match. Printing the number of
-                 * bytes fed, the head of the data and the digest says which of
-                 * the two is happening, and whether the input is even the
-                 * database (an mhbd magic would be unmistakable).
+                 * SHA1TRACE=1: what the firmware hashes, for the first dozen
+                 * digests.  The byte count, the head of the message and the
+                 * digest are enough to tell the hash58 seed and the iTunesDB
+                 * HMAC apart (an mhbd magic is unmistakable) and to compare a
+                 * digest with libgpod's.
                  */
                 if (sha1_trace_on()) {
                     static int n;
@@ -226,12 +208,12 @@ static uint64_t ipod_touch_sha1_read(void *opaque, hwaddr offset, unsigned size)
                                 s->memory_start, s->insize);
                         fprintf(stderr, "  head: %02x %02x %02x %02x %02x %02x %02x %02x"
                                 "   '%c%c%c%c'\n",
-                                s->buffer[0], s->buffer[1], s->buffer[2], s->buffer[3],
-                                s->buffer[4], s->buffer[5], s->buffer[6], s->buffer[7],
-                                isprint(s->buffer[0]) ? s->buffer[0] : '.',
-                                isprint(s->buffer[1]) ? s->buffer[1] : '.',
-                                isprint(s->buffer[2]) ? s->buffer[2] : '.',
-                                isprint(s->buffer[3]) ? s->buffer[3] : '.');
+                                s->head[0], s->head[1], s->head[2], s->head[3],
+                                s->head[4], s->head[5], s->head[6], s->head[7],
+                                isprint(s->head[0]) ? s->head[0] : '.',
+                                isprint(s->head[1]) ? s->head[1] : '.',
+                                isprint(s->head[2]) ? s->head[2] : '.',
+                                isprint(s->head[3]) ? s->head[3] : '.');
                         fprintf(stderr, "  digest:");
                         for (int j = 0; j < 20; j++) {
                             fprintf(stderr, "%02x", s->hashout[j]);
@@ -241,23 +223,6 @@ static uint64_t ipod_touch_sha1_read(void *opaque, hwaddr offset, unsigned size)
                 }
             }
 
-			/*
-			 * SHA1_ZERO=1: keep the device, but answer the digest as the
-			 * unimplemented stub used to -- all zeros.
-			 *
-			 * This is the discriminator for the one difference left between the
-			 * two configurations. With SHA1_OFF the library loads and playback
-			 * starts; with the engine wired the boot is clean but the library is
-			 * empty. Both now back the whole 1 MB window, so the only thing that
-			 * still differs is what these registers answer. If zeroing just the
-			 * digest brings the library back, the firmware is acting on the
-			 * VALUE -- it compares it against something -- and the empty library
-			 * is a verdict, not a side effect. If it does not, the difference is
-			 * in another register and the digest is a red herring.
-			 */
-			if (sha1_zero_on()) {
-				return 0;
-			}
 			return *(uint32_t *)&s->hashout[offset - 0x20];
 	}
 
@@ -267,8 +232,6 @@ static uint64_t ipod_touch_sha1_read(void *opaque, hwaddr offset, unsigned size)
 static void ipod_touch_sha1_write(void *opaque, hwaddr offset, uint64_t value, unsigned size)
 {
     IPodTouchSHA1State *s = (IPodTouchSHA1State *)opaque;
-
-    //fprintf(stderr, "%s: offset 0x%08x value 0x%08x\n", __FUNCTION__, offset, value);
 
 	switch(offset) {
 		case SHA_CONFIG:
@@ -289,10 +252,6 @@ static void ipod_touch_sha1_write(void *opaque, hwaddr offset, uint64_t value, u
 						uint8_t block[0x40];
 						cpu_physical_memory_read(s->memory_start + i * 0x40, block, 0x40);
 						sha1_feed(s, block, 0x40);
-						if (s->buffer_ind + 0x40 <= SHA1_BUFFER_SIZE) {
-							memcpy(s->buffer + s->buffer_ind, block, 0x40);
-							s->buffer_ind += 0x40;
-						}
 					}
 				}
 			} else {
@@ -309,7 +268,7 @@ static void ipod_touch_sha1_write(void *opaque, hwaddr offset, uint64_t value, u
 			s->memory_mode = value;
 			break;
 		case SHA_INSIZE:
-            if (value > SHA1_BUFFER_SIZE) {
+            if (value > SHA1_INSIZE_MAX) {
                 /* An assert would let the guest abort QEMU; refuse instead (Q2). */
                 qemu_log_mask(LOG_GUEST_ERROR,
                               "sha1: insize 0x%" PRIx64 " is over the buffer\n",
@@ -335,11 +294,19 @@ static void ipod_touch_sha1_write(void *opaque, hwaddr offset, uint64_t value, u
 				s->hash_computed = false;
 			}
 			break;
-		case 0x40 ... 0x7c:
-            // write to the hardware buffer
-            s->hw_buffer[(offset - 0x40) / 4] |= value;
+		case 0x40 ... 0x7f: {
+            /*
+             * Write to the hardware buffer.  Byte and halfword stores land at
+             * their own lane of the word (see sha1_ops), not in its low byte.
+             */
+            unsigned shift = (offset & 3) * 8;
+            uint64_t mask = size >= 4 ? 0xffffffffu : (1u << (size * 8)) - 1;
+
+            s->hw_buffer[(offset - 0x40) / 4] |= (uint32_t)((value & mask)
+                                                            << shift);
             s->hw_buffer_dirty = true;
 			break;
+		}
 	}
 }
 
@@ -366,9 +333,44 @@ static void ipod_touch_sha1_init(Object *obj)
     sha1_reset(s);
 }
 
+static void ipod_touch_sha1_reset(DeviceState *dev)
+{
+    sha1_reset(IPOD_TOUCH_SHA1(dev));
+}
+
+/*
+ * The firmware hashes in several CONFIG kicks (the IV words, the key, the
+ * database in chunks, the padded final block), so a snapshot can fall in the
+ * middle of one: the running context goes with it, or the digest after a
+ * restore is wrong and the library reads as empty.
+ */
+static const VMStateDescription vmstate_ipod_touch_sha1 = {
+    .name = "ipodtouch.sha1",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT32(config, IPodTouchSHA1State),
+        VMSTATE_UINT32(memory_start, IPodTouchSHA1State),
+        VMSTATE_UINT32(memory_mode, IPodTouchSHA1State),
+        VMSTATE_UINT32(insize, IPodTouchSHA1State),
+        VMSTATE_UINT32_ARRAY(hw_buffer, IPodTouchSHA1State, 0x10),
+        VMSTATE_UINT8_ARRAY(head, IPodTouchSHA1State, 8),
+        VMSTATE_UINT8_ARRAY(hashout, IPodTouchSHA1State, 0x14),
+        VMSTATE_BOOL(hw_buffer_dirty, IPodTouchSHA1State),
+        VMSTATE_BOOL(hash_computed, IPodTouchSHA1State),
+        VMSTATE_UINT32_ARRAY(ctx.h, IPodTouchSHA1State, 5),
+        VMSTATE_UINT64(ctx.bytes, IPodTouchSHA1State),
+        VMSTATE_UINT8_ARRAY(ctx.block, IPodTouchSHA1State, 64),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void ipod_touch_sha1_class_init(ObjectClass *klass, void *data)
 {
+    DeviceClass *dc = DEVICE_CLASS(klass);
 
+    dc->reset = ipod_touch_sha1_reset;
+    dc->vmsd = &vmstate_ipod_touch_sha1;
 }
 
 static const TypeInfo ipod_touch_sha1_info = {

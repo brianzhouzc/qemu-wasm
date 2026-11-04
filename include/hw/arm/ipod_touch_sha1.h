@@ -21,7 +21,8 @@ typedef struct IPodTouchSHA1Ctx {
 #define TYPE_IPOD_TOUCH_SHA1                "ipodtouch.sha1"
 OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchSHA1State, IPOD_TOUCH_SHA1)
 
-#define SHA1_BUFFER_SIZE 1024 * 1024 * 5
+/* The most one memory-mode request may hash (Q2). */
+#define SHA1_INSIZE_MAX (5 * 1024 * 1024)
 
 #define SHA_CONFIG         0x0
 #define SHA_RESET          0x4
@@ -36,9 +37,8 @@ typedef struct IPodTouchSHA1State {
     uint32_t memory_start;
     uint32_t memory_mode;
     uint32_t insize;
-    uint8_t buffer[SHA1_BUFFER_SIZE];
     uint32_t hw_buffer[0x10]; // hardware buffer
-    uint32_t buffer_ind;
+    uint8_t head[8];          // the message's first bytes, for SHA1TRACE
     uint8_t hashout[0x14];
     bool hw_buffer_dirty;
     bool hash_computed;

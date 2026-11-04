@@ -1600,54 +1600,35 @@ static void ipod_classic_machine_init(MachineState *machine)
     memory_region_add_subregion(sysmem, EIC_MEM_BASE, sysalv_mr);
 
     /*
-     * SM1 (0x38500000): the audio decoder engine, where stock firmware sends
-     * MP3 and AAC.  Rockbox never touches it.  See ipod_classic_sm1.c.  Full
-     * 1 MB window, so every offset it does not use still reads 0.
-     */
-    /*
      * The SHA-1 accelerator (0x38000000).
      *
      * It was an unimplemented zero window, and the retailOS uses it: measured
      * live it writes the config at +0x00, arms memory mode at +0x80, sets the
      * input size at +0x8c and then reads the digest words back from +0x20..+0x34
-     * -- and got zeros for the digest every time. A hash that never matches is
-     * how the firmware ends up in its own panic path (0x08021bec, which prints
-     * "CPU_exception_handler" through semihosting and then software-resets at
-     * 0x08322b10), which is the ~46 s reboot that has made every measurement in
-     * this project noisy and stops playback before it can start.
+     * -- and got zeros for the digest every time. On the older retailOS this
+     * was first measured on, a hash that never matched ended in its panic
+     * path and a software reset about 46 s into every run.
      *
      * The S5L8720 block modelled in hw/arm/ipod_touch_sha1.c has exactly the
      * register map this guest drives (SHA_CONFIG 0x0, SHA_MEMORY_MODE 0x80,
      * SHA_INSIZE 0x8c, digest at 0x20..0x34), so the same device serves the
      * S5L8702. Reused rather than re-written.
-     */
-    /*
-     * SHA1_OFF=1 leaves the block as the zero window it used to be. Kept as a
-     * switch because turning the engine on changes what the firmware can
-     * verify: with it the panic-reset stops, and a disk whose iTunesDB is
-     * signed with the real hash58 (libgpod's HMAC-SHA1 over the file) loads,
-     * while a zeroed signature is rejected outright ("0 songs") instead of
-     * being accepted by a check that could never fail. Being able to A/B the
-     * two on the same image is what tells those apart.
-     */
-    /*
-     * The 1 MB window is backed EITHER WAY, and the engine sits on top of it.
      *
-     * It used to be one or the other: with SHA1_OFF the whole megabyte was a
-     * stub, and with the engine wired only its 0x100 bytes of registers were
-     * mapped, leaving 0x38000100..0x380fffff unassigned. So the switch changed
-     * far more than whether digests were real -- every access to the rest of
-     * the block behaved differently -- and that is not a difference any A/B
-     * comparison between the two should be carrying.
+     * The 1 MB window is backed, and the engine's 0x100 bytes of registers
+     * sit on top of it, so the rest of the block reads as it did before the
+     * engine was wired.
      */
     create_unimplemented_device("s5l8702.sha1", SHA1_MEM_BASE, 0x100000);
-    if (!getenv("SHA1_OFF")) {
-        dev = qdev_new("ipodtouch.sha1");
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-        memory_region_add_subregion_overlap(sysmem, SHA1_MEM_BASE,
-                                            &IPOD_TOUCH_SHA1(dev)->iomem, 1);
-    }
+    dev = qdev_new("ipodtouch.sha1");
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    memory_region_add_subregion_overlap(sysmem, SHA1_MEM_BASE,
+                                        &IPOD_TOUCH_SHA1(dev)->iomem, 1);
 
+    /*
+     * SM1 (0x38500000): the audio decoder engine, where stock firmware sends
+     * MP3 and AAC.  Rockbox never touches it.  See ipod_classic_sm1.c.  Full
+     * 1 MB window, so every offset it does not use still reads 0.
+     */
     dev = qdev_new(TYPE_IPOD_CLASSIC_SM1);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SM1_MEM_BASE);
