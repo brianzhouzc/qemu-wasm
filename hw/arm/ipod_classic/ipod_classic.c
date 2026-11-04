@@ -234,29 +234,6 @@ static void ipod_classic_memory_setup(MachineState *machine,
     iram0 = allocate_ram(sysmem, "iram0", IRAM0_MEM_BASE, IRAM0_MEM_SIZE);
     allocate_ram(sysmem, "iram1", IRAM1_MEM_BASE, IRAM1_MEM_SIZE);
 
-    /*
-     * IRAMSPILL=N: RAM immediately above IRAM1, for MEASUREMENT ONLY.
-     *
-     * The render's halfword copy at 0x08016f08 walks its destination straight
-     * off the top of IRAM1 -- caught at the data-abort vector with
-     * r2 = 0x22040a16, i.e. 0xa16 past the end -- and that single abort is what
-     * becomes CPU_exception_handler and the software reset that cuts playback
-     * short. Whether the ring it is filling is bigger than 128 KB on real
-     * hardware, or the pointer should have wrapped and did not, is UNDETERMINED.
-     * Backing the region lets the run continue so the overrun can be measured:
-     * where the writes actually stop says how big the firmware believes the ring
-     * is. It is not a fix and must not be left on.
-     */
-    if (getenv("IRAMSPILL")) {
-        unsigned long n = strtoul(getenv("IRAMSPILL"), NULL, 0);
-        if (n) {
-            allocate_ram(sysmem, "iram-spill",
-                         IRAM1_MEM_BASE + IRAM1_MEM_SIZE, (uint32_t)n);
-            fprintf(stderr, "IRAMSPILL: %lu bytes mapped above IRAM1 "
-                            "(measurement aid, not a fix)\n", n);
-        }
-    }
-
     allocate_ram(sysmem, "edgeic", EDGEIC_MEM_BASE, EDGEIC_MEM_SIZE);
 
     nms->reset_pc = SDRAM_MEM_BASE;
