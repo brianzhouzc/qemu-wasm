@@ -67,13 +67,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicClkState, IPOD_CLASSIC_CLK)
 #define S5L8702_RSTSR_WDR  (1u << 2)   /* watchdog */
 
 /*
- * The value Apple's retailOS writes to SWRCON when it gives up and asks for a
- * reboot: 0x08322b10 does "WDTCON = 0; SWRCON = 0xaa5" and then spins. Rockbox
- * never writes SWRCON, so 0xaa5 is not documented anywhere; it is taken from
- * the firmware itself. Treated as "any non-zero write resets", with the exact
- * value only used to decide how loudly to complain.
+ * SWRCON: any non-zero write resets the machine.  The older retailOS's reboot
+ * did "WDTCON = 0; SWRCON = 0xaa5" and spun; Rockbox never writes it.
  */
-#define S5L8702_SWRCON_RESET   0xaa5
 
 struct IPodClassicClkState {
     SysBusDevice parent_obj;

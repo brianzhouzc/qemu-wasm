@@ -1,11 +1,11 @@
 /*
  * Apple iPod classic (6th generation), Samsung S5L8702 SoC.
  *
- * Milestone H1: CPU, RAM and the interrupt controllers, plus a -kernel style
- * boot path so a raw image (a Rockbox build, for now) can be dropped straight
- * into SDRAM without going through a bootrom we do not have. Every peripheral
- * that is not modelled yet is registered as an unimplemented device so that
- * -d unimp tells us exactly what the guest reaches for next.
+ * CPU, RAM, the interrupt controllers and the peripherals both firmwares
+ * use, with a -kernel style boot path so a raw image (Apple's retailOS or
+ * Rockbox) can be dropped straight into SDRAM without going through a bootrom
+ * we do not have. Every peripheral that is not modelled is registered as an
+ * unimplemented device so that -d unimp tells us what the guest reaches for.
  *
  * See wiki/02-s5l8702-hardware.md for where the addresses come from and
  * wiki/04-roadmap.md for what comes next.
@@ -1030,7 +1030,8 @@ static void ipod_heartbeat_start(int ms)
  * bottom half runs on QEMU's main-loop thread with the BQL, stops the VM,
  * writes or reads the whole VM state in one file in the Emscripten FS, and
  * starts the VM again. ipod_snapshot_status() lets the page poll:
- *   0 idle, 1 working, 2 finished, 3 failed.
+ *   0 idle, 1 working, 2 finished, 3 failed, 4 saved and paused: the page
+ *   reads the disk, then calls ipod_snapshot_resume().
  */
 static QEMUBH *ipod_snapshot_bh;
 static QEMUTimer *ipod_snapshot_timer;
@@ -1387,8 +1388,7 @@ static void ipod_classic_machine_init(MachineState *machine)
      * The CS42L55 audio codec, also on I2C0, at 7-bit 0x4A. The retailOS talks
      * to it when it brings up or starts the audio engine (osos cscodec_write at
      * 0x0808e1ac, and set_freq's cscodec_write(5, code)); while it did not exist
-     * every write was NACKed and every read returned bus garbage, which is a
-     * candidate for why selecting a song never engages playback. See
+     * every write was NACKed and every read returned bus garbage.  See
      * ipod_classic_cs42l55.c and wiki/14.
      */
     i2c_slave_create_simple(nms->i2c0->bus, TYPE_IPOD_CLASSIC_CS42L55,

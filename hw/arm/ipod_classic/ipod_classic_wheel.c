@@ -498,9 +498,10 @@ static void wheel_key_event(void *opaque, int keycode)
     uint32_t bit;
 
     /*
-     * Before the overlay's tee: this press goes nowhere, and no wasm_press_mask
-     * or pending step means nobody acknowledges it either, so a script's
-     * press() says the guest never took it, which is true.
+     * Cut off (hold on, and the firmware has acted on it): this press goes
+     * nowhere, and no wasm_press_mask or pending step means nobody
+     * acknowledges it either, so a script's press() says the guest never
+     * took it, which is true.
      */
     if (wheel_cut_off(s)) {
         return;
@@ -1019,7 +1020,7 @@ static const VMStateDescription vmstate_ipod_classic_wheel = {
 #ifdef EMSCRIPTEN
     /*
      * The browser-only fields are a wasm-only subsection (T1): sending them
-     * from the main description keeps native and wasm version-3 streams
+     * from the main description keeps native and wasm streams of one version
      * compatible, and a cross load fails on an unknown subsection instead of
      * misparsing.
      */
