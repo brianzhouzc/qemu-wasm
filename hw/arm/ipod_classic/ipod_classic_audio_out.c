@@ -46,9 +46,11 @@ static struct {
 
 /*
  * In samples, not frames: DMA may stop on an odd one, and the pair is only
- * published once its other half has arrived.
+ * published once its other half has arrived.  64 bits, so that the frame
+ * count published from it wraps at 2^32 like the reader's: a 32-bit sample
+ * count made it jump from 0x7fffffff to 0 after 13.5 hours at 44.1 kHz.
  */
-static uint32_t out_samples;
+static uint64_t out_samples;
 
 void ipod_classic_audio_out_write(const void *samples, size_t bytes)
 {
@@ -64,7 +66,7 @@ void ipod_classic_audio_out_write(const void *samples, size_t bytes)
         from += n * 2;
         left -= n;
     }
-    qatomic_store_release(&out.write, out_samples / 2);
+    qatomic_store_release(&out.write, (uint32_t)(out_samples / 2));
 }
 
 void ipod_classic_audio_out_set_rate(uint32_t hz)
@@ -90,8 +92,8 @@ void ipod_classic_audio_out_set_gain(uint32_t left, uint32_t right)
 void ipod_classic_audio_out_flush(void)
 {
     /* Line the next frame up with the left channel again. */
-    out_samples = (out_samples + 1) & ~1u;
-    qatomic_store_release(&out.write, out_samples / 2);
+    out_samples = (out_samples + 1) & ~(uint64_t)1;
+    qatomic_store_release(&out.write, (uint32_t)(out_samples / 2));
     qatomic_store_release(&out.epoch, qatomic_read(&out.epoch) + 1);
 }
 

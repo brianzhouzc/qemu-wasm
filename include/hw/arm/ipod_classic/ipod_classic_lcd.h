@@ -127,18 +127,6 @@ struct IPodClassicLCDState {
 
     uint32_t con_reg;
     uint32_t intcon;
-    /*
-     * FRAME-DONE INTERRUPT (LCD_FRAME_IRQ=1).
-     *
-     * The block has an interrupt line, wired to S5L8702_LCD_IRQ in the machine,
-     * and an INTCON at +0x18 that the model stores and never acts on -- so the
-     * line has never been raised once. MEASURED symptom: entering Now Playing
-     * starts the album-art animation and it freezes on its first frame, with
-     * the CPU asleep in the idle WFI rather than spinning. An animation that
-     * stops with the machine idle is waiting for something that never arrives.
-     */
-    QEMUTimer *irq_off;
-    bool irq_pending;
     uint32_t phtime;
     uint32_t rst_time;
     uint32_t drv_rst;
@@ -180,7 +168,6 @@ struct IPodClassicLCDState {
 
     /* Counters, for the trace only. */
     uint64_t pixels_this_frame;
-    uint64_t composed_frames;
 
     /*
      * The panel comes up on the firmware's boot screen instead of black.  Set

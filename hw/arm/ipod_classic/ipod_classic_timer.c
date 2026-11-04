@@ -505,11 +505,11 @@ static void ipod_classic_timer_write(void *opaque, hwaddr offset,
          * does. Writes of DATA0 and of PRE still reload; see the note in
          * chan_reload().
          *
-         * The retailOS does not notice either way: the only timer it uses is
-         * E, free-running at 1 MHz, set up at 0x08324e48 and read at
-         * 0x08324e38, and E is 32-bit so its status never lived in CON. The
-         * three navtest.sh runs across this change give the same pixel counts.
-         * Who collects is Rockbox and the bare-metal tests. See wiki/11 s.19.2.
+         * When this changed, the retailOS it was measured on used only timer
+         * E, 32-bit and free-running at 1 MHz, so its status never lived in
+         * CON, and three navtest.sh runs gave the same pixel counts.  2.0.5
+         * also programs timer B (see chan_is_host_tick()).  Who collects is
+         * Rockbox and the bare-metal tests. See wiki/11 s.19.2.
          */
         if (new_cfg != old_cfg) {
             chan_reload(c);

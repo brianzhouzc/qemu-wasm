@@ -77,7 +77,9 @@ jobs:
           cache-to: type=gha,mode=max,scope=buildqemu
 
       # As build.sh: the source goes into the container without .git, and the
-      # build id header is written at the source root.
+      # build id header is written at the source root.  ENV is exported so the
+      # harness's `env` option can set the model's trace variables: getenv()
+      # reads Emscripten's own ENV object, which is private otherwise.
       - name: Build qemu-system-arm
         env:
           COMMIT: ${{ steps.src.outputs.commit }}
@@ -94,7 +96,7 @@ jobs:
           emconfigure /qemu/configure --static --target-list=arm-softmmu --cpu=wasm32 --cross-prefix= \
             --without-default-features --enable-system --with-coroutine=fiber \
             --extra-cflags="$EXTRA_CFLAGS" --extra-cxxflags="$EXTRA_CFLAGS" \
-            --extra-ldflags="-sEXPORTED_RUNTIME_METHODS=getTempRet0,setTempRet0,addFunction,removeFunction,FS,ccall -sMODULARIZE=1 -sEXPORT_NAME=createQEMU"
+            --extra-ldflags="-sEXPORTED_RUNTIME_METHODS=getTempRet0,setTempRet0,addFunction,removeFunction,FS,ccall,ENV -sMODULARIZE=1 -sEXPORT_NAME=createQEMU"
           emmake make -j$(nproc) qemu-system-arm
           '
           docker exec build ls -l /build | grep qemu-system-arm

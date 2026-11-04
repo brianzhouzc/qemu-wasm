@@ -36,7 +36,6 @@
 #include "migration/vmstate.h"
 #include "ui/console.h"
 #include "hw/arm/ipod_classic/ipod_classic_wheel.h"
-#include "hw/arm/ipod_classic/ipod_classic_np_overlay.h"
 /* ipod_classic_wake_vcpu() / ipod_classic_input_wake(): see the machine header. */
 #include "hw/arm/ipod_classic/ipod_classic.h"
 
@@ -499,9 +498,10 @@ static void wheel_key_event(void *opaque, int keycode)
     uint32_t bit;
 
     /*
-     * Before the overlay's tee: this press goes nowhere, and no wasm_press_mask
-     * or pending step means nobody acknowledges it either, so a script's
-     * press() says the guest never took it, which is true.
+     * Cut off (hold on, and the firmware has acted on it): this press goes
+     * nowhere, and no wasm_press_mask or pending step means nobody
+     * acknowledges it either, so a script's press() says the guest never
+     * took it, which is true.
      */
     if (wheel_cut_off(s)) {
         return;
@@ -512,14 +512,6 @@ static void wheel_key_event(void *opaque, int keycode)
         fprintf(stderr, "WHEELTRACE key 0x%02x\n", keycode);
         key_traced = true;
     }
-
-    /*
-     * Tee every keycode to the HLE Now Playing overlay's control handler first
-     * (play/pause, prev/next, seek, show/hide). No-op unless HLE_NP_OVERLAY is
-     * set; the key still flows to the guest below, so navtest/Rockbox and the
-     * default build are unaffected.
-     */
-    ipod_classic_np_overlay_key(keycode);
 
     switch (keycode & 0x7f) {
     case KEY_ENTER: bit = S5L8702_WHEEL_BTN_SELECT; break;
@@ -839,21 +831,15 @@ static void wasm_key_bh_fn(void *opaque)
          * guest did not even see (icount frozen for the whole 8 s wait).  The
          * input itself has to be the wake source.
          *
-         * While the machine is powered off this is the power button.  op 2 is a
-         * raw key event (press or release) and takes the same path as the
-         * native keyboard handler, so a release cannot power the machine on and
-         * the release of a dropped power-on press is dropped as well.  op 1 is
-         * a synthesized press whose release the model generates itself, so it
+         * While the machine is powered off this is the power button.  A press
+         * is synthesized, and the model generates its release itself, so it
          * only needs the wake.
          */
-        if (op == 2 ? ipod_classic_power_key_event(arg)
-                    : ipod_classic_input_wake()) {
+        if (ipod_classic_input_wake()) {
             tail++;
             continue;
         }
-        if (op == 2) {
-            wheel_key_event(s, arg);
-        } else if (op == 1) {
+        if (op == 1) {
             wasm_key_do_press(s, arg, hold);
         }
         tail++;
@@ -895,12 +881,6 @@ EMSCRIPTEN_KEEPALIVE int ipod_wasm_key_ack(void)
 {
     return wasm_wheel_state ?
         (int)qatomic_read(&wasm_wheel_state->wasm_consumed) : 0;
-}
-
-EMSCRIPTEN_KEEPALIVE void ipod_wasm_key(int keycode)
-{
-    /* Raw press/release event; queued like any other browser key (Q11). */
-    wasm_key_queue(2, keycode, 0);
 }
 
 /*
@@ -1028,7 +1008,7 @@ static const VMStateDescription vmstate_ipod_classic_wheel = {
 #ifdef EMSCRIPTEN
     /*
      * The browser-only fields are a wasm-only subsection (T1): sending them
-     * from the main description keeps native and wasm version-3 streams
+     * from the main description keeps native and wasm streams of one version
      * compatible, and a cross load fails on an unknown subsection instead of
      * misparsing.
      */

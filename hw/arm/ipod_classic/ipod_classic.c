@@ -1,11 +1,11 @@
 /*
  * Apple iPod classic (6th generation), Samsung S5L8702 SoC.
  *
- * Milestone H1: CPU, RAM and the interrupt controllers, plus a -kernel style
- * boot path so a raw image (a Rockbox build, for now) can be dropped straight
- * into SDRAM without going through a bootrom we do not have. Every peripheral
- * that is not modelled yet is registered as an unimplemented device so that
- * -d unimp tells us exactly what the guest reaches for next.
+ * CPU, RAM, the interrupt controllers and the peripherals both firmwares
+ * use, with a -kernel style boot path so a raw image (Apple's retailOS or
+ * Rockbox) can be dropped straight into SDRAM without going through a bootrom
+ * we do not have. Every peripheral that is not modelled is registered as an
+ * unimplemented device so that -d unimp tells us what the guest reaches for.
  *
  * See wiki/02-s5l8702-hardware.md for where the addresses come from and
  * wiki/04-roadmap.md for what comes next.
@@ -28,9 +28,6 @@
 #include "hw/dma/pl080.h"
 #include "hw/arm/ipod_classic/ipod_classic.h"
 #include "hw/arm/ipod_classic/ipod_classic_cs42l55.h"
-#include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
-#include "hw/arm/ipod_classic/ipod_classic_hle_np.h"
-#include "hw/arm/ipod_classic/ipod_classic_np_overlay.h"
 #include "hw/arm/ipod_classic/ipod_classic_timer.h"
 /* The S5L8720's SHA-1 block; the S5L8702 drives the same register map. */
 #include "hw/arm/ipod_touch_sha1.h"
@@ -236,29 +233,6 @@ static void ipod_classic_memory_setup(MachineState *machine,
 
     iram0 = allocate_ram(sysmem, "iram0", IRAM0_MEM_BASE, IRAM0_MEM_SIZE);
     allocate_ram(sysmem, "iram1", IRAM1_MEM_BASE, IRAM1_MEM_SIZE);
-
-    /*
-     * IRAMSPILL=N: RAM immediately above IRAM1, for MEASUREMENT ONLY.
-     *
-     * The render's halfword copy at 0x08016f08 walks its destination straight
-     * off the top of IRAM1 -- caught at the data-abort vector with
-     * r2 = 0x22040a16, i.e. 0xa16 past the end -- and that single abort is what
-     * becomes CPU_exception_handler and the software reset that cuts playback
-     * short. Whether the ring it is filling is bigger than 128 KB on real
-     * hardware, or the pointer should have wrapped and did not, is UNDETERMINED.
-     * Backing the region lets the run continue so the overrun can be measured:
-     * where the writes actually stop says how big the firmware believes the ring
-     * is. It is not a fix and must not be left on.
-     */
-    if (getenv("IRAMSPILL")) {
-        unsigned long n = strtoul(getenv("IRAMSPILL"), NULL, 0);
-        if (n) {
-            allocate_ram(sysmem, "iram-spill",
-                         IRAM1_MEM_BASE + IRAM1_MEM_SIZE, (uint32_t)n);
-            fprintf(stderr, "IRAMSPILL: %lu bytes mapped above IRAM1 "
-                            "(measurement aid, not a fix)\n", n);
-        }
-    }
 
     allocate_ram(sysmem, "edgeic", EDGEIC_MEM_BASE, EDGEIC_MEM_SIZE);
 
@@ -1056,11 +1030,14 @@ static void ipod_heartbeat_start(int ms)
  * bottom half runs on QEMU's main-loop thread with the BQL, stops the VM,
  * writes or reads the whole VM state in one file in the Emscripten FS, and
  * starts the VM again. ipod_snapshot_status() lets the page poll:
- *   0 idle, 1 working, 2 finished, 3 failed.
+ *   0 idle, 1 working, 2 finished, 3 failed, 4 saved and paused: the page
+ *   reads the disk, then calls ipod_snapshot_resume().
  */
 static QEMUBH *ipod_snapshot_bh;
 static QEMUTimer *ipod_snapshot_timer;
+static QEMUTimer *ipod_snapshot_retry;
 static int64_t ipod_snapshot_deadline;
+static int64_t ipod_snapshot_wait_until;
 static int ipod_snapshot_op;            /* 1 save, 2 load */
 static bool ipod_snapshot_was_running;  /* state 4: paused until resume */
 static bool ipod_snapshot_resume_pending;
@@ -1212,6 +1189,28 @@ static void ipod_snapshot_bh_fn(void *opaque)
                   qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 50);
         return;
     }
+    /*
+     * Not between an ATA command and its go bit.  The IDE core hands over the
+     * DMA callback with the command, the go bit runs it a few guest
+     * instructions later, and a pointer cannot be saved: a state saved in
+     * between restores a disk that never answers, every time it is loaded.
+     * So let the guest run on and try again; after a second, save anyway.
+     */
+    if (ipod_machine && ipod_machine->ata &&
+        ipod_classic_ata_dma_armed(ipod_machine->ata)) {
+        int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+
+        if (!ipod_snapshot_wait_until) {
+            ipod_snapshot_wait_until = now + 1000;
+        }
+        if (now < ipod_snapshot_wait_until) {
+            timer_mod(ipod_snapshot_retry, now + 1);
+            return;
+        }
+        warn_report("snapshot: saving with an ATA transfer set up but not "
+                    "started; a restore will lose it");
+    }
+    ipod_snapshot_wait_until = 0;
     was_running = runstate_is_running();
     ipod_snapshot_was_running = was_running;
     global_state_store();
@@ -1302,6 +1301,8 @@ static void ipod_classic_machine_init(MachineState *machine)
     ipod_snapshot_bh = qemu_bh_new(ipod_snapshot_bh_fn, NULL);
     ipod_snapshot_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
                                        ipod_snapshot_poll, NULL);
+    ipod_snapshot_retry = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                       ipod_snapshot_bh_fn, NULL);
 #endif
 #if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
     if (nms->wasm_instantiate > 0) {
@@ -1387,8 +1388,7 @@ static void ipod_classic_machine_init(MachineState *machine)
      * The CS42L55 audio codec, also on I2C0, at 7-bit 0x4A. The retailOS talks
      * to it when it brings up or starts the audio engine (osos cscodec_write at
      * 0x0808e1ac, and set_freq's cscodec_write(5, code)); while it did not exist
-     * every write was NACKed and every read returned bus garbage, which is a
-     * candidate for why selecting a song never engages playback. See
+     * every write was NACKed and every read returned bus garbage.  See
      * ipod_classic_cs42l55.c and wiki/14.
      */
     i2c_slave_create_simple(nms->i2c0->bus, TYPE_IPOD_CLASSIC_CS42L55,
@@ -1600,54 +1600,35 @@ static void ipod_classic_machine_init(MachineState *machine)
     memory_region_add_subregion(sysmem, EIC_MEM_BASE, sysalv_mr);
 
     /*
-     * SM1 (0x38500000): the audio decoder engine, where stock firmware sends
-     * MP3 and AAC.  Rockbox never touches it.  See ipod_classic_sm1.c.  Full
-     * 1 MB window, so every offset it does not use still reads 0.
-     */
-    /*
      * The SHA-1 accelerator (0x38000000).
      *
      * It was an unimplemented zero window, and the retailOS uses it: measured
      * live it writes the config at +0x00, arms memory mode at +0x80, sets the
      * input size at +0x8c and then reads the digest words back from +0x20..+0x34
-     * -- and got zeros for the digest every time. A hash that never matches is
-     * how the firmware ends up in its own panic path (0x08021bec, which prints
-     * "CPU_exception_handler" through semihosting and then software-resets at
-     * 0x08322b10), which is the ~46 s reboot that has made every measurement in
-     * this project noisy and stops playback before it can start.
+     * -- and got zeros for the digest every time. On the older retailOS this
+     * was first measured on, a hash that never matched ended in its panic
+     * path and a software reset about 46 s into every run.
      *
      * The S5L8720 block modelled in hw/arm/ipod_touch_sha1.c has exactly the
      * register map this guest drives (SHA_CONFIG 0x0, SHA_MEMORY_MODE 0x80,
      * SHA_INSIZE 0x8c, digest at 0x20..0x34), so the same device serves the
      * S5L8702. Reused rather than re-written.
-     */
-    /*
-     * SHA1_OFF=1 leaves the block as the zero window it used to be. Kept as a
-     * switch because turning the engine on changes what the firmware can
-     * verify: with it the panic-reset stops, and a disk whose iTunesDB is
-     * signed with the real hash58 (libgpod's HMAC-SHA1 over the file) loads,
-     * while a zeroed signature is rejected outright ("0 songs") instead of
-     * being accepted by a check that could never fail. Being able to A/B the
-     * two on the same image is what tells those apart.
-     */
-    /*
-     * The 1 MB window is backed EITHER WAY, and the engine sits on top of it.
      *
-     * It used to be one or the other: with SHA1_OFF the whole megabyte was a
-     * stub, and with the engine wired only its 0x100 bytes of registers were
-     * mapped, leaving 0x38000100..0x380fffff unassigned. So the switch changed
-     * far more than whether digests were real -- every access to the rest of
-     * the block behaved differently -- and that is not a difference any A/B
-     * comparison between the two should be carrying.
+     * The 1 MB window is backed, and the engine's 0x100 bytes of registers
+     * sit on top of it, so the rest of the block reads as it did before the
+     * engine was wired.
      */
     create_unimplemented_device("s5l8702.sha1", SHA1_MEM_BASE, 0x100000);
-    if (!getenv("SHA1_OFF")) {
-        dev = qdev_new("ipodtouch.sha1");
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-        memory_region_add_subregion_overlap(sysmem, SHA1_MEM_BASE,
-                                            &IPOD_TOUCH_SHA1(dev)->iomem, 1);
-    }
+    dev = qdev_new("ipodtouch.sha1");
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    memory_region_add_subregion_overlap(sysmem, SHA1_MEM_BASE,
+                                        &IPOD_TOUCH_SHA1(dev)->iomem, 1);
 
+    /*
+     * SM1 (0x38500000): the audio decoder engine, where stock firmware sends
+     * MP3 and AAC.  Rockbox never touches it.  See ipod_classic_sm1.c.  Full
+     * 1 MB window, so every offset it does not use still reads 0.
+     */
     dev = qdev_new(TYPE_IPOD_CLASSIC_SM1);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SM1_MEM_BASE);
@@ -1657,25 +1638,6 @@ static void ipod_classic_machine_init(MachineState *machine)
      */
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        s5l8702_get_irq(nms, S5L8702_SM1_IRQ));
-
-    /*
-     * The audio data-path HLE. A no-op unless HLE_AUDIO_DATAPATH is set; when it
-     * is, the host decodes the guest's own song (from the same disk image) and
-     * feeds the PCM into DMAC0 channel 1 -- the channel that drains the audio
-     * ping-pong to the I2S FIFO -- so the retailOS plays its real song through
-     * its own I2S despite the MeCCA decode deadlock. See ipod_classic_hle_audio.c
-     * and wiki/19 section 11.19. Default build is byte-identical.
-     */
-    ipod_classic_hle_audio_init(cpu, dmac0, nms->i2s);
-
-    /* HLE "Now Playing" bootstrap (wiki/19 s.11.20): break the MeCCA decode
-     * deadlock so the guest's own engine renders. No-op unless HLE_NP is set. */
-    ipod_classic_hle_np_init(cpu);
-
-    /* HLE "Now Playing" host overlay (wiki/19 s.11.23): a visible, controllable
-     * player drawn over the framebuffer, driven by the data-path audio. No-op
-     * unless HLE_NP_OVERLAY is set. */
-    ipod_classic_np_overlay_init();
 
     /* Serial console. */
     exynos4210_uart_create(UART0_MEM_BASE, 256, 0, serial_hd(0),

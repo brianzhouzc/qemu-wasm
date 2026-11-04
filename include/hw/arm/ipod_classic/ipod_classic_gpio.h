@@ -36,13 +36,9 @@
  * after the fix: GPIOTRACE shows PDAT(10) -> 0x40, i.e. pin 86 reads 1, and the
  * message becomes type 0.
  *
- * NECESSARY, NOT SUFFICIENT, and the earlier version of this note overstated
- * it. Fixing the pin does NOT make a boot with a disk draw: 0x080b2ce8
- * dispatches the announcement through [0x08911ad8], which is still 0 at 45 s
- * (measured through the monitor, "xp /1wx 0x08911ad8"), so the message is
- * dropped. The boot still parks in "while (!ready) wait();" at 0x081228c4 and
- * still screendumps 0 lit pixels. See wiki/11-classic6g-retailos.md sec.9 for
- * what actually blocks it.
+ * Necessary, not sufficient: on the older retailOS this was measured on, a
+ * boot with a disk still did not draw after this fix (wiki/11 sec.9 has what
+ * blocked it then).  2.0.5 boots with a disk and draws.
  *
  * What pin 86 is CALLED is UNDETERMINED: Rockbox does not name it and no
  * datasheet we have covers it. What it DOES in Apple's firmware is verified

@@ -14,8 +14,6 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
-#include "hw/core/cpu.h"
-#include "target/arm/cpu.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
 #include "exec/address-spaces.h"
@@ -36,7 +34,6 @@ static int ata_lba_mode(void)
     }
     return mode;
 }
-#include "hw/arm/ipod_classic/ipod_classic_hle_audio.h"
 
 /* Which IDE core port a device-register offset corresponds to. */
 static int ata_ioport(hwaddr offset)
@@ -153,102 +150,13 @@ static int32_t ipod_classic_ata_dma_prepare_buf(const IDEDMA *dma,
             !(s->reg[S5L8702_ATA_CFG / 4] & S5L8702_ATA_CFG_WRITE)) {
             static uint64_t rd_ops, rd_bytes;
             /*
-             * Check that the bytes LAND.  Knowing the right sector is read
-             * does not mean the data reaches guest memory: a wrong
-             * destination makes the parser see garbage and the player abort
-             * -- exactly the symptom.  Read the destination of the PREVIOUS
-             * transfer (this one has finished by the time the next arrives)
-             * and print its first words next to the sector they came from.
-             * A monitor dump does not help: the buffers are reused within
-             * seconds.
+             * s->dma_cur has already advanced by len above, so this
+             * transfer starts at dma_cur - len.  Reading dma_cur itself looks
+             * at the end of the block and returns zeros, which reads the same
+             * as "the data does not arrive".
              */
-            static uint32_t prev_dst;
-            static int64_t prev_sec = -1;
-            if (prev_sec >= 0) {
-                uint8_t head[8] = { 0 };
-                address_space_read(&address_space_memory, prev_dst,
-                                   MEMTXATTRS_UNSPECIFIED, head, sizeof(head));
-                fprintf(stderr, "ATALND lba=%" PRId64 " dst=0x%08x -> "
-                        "%02x %02x %02x %02x %02x %02x %02x %02x\n",
-                        prev_sec, prev_dst, head[0], head[1], head[2], head[3],
-                        head[4], head[5], head[6], head[7]);
-            }
-            /*
-             * NOTE: s->dma_cur has already advanced by len bytes a few lines
-             * above, so the start of THIS transfer is dma_cur - len.  Reading
-             * without subtracting looks at the end of the block and returns
-             * zeros, which reads the same as "the data does not arrive" -- a
-             * false positive ready to slip into a conclusion.
-             */
-            /*
-             * PLAYBACK TIME ANCHOR.  Every named site of the inherited map
-             * also fires during boot, so none of them can open a trace window
-             * at playback time.  A read of a sector INSIDE the song file is
-             * exclusive to playback: ATALBA_LO/HI bound that range (in bytes)
-             * and the guest PC that asked for it is printed here -- player
-             * code, a reliable entry point.
-             */
-            {
-                const char *lo_s = getenv("ATALBA_LO");
-                const char *hi_s = getenv("ATALBA_HI");
-                if (lo_s && hi_s) {
-                    uint64_t byte = (uint64_t)ide_get_sector(is) * 512;
-                    uint64_t lo = strtoull(lo_s, NULL, 0);
-                    uint64_t hi = strtoull(hi_s, NULL, 0);
-                    if (byte >= lo && byte <= hi) {
-                        static uint64_t in_song;
-                        uint64_t k = ++in_song;
-                        if ((k & (k - 1)) == 0) {
-                            CPUState *cs = current_cpu;
-                            uint32_t pc = 0, lr = 0, sp = 0;
-                            if (cs) {
-                                CPUARMState *e = &ARM_CPU(cs)->env;
-                                pc = (uint32_t)CPU_GET_CLASS(cs)->get_pc(cs);
-                                /*
-                                 * LR y SP del invitado en el momento de pedir el
-                                 * sector: el PC solo da la rutina del driver, que
-                                 * es comun a todo el disco. El LR nombra a QUIEN
-                                 * la llama, y eso ya es codigo del reproductor.
-                                 */
-                                lr = (uint32_t)e->regs[14];
-                                sp = (uint32_t)e->regs[13];
-                            }
-                            fprintf(stderr, "ATASONG #%" PRIu64 " byte=%" PRIu64
-                                    " pc~0x%08x lr=0x%08x sp=0x%08x\n",
-                                    k, byte, pc, lr, sp);
-                            /*
-                             * LA CADENA DE LLAMADAS, que es lo que hace falta.
-                             * El LR solo da un nivel. Barriendo la pila y
-                             * quedandose con los valores que caen en el rango de
-                             * codigo del firmware salen las direcciones de
-                             * retorno de los marcos de arriba -- o sea el camino
-                             * desde el reproductor hasta esta lectura. Con la
-                             * pila fija (mismo SP en todas las lecturas) esto es
-                             * estable y repetible. Hay falsos positivos (datos
-                             * que parecen punteros), asi que se publican en
-                             * crudo y se filtran leyendo el desensamblado.
-                             */
-                            if (cs && k == 1) {
-                                for (int w = 0; w < 96; w++) {
-                                    uint32_t v = 0;
-                                    address_space_read(&address_space_memory,
-                                                       sp + w * 4,
-                                                       MEMTXATTRS_UNSPECIFIED,
-                                                       &v, 4);
-                                    if (v >= 0x08000000 && v < 0x08400000
-                                        && (v & 3) == 0) {
-                                        fprintf(stderr, "  ATASTACK +0x%03x = "
-                                                "0x%08x\n", w * 4, v);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            prev_dst = (uint32_t)(s->dma_cur - len);
-            prev_sec = ide_get_sector(is);
-            int64_t sec = prev_sec;
+            uint32_t dst = (uint32_t)(s->dma_cur - len);
+            int64_t sec = ide_get_sector(is);
             uint64_t n = ++rd_ops;
             /*
              * ATALBA=2 logs EVERY read with a virtual timestamp. The doubling
@@ -264,22 +172,7 @@ static int32_t ipod_classic_ata_dma_prepare_buf(const IDEDMA *dma,
                         " lba=%" PRId64 " (byte %" PRId64 ") len=%u dst=0x%08x"
                         "  total=%" PRIu64 " KB\n",
                         qemu_clock_get_us(QEMU_CLOCK_VIRTUAL), n, sec,
-                        sec * 512, (unsigned)len, (uint32_t)(s->dma_cur - len),
-                        rd_bytes / 1024);
-            }
-        }
-
-        /*
-         * DATA-PATH HLE track identification: tell the audio shim which disk
-         * bytes the guest is reading, so it can tell which audio file is being
-         * streamed and decode that same song host-side. Reads only; a no-op
-         * unless HLE_AUDIO_DATAPATH is set. See ipod_classic_hle_audio.c.
-         */
-        if (ipod_classic_hle_audio_enabled() &&
-            !(s->reg[S5L8702_ATA_CFG / 4] & S5L8702_ATA_CFG_WRITE)) {
-            int64_t sec = ide_get_sector(is);
-            if (sec >= 0) {
-                ipod_classic_hle_audio_note_disk_read((uint64_t)sec * 512, len);
+                        sec * 512, (unsigned)len, dst, rd_bytes / 1024);
             }
         }
     }
@@ -528,15 +421,20 @@ void ipod_classic_ata_init_drive(DeviceState *dev, DriveInfo *hd)
     }
 }
 
+bool ipod_classic_ata_dma_armed(IPodClassicATAState *s)
+{
+    return s->dma_cb != NULL;
+}
+
 static int ipod_classic_ata_post_load(void *opaque, int version_id)
 {
     IPodClassicATAState *s = opaque;
 
     /*
      * The DMA callback is a pointer into the IDE core invocation that set the
-     * transfer up and cannot outlive a restore. Snapshots are taken with the
-     * disk idle, so drop a half-finished transfer instead of calling through
-     * stale state.
+     * transfer up and cannot outlive a restore.  The browser build's save
+     * waits until none is latched (the snapshot code in ipod_classic.c), so
+     * drop one instead of calling through stale state.
      */
     s->dma_cb = NULL;
     return 0;

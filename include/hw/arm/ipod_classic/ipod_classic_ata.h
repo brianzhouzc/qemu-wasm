@@ -145,4 +145,10 @@ struct IPodClassicATAState {
 
 void ipod_classic_ata_init_drive(DeviceState *dev, DriveInfo *hd);
 
+/*
+ * True between the IDE command that sets a DMA up and the go bit that runs
+ * it: the core's callback is latched, and a snapshot cannot carry it.
+ */
+bool ipod_classic_ata_dma_armed(IPodClassicATAState *s);
+
 #endif

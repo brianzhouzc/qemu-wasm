@@ -57,7 +57,6 @@
 #include "hw/arm/ipod_classic/ipod_classic_lcd.h"
 #include "hw/arm/ipod_classic/ipod_classic_disp.h"
 #include "hw/arm/ipod_classic/ipod_classic_bootscreen.h"
-#include "hw/arm/ipod_classic/ipod_classic_np_overlay.h"
 
 /*
  * INSTRUMENTATION ONLY -- LCDTRACE=1 in the environment prints every access to
@@ -276,60 +275,11 @@ static void panel_data(IPodClassicLCDState *s, uint32_t value)
  * frame. The model therefore composes in gfx_update instead and this write only
  * gets counted -- see ipod_classic_lcd_gfx_update() for that argument in full.
  */
-/* Drop the frame-done line; see lcd_frame_irq() for the shape and why. */
-static void lcd_irq_off(void *opaque)
-{
-    IPodClassicLCDState *s = opaque;
-
-    if (s->irq_pending) {
-        s->irq_pending = false;
-        qemu_irq_lower(s->irq);
-    }
-}
-
-static bool lcd_frame_irq_on(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("LCD_FRAME_IRQ");
-        on = (e && *e && *e != '0') ? 1 : 0;
-        if (on) {
-            fprintf(stderr, "LCD_FRAME_IRQ: el motor de fotograma avisa al "
-                    "terminar\n");
-        }
-    }
-    return on == 1;
-}
-
-/*
- * Report the frame as done.
- *
- * Our frame engine finishes inside the store that starts it -- the picture is
- * composed from the display pipe on every refresh -- so "done" is now. What is
- * NOT known is how the guest acknowledges: no ack register has been identified
- * in this block. So the line is a short pulse rather than a level held until
- * someone clears it, the same shape and for the same reason as the SM1 engine
- * interrupt: a level nobody knows how to drop wedges the handler, and that is
- * a measured failure mode in this tree, not a hypothetical one.
- *
- * Gated on LCD_FRAME_IRQ so the default build stays exactly as measured.
- */
-static void lcd_frame_irq(IPodClassicLCDState *s)
-{
-    if (!lcd_frame_irq_on() || !s->irq_off || s->irq_pending) {
-        return;
-    }
-    s->irq_pending = true;
-    qemu_irq_raise(s->irq);
-    timer_mod(s->irq_off, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 200000);
-}
-
 static void panel_frame_go(IPodClassicLCDState *s, uint32_t value)
 {
     if (value == 0) {
         return;
     }
-    lcd_frame_irq(s);
     /*
      * Counted here, after the zero-write filter, so the number printed by
      * lcd_trace_totals() is starts and not writes to +0x70. Every +0x70 write
@@ -588,7 +538,7 @@ void ipod_classic_lcd_set_boot_screen(IPodClassicLCDState *s, bool on)
 }
 
 /*
- * Compose the panel from the display pipe and the HLE overlay, and report
+ * Compose the panel from the display pipe, and report
  * whether a new frame is available.  Split out for the browser build, which
  * composes on its own timer and has no console frontend to update.
  */
@@ -621,22 +571,10 @@ static bool ipod_classic_lcd_compose(IPodClassicLCDState *s)
     if (s->disp && ipod_classic_disp_compose(s->disp, s->fb,
                                              S5L8702_PANEL_WIDTH,
                                              S5L8702_PANEL_HEIGHT)) {
-        s->composed_frames++;
         lcd_composed_frames++;
         s->dirty = true;
         /* Guest content is on the panel: the boot screen is gone. */
         qatomic_set(&s->boot_screen_active, 0);
-    }
-
-    /*
-     * HLE Now Playing overlay (wiki/19 s11.23): paint the player UI over the
-     * composed guest frame. Kept dirty every refresh while visible so the clock
-     * and progress bar advance. No-op unless HLE_NP_OVERLAY is set.
-     */
-    if (ipod_classic_np_overlay_active()) {
-        ipod_classic_np_overlay_draw(s->fb, S5L8702_PANEL_WIDTH,
-                                     S5L8702_PANEL_HEIGHT);
-        s->dirty = true;
     }
 
     if (!s->dirty) {
@@ -806,7 +744,6 @@ static void ipod_classic_lcd_reset(DeviceState *dev)
     s->fr_unk7c = 0;
     s->fr_hold = 0;
     s->fr_unk88 = 0;
-    s->composed_frames = 0;
 
     memset(s->fb, 0, sizeof(s->fb));
     if (s->boot_screen) {
@@ -843,8 +780,6 @@ static void ipod_classic_lcd_realize(DeviceState *dev, Error **errp)
                           TYPE_IPOD_CLASSIC_LCD, S5L8702_LCD_MEM_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
-    /* Only armed when LCD_FRAME_IRQ is set; see lcd_frame_irq(). */
-    s->irq_off = timer_new_ns(QEMU_CLOCK_VIRTUAL, lcd_irq_off, s);
 
     s->con = graphic_console_init(dev, 0, &ipod_classic_lcd_gfx_ops, s);
     qemu_console_resize(s->con, S5L8702_PANEL_WIDTH, S5L8702_PANEL_HEIGHT);
