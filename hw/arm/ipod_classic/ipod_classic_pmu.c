@@ -34,11 +34,13 @@
  *     is in ipod_classic.c. Both also mask INT1_SECOND, so the tick below does
  *     not pull the line down (measured on 2.0.5, INT1M = 0xb0).
  *   - The hold switch, GPIOSTAT bit 1, and its change interrupt, INT6 bit 1.
+ *   - The RTC's time, RTCSC..RTCYR, read from the host's clock in UTC; see
+ *     the note at the read.  A write to it is stored and never read back.
  *
  * WHAT IS NOT
  *
- *   - The RTC. It reads back whatever was written, which is wrong, and is
- *     flagged here because on the 5G an absent RTC had a visible side effect:
+ *   - The RTC's alarm: its registers read back whatever was written.  Worth
+ *     knowing because on the 5G an absent RTC had a visible side effect:
  *     Rockbox decided an alarm had gone off on every boot.
  *   - Charging, the ON/OFF controller and the regulators. Writing them changes
  *     nothing, because there is no voltage in here for a voltage to mean.
@@ -224,8 +226,8 @@ static uint8_t pmu_reg_read(IPodClassicPMUState *s, uint8_t addr)
          *
          * PCF506xx keeps these fields in BCD, and the block is
          * second, minute, hour, weekday, day, month, year (year is 00..99).
-         * qemu_get_timedate is the same source hw/rtc/pl031.c uses, so -rtc on
-         * the command line works here as it does everywhere else in QEMU.
+         * It is the host's time, not qemu_get_timedate(), so -rtc on the
+         * command line does not reach it.
          */
         {
             struct tm tm;
