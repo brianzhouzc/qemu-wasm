@@ -423,15 +423,20 @@ void ipod_classic_ata_init_drive(DeviceState *dev, DriveInfo *hd)
     }
 }
 
+bool ipod_classic_ata_dma_armed(IPodClassicATAState *s)
+{
+    return s->dma_cb != NULL;
+}
+
 static int ipod_classic_ata_post_load(void *opaque, int version_id)
 {
     IPodClassicATAState *s = opaque;
 
     /*
      * The DMA callback is a pointer into the IDE core invocation that set the
-     * transfer up and cannot outlive a restore. Snapshots are taken with the
-     * disk idle, so drop a half-finished transfer instead of calling through
-     * stale state.
+     * transfer up and cannot outlive a restore.  The browser build's save
+     * waits until none is latched (the snapshot code in ipod_classic.c), so
+     * drop one instead of calling through stale state.
      */
     s->dma_cb = NULL;
     return 0;

@@ -1034,7 +1034,9 @@ static void ipod_heartbeat_start(int ms)
  */
 static QEMUBH *ipod_snapshot_bh;
 static QEMUTimer *ipod_snapshot_timer;
+static QEMUTimer *ipod_snapshot_retry;
 static int64_t ipod_snapshot_deadline;
+static int64_t ipod_snapshot_wait_until;
 static int ipod_snapshot_op;            /* 1 save, 2 load */
 static bool ipod_snapshot_was_running;  /* state 4: paused until resume */
 static bool ipod_snapshot_resume_pending;
@@ -1186,6 +1188,28 @@ static void ipod_snapshot_bh_fn(void *opaque)
                   qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 50);
         return;
     }
+    /*
+     * Not between an ATA command and its go bit.  The IDE core hands over the
+     * DMA callback with the command, the go bit runs it a few guest
+     * instructions later, and a pointer cannot be saved: a state saved in
+     * between restores a disk that never answers, every time it is loaded.
+     * So let the guest run on and try again; after a second, save anyway.
+     */
+    if (ipod_machine && ipod_machine->ata &&
+        ipod_classic_ata_dma_armed(ipod_machine->ata)) {
+        int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+
+        if (!ipod_snapshot_wait_until) {
+            ipod_snapshot_wait_until = now + 1000;
+        }
+        if (now < ipod_snapshot_wait_until) {
+            timer_mod(ipod_snapshot_retry, now + 1);
+            return;
+        }
+        warn_report("snapshot: saving with an ATA transfer set up but not "
+                    "started; a restore will lose it");
+    }
+    ipod_snapshot_wait_until = 0;
     was_running = runstate_is_running();
     ipod_snapshot_was_running = was_running;
     global_state_store();
@@ -1276,6 +1300,8 @@ static void ipod_classic_machine_init(MachineState *machine)
     ipod_snapshot_bh = qemu_bh_new(ipod_snapshot_bh_fn, NULL);
     ipod_snapshot_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
                                        ipod_snapshot_poll, NULL);
+    ipod_snapshot_retry = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                       ipod_snapshot_bh_fn, NULL);
 #endif
 #if defined(EMSCRIPTEN) && !defined(CONFIG_TCG_INTERPRETER)
     if (nms->wasm_instantiate > 0) {
