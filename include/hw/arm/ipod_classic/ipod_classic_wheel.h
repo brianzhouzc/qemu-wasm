@@ -331,7 +331,7 @@ struct IPodClassicWheelState {
      * and let the three fields be read torn.
      */
     struct {
-        int32_t op;              /* 1 = press with hold, 2 = raw key */
+        int32_t op;              /* 1 = press with hold */
         int32_t arg;
         int32_t hold;
     } wasm_key_ring[8];

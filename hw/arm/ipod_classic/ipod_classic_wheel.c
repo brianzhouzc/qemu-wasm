@@ -831,21 +831,15 @@ static void wasm_key_bh_fn(void *opaque)
          * guest did not even see (icount frozen for the whole 8 s wait).  The
          * input itself has to be the wake source.
          *
-         * While the machine is powered off this is the power button.  op 2 is a
-         * raw key event (press or release) and takes the same path as the
-         * native keyboard handler, so a release cannot power the machine on and
-         * the release of a dropped power-on press is dropped as well.  op 1 is
-         * a synthesized press whose release the model generates itself, so it
+         * While the machine is powered off this is the power button.  A press
+         * is synthesized, and the model generates its release itself, so it
          * only needs the wake.
          */
-        if (op == 2 ? ipod_classic_power_key_event(arg)
-                    : ipod_classic_input_wake()) {
+        if (ipod_classic_input_wake()) {
             tail++;
             continue;
         }
-        if (op == 2) {
-            wheel_key_event(s, arg);
-        } else if (op == 1) {
+        if (op == 1) {
             wasm_key_do_press(s, arg, hold);
         }
         tail++;
@@ -887,12 +881,6 @@ EMSCRIPTEN_KEEPALIVE int ipod_wasm_key_ack(void)
 {
     return wasm_wheel_state ?
         (int)qatomic_read(&wasm_wheel_state->wasm_consumed) : 0;
-}
-
-EMSCRIPTEN_KEEPALIVE void ipod_wasm_key(int keycode)
-{
-    /* Raw press/release event; queued like any other browser key (Q11). */
-    wasm_key_queue(2, keycode, 0);
 }
 
 /*
