@@ -884,8 +884,10 @@ static void tcg_wasm_out_clz64(TCGContext *s, TCGReg ret, TCGReg arg1, TCGReg ar
 }
 
 static void tcg_wasm_out_clz32(TCGContext *s, TCGReg ret, TCGReg arg1, TCGReg arg2){
+    /* Zero means the low 32 bits: the upper half of an i32 is not defined. */
     tcg_wasm_out_op_global_get_r(s, arg1);
-    tcg_wasm_out_op_i64_eqz(s);
+    tcg_wasm_out_op_i32_wrap_i64(s);
+    tcg_wasm_out_op_i32_eqz(s);
     tcg_wasm_out_op_if_ret_i32(s);
     tcg_wasm_out_op_global_get_r(s, arg2);
     tcg_wasm_out_op_i32_wrap_i64(s);
@@ -911,8 +913,10 @@ static void tcg_wasm_out_ctz64(TCGContext *s, TCGReg ret, TCGReg arg1, TCGReg ar
 }
 
 static void tcg_wasm_out_ctz32(TCGContext *s, TCGReg ret, TCGReg arg1, TCGReg arg2){
+    /* Zero means the low 32 bits: the upper half of an i32 is not defined. */
     tcg_wasm_out_op_global_get_r(s, arg1);
-    tcg_wasm_out_op_i64_eqz(s);
+    tcg_wasm_out_op_i32_wrap_i64(s);
+    tcg_wasm_out_op_i32_eqz(s);
     tcg_wasm_out_op_if_ret_i32(s);
     tcg_wasm_out_op_global_get_r(s, arg2);
     tcg_wasm_out_op_i32_wrap_i64(s);
@@ -1470,9 +1474,54 @@ static void tcg_wasm_out_add2(TCGContext *s, TCGType type,
     tcg_wasm_out_op_global_set_r(s, reth);
 }
 
-static void tcg_wasm_out_sub2(TCGContext *s, TCGReg retl, TCGReg reth,
+static void tcg_wasm_out_sub2(TCGContext *s, TCGType type,
+                             TCGReg retl, TCGReg reth,
                              TCGReg al, TCGReg ah, TCGReg bl, TCGReg bh)
 {
+    if (type == TCG_TYPE_I32) {
+        /*
+         * As add2_i32: the halves are 32 bits wide in i64 globals whose upper
+         * halves are not defined, so mask the inputs, take the borrow from bit
+         * 32 of the low difference, and mask the outputs.  The 64-bit
+         * sequence below compares unmasked values and got the borrow wrong.
+         */
+        /* high difference: (ah & 0xffffffff) - (bh & 0xffffffff) */
+        tcg_wasm_out_op_global_get_r(s, ah);
+        tcg_wasm_out_op_i64_const(s, 0xffffffffu);
+        tcg_wasm_out_op_i64_and(s);
+        tcg_wasm_out_op_global_get_r(s, bh);
+        tcg_wasm_out_op_i64_const(s, 0xffffffffu);
+        tcg_wasm_out_op_i64_and(s);
+        tcg_wasm_out_op_i64_sub(s);
+
+        /* low difference: (al & 0xffffffff) - (bl & 0xffffffff) */
+        tcg_wasm_out_op_global_get_r(s, al);
+        tcg_wasm_out_op_i64_const(s, 0xffffffffu);
+        tcg_wasm_out_op_i64_and(s);
+        tcg_wasm_out_op_global_get_r(s, bl);
+        tcg_wasm_out_op_i64_const(s, 0xffffffffu);
+        tcg_wasm_out_op_i64_and(s);
+        tcg_wasm_out_op_i64_sub(s);
+
+        /* keep it, store its low 32 bits */
+        tcg_wasm_out_op_local_set(s, TMP64_0_IDX);
+        tcg_wasm_out_op_local_get(s, TMP64_0_IDX);
+        tcg_wasm_out_op_i64_const(s, 0xffffffffu);
+        tcg_wasm_out_op_i64_and(s);
+        tcg_wasm_out_op_global_set_r(s, retl);
+
+        /* borrow: the low difference went negative, i.e. bit 63 is set */
+        tcg_wasm_out_op_local_get(s, TMP64_0_IDX);
+        tcg_wasm_out_op_i64_const(s, 63);
+        tcg_wasm_out_op_i64_shr_u(s);
+
+        /* reth = (high difference - borrow) & 0xffffffff */
+        tcg_wasm_out_op_i64_sub(s);
+        tcg_wasm_out_op_i64_const(s, 0xffffffffu);
+        tcg_wasm_out_op_i64_and(s);
+        tcg_wasm_out_op_global_set_r(s, reth);
+        return;
+    }
     // sub higher
     tcg_wasm_out_op_global_get_r(s, ah);
     tcg_wasm_out_op_global_get_r(s, bh);
@@ -1505,10 +1554,24 @@ static void tcg_wasm_out_sub2(TCGContext *s, TCGReg retl, TCGReg reth,
     tcg_wasm_out_op_global_set_r(s, reth);
 }
 
+/*
+ * The 32x32->64 multiplies (UMULL, SMULL and the accumulating forms).  An i32
+ * value lives in an i64 global whose upper half is not defined: add_i32 is a
+ * plain i64.add, so 0x80000000 + 0x80000000 leaves bit 32 set, and a value
+ * can arrive zero- or sign-extended depending on what produced it.  The
+ * 64-bit product needs the inputs as 32-bit numbers, so zero-extend them for
+ * mulu2 and sign-extend them for muls2.  Without that, -1 held zero-extended
+ * multiplied as 4294967295 and SMULL gave the wrong high word, which is what
+ * broke Rockbox's MP3 and AAC decoders under the JIT.
+ */
 static void tcg_wasm_out_mulu2_i32(TCGContext *s, TCGReg retl, TCGReg reth, TCGReg arg1, TCGReg arg2)
 {
     tcg_wasm_out_op_global_get_r(s, arg1);
+    tcg_wasm_out_op_i64_const(s, 0xffffffffu);
+    tcg_wasm_out_op_i64_and(s);
     tcg_wasm_out_op_global_get_r(s, arg2);
+    tcg_wasm_out_op_i64_const(s, 0xffffffffu);
+    tcg_wasm_out_op_i64_and(s);
     tcg_wasm_out_op_i64_mul(s);
     tcg_wasm_out_op_set_r_as_i64(s, retl, reth);
 }
@@ -1516,7 +1579,11 @@ static void tcg_wasm_out_mulu2_i32(TCGContext *s, TCGReg retl, TCGReg reth, TCGR
 static void tcg_wasm_out_muls2_i32(TCGContext *s, TCGReg retl, TCGReg reth, TCGReg arg1, TCGReg arg2)
 {
     tcg_wasm_out_op_global_get_r(s, arg1);
+    tcg_wasm_out_op_i32_wrap_i64(s);
+    tcg_wasm_out_op_i64_extend_i32_s(s);
     tcg_wasm_out_op_global_get_r(s, arg2);
+    tcg_wasm_out_op_i32_wrap_i64(s);
+    tcg_wasm_out_op_i64_extend_i32_s(s);
     tcg_wasm_out_op_i64_mul(s);
     tcg_wasm_out_op_set_r_as_i64(s, retl, reth);
 }
@@ -2387,7 +2454,24 @@ static void* qemu_ld_helper_ptr(uint32_t oi)
     }
 }
 
-static void tcg_wasm_out_qemu_ld(TCGContext *s, const TCGArg *args, bool is_64)
+/*
+ * A 32-bit guest address is an i32 value, whose upper half in its i64 global
+ * is not defined (an address computed as base + index << 2 with a negative
+ * index carries into it).  The interpreter truncates it ((uint32_t)regs[r1])
+ * and the native backends zero-extend it; do the same, in place, before the
+ * TLB compare, the host address and the slow path's helper see it.  The
+ * register's low 32 bits, all an i32 consumer reads, do not change.
+ */
+static void tcg_wasm_out_addr32(TCGContext *s, TCGReg addr_reg)
+{
+    tcg_wasm_out_op_global_get_r(s, addr_reg);
+    tcg_wasm_out_op_i64_const(s, 0xffffffffu);
+    tcg_wasm_out_op_i64_and(s);
+    tcg_wasm_out_op_global_set_r(s, addr_reg);
+}
+
+static void tcg_wasm_out_qemu_ld(TCGContext *s, const TCGArg *args, bool is_64,
+                                 bool addr32)
 {
     TCGReg addr_reg;
     TCGReg data_reg;
@@ -2399,6 +2483,9 @@ static void tcg_wasm_out_qemu_ld(TCGContext *s, const TCGArg *args, bool is_64)
     oi = *args++;
     opc = get_memop(oi);
 
+    if (addr32) {
+        tcg_wasm_out_addr32(s, addr_reg);
+    }
     uint8_t base = tcg_wasm_out_tlb_load(s, addr_reg, oi, true);
     
     tcg_wasm_out_op_local_get(s, base);
@@ -2516,7 +2603,8 @@ static void* qemu_st_helper_ptr(uint32_t oi)
     }
 }
 
-static void tcg_wasm_out_qemu_st(TCGContext *s, const TCGArg *args, bool is_64)
+static void tcg_wasm_out_qemu_st(TCGContext *s, const TCGArg *args, bool is_64,
+                                 bool addr32)
 {
     TCGReg addr_reg;
     TCGReg data_reg;
@@ -2528,6 +2616,9 @@ static void tcg_wasm_out_qemu_st(TCGContext *s, const TCGArg *args, bool is_64)
     oi = *args++;
     opc = get_memop(oi);
 
+    if (addr32) {
+        tcg_wasm_out_addr32(s, addr_reg);
+    }
     uint8_t base = tcg_wasm_out_tlb_load(s, addr_reg, oi, false);
 
     tcg_wasm_out_op_local_get(s, base);
@@ -3358,7 +3449,8 @@ static void tcg_out_sub2(TCGContext *s, TCGOpcode opc, TCGReg retl, TCGReg reth,
                          TCGReg al, TCGReg ah, TCGReg bl, TCGReg bh)
 {
     tcg_tci_out_op_rrrrrr(s, opc, retl, reth, al, ah, bl, bh);
-    tcg_wasm_out_sub2(s, retl, reth, al, ah, bl, bh);
+    tcg_wasm_out_sub2(s, opc == INDEX_op_sub2_i32 ? TCG_TYPE_I32 : TCG_TYPE_I64,
+                      retl, reth, al, ah, bl, bh);
 }
 static void tcg_out_mulu2_i32(TCGContext *s, TCGOpcode opc, TCGReg retl, TCGReg reth, TCGReg arg1, TCGReg arg2)
 {
@@ -3439,12 +3531,16 @@ static uint8_t tcg_tci_out_qemu_ldst(TCGContext *s, TCGOpcode opc, const TCGArg 
 static void tcg_out_qemu_ld(TCGContext *s, TCGOpcode opc, const TCGArg *args, bool is_64)
 {
     tcg_tci_out_qemu_ldst(s, opc, args);
-    tcg_wasm_out_qemu_ld(s, args, is_64);
+    tcg_wasm_out_qemu_ld(s, args, is_64,
+                         opc == INDEX_op_qemu_ld_a32_i32 ||
+                         opc == INDEX_op_qemu_ld_a32_i64);
 }
 static void tcg_out_qemu_st(TCGContext *s, TCGOpcode opc, const TCGArg *args, bool is_64)
 {
     tcg_tci_out_qemu_ldst(s, opc, args);
-    tcg_wasm_out_qemu_st(s, args, is_64);
+    tcg_wasm_out_qemu_st(s, args, is_64,
+                         opc == INDEX_op_qemu_st_a32_i32 ||
+                         opc == INDEX_op_qemu_st_a32_i64);
 }
 static void tcg_out_deposit_i32(TCGContext *s, TCGOpcode opc, TCGReg dest, TCGReg arg1, TCGReg arg2, int pos, int len)
 {
