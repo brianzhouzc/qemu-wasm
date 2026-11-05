@@ -46,6 +46,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicAESState, IPOD_CLASSIC_AES)
 #define S5L8702_AES_KEY_WORDS   8
 #define S5L8702_AES_IV_WORDS    4
 
+/* The most one job runs: the size of DRAM.  See ipod_classic_aes_run(). */
+#define S5L8702_AES_MAX_JOB     0x4000000u
+
 /*
  * KEYLEN.  Bit 0 is the direction (1 encrypt, 0 decrypt) in every driver.
  * Bits 16-17 are the key length in openiBoot (GET_KEYLEN: 0 for AES-128, 1

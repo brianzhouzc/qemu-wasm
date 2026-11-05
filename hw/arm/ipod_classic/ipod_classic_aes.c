@@ -131,6 +131,16 @@ static void ipod_classic_aes_run(IPodClassicAESState *s)
                       s->reg[S5L8702_AES_OUTSIZE / 4]);
         size = MIN(size, s->reg[S5L8702_AES_OUTSIZE / 4]) & ~15u;
     }
+    /*
+     * The job runs inside the guest's write, so a size gone wrong would hold
+     * the whole machine while it crawled through gigabytes.  Nothing real is
+     * bigger than DRAM; 2.0.5's jobs are 4 KB.
+     */
+    if (size > S5L8702_AES_MAX_JOB) {
+        qemu_log_mask(LOG_GUEST_ERROR, "s5l8702.aes: a job of 0x%x bytes; "
+                      "running the first 0x%x\n", size, S5L8702_AES_MAX_JOB);
+        size = S5L8702_AES_MAX_JOB;
+    }
     if (aes_trace_on()) {
         fprintf(stderr, "s5l8702.aes: job %u %s type %u keylen 0x%x "
                 "in 0x%08" HWADDR_PRIx " out 0x%08" HWADDR_PRIx " size 0x%x\n",
