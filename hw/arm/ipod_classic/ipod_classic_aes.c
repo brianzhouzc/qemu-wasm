@@ -6,8 +6,9 @@
  * 4 KB jobs as it loads it.  The block used to be an unimplemented window
  * that read 0, and the driver (0x0802e87c in the running image) polls STATUS
  * bit 0 with no timeout, so starting any game spun there for ever: the
- * screen stayed on the Games list and nothing answered a button again
- * (MEASURED on qemu 7837aed, the JIT and TCI alike).
+ * firmware's "Loading..." spinner kept turning, the keys were still read,
+ * and no button got back to the menus (MEASURED on qemu 7837aed, the JIT
+ * and TCI alike).
  *
  * One job, as 2.0.5 programs it: TYPE = 0 and a 128-bit key in KEY[4..7],
  * UNKREG0 pulsed, CONTROL = 1, KEYLEN = 0xe (decrypt), the three sizes 0x1000,
