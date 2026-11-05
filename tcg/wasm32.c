@@ -90,8 +90,6 @@ EM_JS(int, instantiate_wasm, (), {
                     "helper": helper,
                         });
 
-        Module.__wasm32_tb.inst_gc_registry.register(inst, "instance");
-
         const fidx = addFunction(inst.exports.start, 'ii');
 
         return fidx;
@@ -113,17 +111,31 @@ EM_JS(void, remove_module_js, (), {
         memory_v.setInt32(Module.__wasm32_tb.to_remove_instance_idx_ptr, 0, true);
     });
 
+/*
+ * Compiled blocks in the function table.  Each is a WebAssembly module and
+ * instance of its own, about 30 KB of host memory, so the number is capped:
+ * at MAX_INSTANCE_ALIVE the oldest half is removed from the table, and a
+ * block of theirs that is still hot is compiled again after another
+ * instantiate_num runs.  A stock boot compiles about 3,000.
+ *
+ * Removed instances are counted gone at once.  V8 frees an unreferenced
+ * instance in an ordinary collection, which runs on allocation and needs no
+ * turn of the event loop.  The count used to wait for FinalizationRegistry
+ * callbacks instead, which only run when the thread returns to its event
+ * loop, and the vCPU thread never does: the count stuck at the cap, no block
+ * was compiled after that, and an emscripten_sleep(0) every 50,000 blocks
+ * meant to let the callbacks in made the guest twice as slow as TCI
+ * (measured with the cap at 400: stock boot 57 s against TCI's 28 s).
+ */
 int instance_alive_global = 0;
 __thread int instance_alive_local = 0;
-__thread int instance_running_local = 0;
-__thread uint32_t instance_garbage_collected_local = 0;
 
 struct instance_info {
     uint8_t *tb;
     int fidx;
 };
 
-#define MAX_INSTANCE_ALIVE 15000
+#define MAX_INSTANCE_ALIVE 4096
 #define INSTANCE_RUNNING_LEN MAX_INSTANCE_ALIVE
 __thread struct instance_info instance_running[INSTANCE_RUNNING_LEN];
 __thread int instance_running_begin = 0;
@@ -138,46 +150,20 @@ static bool can_add_instance()
     return qatomic_read(&instance_alive_global) < MAX_INSTANCE_ALIVE;
 }
 
-static void inc_instance_local()
-{
-    instance_running_local++;
-    instance_alive_local++;
-}
-
-static int instance_pending_gc_local()
-{
-    return (instance_alive_local - instance_running_local);
-}
-
-static void check_instance_garbage_collected()
-{
-    if (instance_garbage_collected_local > 0) {
-        if (instance_garbage_collected_local > instance_pending_gc_local()) {
-            printf("unexpected number of removed instances %d > %d",
-                   instance_garbage_collected_local, instance_pending_gc_local()); fflush(stdout);
-            exit(1);
-        }
-        qatomic_sub(&instance_alive_global, instance_garbage_collected_local);
-        instance_alive_local -= instance_garbage_collected_local;
-        instance_garbage_collected_local = 0;
-    }
-}
-
+/* Remove the oldest half of this thread's compiled blocks from the table. */
 static void remove_instance_running_local()
 {
-    if (instance_pending_gc_local() > 0) {
-        return;
-    }
-    int to_remove = instance_running_local / 2;
+    int to_remove = instance_alive_local / 2;
     for (int i = 0; i < to_remove; i++) {
         instance_running[instance_running_begin].tb = NULL;
         to_remove_instance[to_remove_instance_idx++] = instance_running[instance_running_begin].fidx;
-        instance_running_local--;
         instance_running_begin = (instance_running_begin + 1)%INSTANCE_RUNNING_LEN;
     }
     if (to_remove_instance_idx > 0) {
         remove_module_js();
     }
+    instance_alive_local -= to_remove;
+    qatomic_sub(&instance_alive_global, to_remove);
 }
 
 static void add_instance_running_local(int fidx, void *tb_ptr)
@@ -189,7 +175,7 @@ static void add_instance_running_local(int fidx, void *tb_ptr)
     *(uint32_t*)tb_export_ptr = (uint32_t)(&(instance_running[instance_running_end]));
 
     instance_running_end  = (instance_running_end+1)%INSTANCE_RUNNING_LEN;
-    inc_instance_local();
+    instance_alive_local++;
     qatomic_inc(&instance_alive_global);
 
 }
@@ -202,33 +188,22 @@ static int get_instance_running_local(void *tb_ptr)
         return 0;
     }
     if (elm->tb != tb_ptr) {
+        /*
+         * The block's module was removed at the cap (or its slot reused), so
+         * it runs in the interpreter again and earns its compile with
+         * another instantiate_num runs.  This used to set the counter to the
+         * threshold, compiling it again on its next run, which made a set of
+         * hot blocks larger than the cap thrash: with the cap at 400 a stock
+         * boot compiled 8.3 million modules and took 130 s.  Never reached
+         * with the JIT off (instantiate_num == INT32_MAX): tcg_qemu_tb_exec()
+         * skips this lookup then.
+         */
         *(uint32_t*)tb_export_ptr = 0;
         int tb_counter_ptr = (uint32_t)tb_ptr + counter_vec_off;
-        /*
-         * Only reachable when the JIT is enabled: tcg_qemu_tb_exec() skips
-         * this lookup entirely under -icount (instantiate_num == INT32_MAX),
-         * so no instance exists and this "instantiate immediately" write --
-         * which sets the counter to the threshold -- cannot happen there.  If
-         * the lookup is ever moved back before that guard, this write is the
-         * overflow the guard exists to prevent.
-         */
-        *(uint32_t*)tb_counter_ptr = instantiate_num; // will be instanciated immediately
+        *(uint32_t*)tb_counter_ptr = 0;
         return 0;
     }
     return elm->fidx;
-}
-
-#define MAX_EXEC_NUM 50000
-__thread int exec_cnt = MAX_EXEC_NUM;
-static inline void trysleep()
-{
-    if (--exec_cnt == 0) {
-        if (!can_add_instance()) {
-            emscripten_sleep(0); // return to the browser main loop
-            check_instance_garbage_collected();
-        }
-        exec_cnt = MAX_EXEC_NUM;
-    }
 }
 
 __thread struct wasmContext ctx = {
@@ -272,20 +247,12 @@ int get_core_nums()
     return core_nums;
 }
 
-EM_JS(void, init_wasm32_js, (int tb_ptr_ptr, int cur_core_num, int to_remove_instance_ptr, int to_remove_instance_idx_ptr, int instance_garbage_collected_ptr), {
+EM_JS(void, init_wasm32_js, (int tb_ptr_ptr, int cur_core_num, int to_remove_instance_ptr, int to_remove_instance_idx_ptr), {
         Module.__wasm32_tb = {
             tb_ptr_ptr: tb_ptr_ptr,
             cur_core_num: cur_core_num,
             to_remove_instance_ptr: to_remove_instance_ptr,
             to_remove_instance_idx_ptr: to_remove_instance_idx_ptr,
-            instance_garbage_collected_ptr: instance_garbage_collected_ptr,
-            inst_gc_registry: new FinalizationRegistry((i) => {
-                    if (i == "instance") {
-                        const memory_v = new DataView(HEAP8.buffer);
-                        let v = memory_v.getInt32(Module.__wasm32_tb.instance_garbage_collected_ptr, true);
-                        memory_v.setInt32(Module.__wasm32_tb.instance_garbage_collected_ptr, v + 1, true);
-                    }
-            })
         };
 });
 
@@ -299,7 +266,7 @@ void init_wasm32()
         ctx.stack = (uint64_t*)malloc(TCG_STATIC_CALL_ARGS_SIZE + TCG_STATIC_FRAME_SIZE);
         ctx.stack128 = (uint64_t*)malloc(TCG_STATIC_CALL_ARGS_SIZE + TCG_STATIC_FRAME_SIZE);
         ctx.tci_tb_ptr = (uint32_t*)&tci_tb_ptr;
-        init_wasm32_js((int)&ctx.tb_ptr, cur_core_num, (int)to_remove_instance, (int)&to_remove_instance_idx, (int)&instance_garbage_collected_local);
+        init_wasm32_js((int)&ctx.tb_ptr, cur_core_num, (int)to_remove_instance, (int)&to_remove_instance_idx);
         initdone = true;
 
         /*
@@ -1410,7 +1377,6 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
     ctx.tb_ptr = (uint32_t*)v_tb_ptr;
     ctx.do_init = 1;
     while (true) {
-        trysleep();
         uint32_t res;
         /*
          * Under -icount the JIT is off (instantiate_num == INT32_MAX), so no
@@ -1431,8 +1397,8 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
                 *(int32_t*)tb_counter_ptr += 1;
                 res = tcg_qemu_tb_exec_tci(env);
             } else if (!can_add_instance()) {
+                /* The block is compiled the next time it runs. */
                 remove_instance_running_local();
-                check_instance_garbage_collected();
                 res = tcg_qemu_tb_exec_tci(env);
             } else {
                 int fidx = instantiate_wasm();
