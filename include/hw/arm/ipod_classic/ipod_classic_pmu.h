@@ -16,6 +16,7 @@
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
 #include "qom/object.h"
+#include "qemu/seqlock.h"
 
 #define TYPE_IPOD_CLASSIC_PMU "pcf50635"
 OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicPMUState, IPOD_CLASSIC_PMU)
@@ -38,6 +39,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicPMUState, IPOD_CLASSIC_PMU)
 #define PCF5063X_REG_OOCSHDWN  0x0c
 #define PCF5063X_REG_OOCSTAT   0x12
 #define PCF5063X_REG_GPIOCTL   0x13
+#define PCF5063X_REG_LEDOUT    0x28
+#define PCF5063X_REG_LEDENA    0x29
+#define PCF5063X_REG_LEDCTL    0x2a
+#define PCF5063X_REG_LEDDIM    0x2b
 #define PCF5063X_REG_DCDCSTAT  0x41
 #define PCF5063X_REG_LDOSTAT   0x42
 #define PCF5063X_REG_MBCS1     0x4b
@@ -98,6 +103,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicPMUState, IPOD_CLASSIC_PMU)
  * INT6 bit 1 is the same pin's change interrupt, PCF50635_INT6_GPIO2 in
  * pmu-target.h:37: Rockbox only reads GPIOSTAT again when it fires.
  */
+#define PCF5063X_LEDOUT_MASK      0x3f   /* 64 current steps */
+#define PCF5063X_LEDENA_ON        0x01
+
 #define PCF50635_GPIOSTAT_HOLD_OFF  0x02
 #define PCF50635_INT6_HOLD          0x02
 
@@ -135,6 +143,26 @@ struct IPodClassicPMUState {
      * move it, and GPIOSTAT reads follow it whatever the guest wrote there.
      */
     bool hold;
+
+    /*
+     * The LED converter that lights the LCD; see THE BACKLIGHT in the .c.
+     * Its output walks one current step every bl_step_ns, from bl_from at
+     * bl_start_ns (QEMU_CLOCK_REALTIME) towards bl_to.
+     */
+    uint8_t bl_from;
+    uint8_t bl_to;
+    uint32_t bl_step_ns;
+    int64_t bl_start_ns;
+    /*
+     * OOCSHDWN was written: the ON/OFF controller has cut the supplies, the
+     * LED converter's with them, until the reset that powers the machine on.
+     */
+    bool standby;
+    /*
+     * The page reads the ramp and LEDOUT/LEDENA from its own thread, with no
+     * BQL: every write to them is a write section of this.
+     */
+    QemuSeqLock bl_lock;
 };
 
 /* Slide the switch; the guest hears about it through INT6 and nIRQ. */
