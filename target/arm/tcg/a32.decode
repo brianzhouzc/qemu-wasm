@@ -51,6 +51,17 @@
 &mcrr            cp opc1 crm rt rt2
 
 # Data-processing (register)
+#
+# TST, TEQ, CMP and CMN have no destination, and MOV and MVN no first
+# operand: the ARM ARM marks those fields should-be-zero, UNPREDICTABLE
+# otherwise.  Upstream QEMU decodes only 0000 there and makes anything else
+# UNDEF.  The ARM926EJ-S ignores the field, and code built for it relies on
+# that: the encrypted games in Apple's iPod classic firmware 2.0.5 (Extras >
+# Games) execute 0xe3524000, CMP r2 with Rd = r4, and on QEMU took the
+# undefined-instruction vector, after which the firmware printed
+# "CPU_exception_handler" and rebooted.  So in all three forms below the
+# field is ignored, as the hardware does.  UNPREDICTABLE allows it, and no
+# other encoding shares these bit patterns (S = 1 for the compares).
 
 @s_rrr_shi       ---- ... .... s:1 rn:4 rd:4 shim:5 shty:2 . rm:4 \
                  &s_rrr_shi
@@ -67,14 +78,14 @@ ADD_rrri         .... 000 0100 . .... .... ..... .. 0 ....    @s_rrr_shi
 ADC_rrri         .... 000 0101 . .... .... ..... .. 0 ....    @s_rrr_shi
 SBC_rrri         .... 000 0110 . .... .... ..... .. 0 ....    @s_rrr_shi
 RSC_rrri         .... 000 0111 . .... .... ..... .. 0 ....    @s_rrr_shi
-TST_xrri         .... 000 1000 1 .... 0000 ..... .. 0 ....    @S_xrr_shi
-TEQ_xrri         .... 000 1001 1 .... 0000 ..... .. 0 ....    @S_xrr_shi
-CMP_xrri         .... 000 1010 1 .... 0000 ..... .. 0 ....    @S_xrr_shi
-CMN_xrri         .... 000 1011 1 .... 0000 ..... .. 0 ....    @S_xrr_shi
+TST_xrri         .... 000 1000 1 .... ---- ..... .. 0 ....    @S_xrr_shi
+TEQ_xrri         .... 000 1001 1 .... ---- ..... .. 0 ....    @S_xrr_shi
+CMP_xrri         .... 000 1010 1 .... ---- ..... .. 0 ....    @S_xrr_shi
+CMN_xrri         .... 000 1011 1 .... ---- ..... .. 0 ....    @S_xrr_shi
 ORR_rrri         .... 000 1100 . .... .... ..... .. 0 ....    @s_rrr_shi
-MOV_rxri         .... 000 1101 . 0000 .... ..... .. 0 ....    @s_rxr_shi
+MOV_rxri         .... 000 1101 . ---- .... ..... .. 0 ....    @s_rxr_shi
 BIC_rrri         .... 000 1110 . .... .... ..... .. 0 ....    @s_rrr_shi
-MVN_rxri         .... 000 1111 . 0000 .... ..... .. 0 ....    @s_rxr_shi
+MVN_rxri         .... 000 1111 . ---- .... ..... .. 0 ....    @s_rxr_shi
 
 %imm16           16:4 0:12
 @mov16           ---- .... .... .... rd:4 ............        &ri imm=%imm16
@@ -99,14 +110,14 @@ ADD_rrrr         .... 000 0100 . .... .... .... 0 .. 1 ....   @s_rrr_shr
 ADC_rrrr         .... 000 0101 . .... .... .... 0 .. 1 ....   @s_rrr_shr
 SBC_rrrr         .... 000 0110 . .... .... .... 0 .. 1 ....   @s_rrr_shr
 RSC_rrrr         .... 000 0111 . .... .... .... 0 .. 1 ....   @s_rrr_shr
-TST_xrrr         .... 000 1000 1 .... 0000 .... 0 .. 1 ....   @S_xrr_shr
-TEQ_xrrr         .... 000 1001 1 .... 0000 .... 0 .. 1 ....   @S_xrr_shr
-CMP_xrrr         .... 000 1010 1 .... 0000 .... 0 .. 1 ....   @S_xrr_shr
-CMN_xrrr         .... 000 1011 1 .... 0000 .... 0 .. 1 ....   @S_xrr_shr
+TST_xrrr         .... 000 1000 1 .... ---- .... 0 .. 1 ....   @S_xrr_shr
+TEQ_xrrr         .... 000 1001 1 .... ---- .... 0 .. 1 ....   @S_xrr_shr
+CMP_xrrr         .... 000 1010 1 .... ---- .... 0 .. 1 ....   @S_xrr_shr
+CMN_xrrr         .... 000 1011 1 .... ---- .... 0 .. 1 ....   @S_xrr_shr
 ORR_rrrr         .... 000 1100 . .... .... .... 0 .. 1 ....   @s_rrr_shr
-MOV_rxrr         .... 000 1101 . 0000 .... .... 0 .. 1 ....   @s_rxr_shr
+MOV_rxrr         .... 000 1101 . ---- .... .... 0 .. 1 ....   @s_rxr_shr
 BIC_rrrr         .... 000 1110 . .... .... .... 0 .. 1 ....   @s_rrr_shr
-MVN_rxrr         .... 000 1111 . 0000 .... .... 0 .. 1 ....   @s_rxr_shr
+MVN_rxrr         .... 000 1111 . ---- .... .... 0 .. 1 ....   @s_rxr_shr
 
 # Data-processing (immediate)
 
@@ -127,14 +138,14 @@ ADD_rri          .... 001 0100 . .... .... ............       @s_rri_rot
 ADC_rri          .... 001 0101 . .... .... ............       @s_rri_rot
 SBC_rri          .... 001 0110 . .... .... ............       @s_rri_rot
 RSC_rri          .... 001 0111 . .... .... ............       @s_rri_rot
-TST_xri          .... 001 1000 1 .... 0000 ............       @S_xri_rot
-TEQ_xri          .... 001 1001 1 .... 0000 ............       @S_xri_rot
-CMP_xri          .... 001 1010 1 .... 0000 ............       @S_xri_rot
-CMN_xri          .... 001 1011 1 .... 0000 ............       @S_xri_rot
+TST_xri          .... 001 1000 1 .... ---- ............       @S_xri_rot
+TEQ_xri          .... 001 1001 1 .... ---- ............       @S_xri_rot
+CMP_xri          .... 001 1010 1 .... ---- ............       @S_xri_rot
+CMN_xri          .... 001 1011 1 .... ---- ............       @S_xri_rot
 ORR_rri          .... 001 1100 . .... .... ............       @s_rri_rot
-MOV_rxi          .... 001 1101 . 0000 .... ............       @s_rxi_rot
+MOV_rxi          .... 001 1101 . ---- .... ............       @s_rxi_rot
 BIC_rri          .... 001 1110 . .... .... ............       @s_rri_rot
-MVN_rxi          .... 001 1111 . 0000 .... ............       @s_rxi_rot
+MVN_rxi          .... 001 1111 . ---- .... ............       @s_rxi_rot
 
 # Multiply and multiply accumulate
 

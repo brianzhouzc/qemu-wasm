@@ -444,7 +444,7 @@ ipod_classic_unimplemented[] = {
     { "s5l8702.usb-fc",   USB_FC_MEM_BASE,   0x100000 },
     { "s5l8702.ata-unk",  ATA_UNK_MEM_BASE,  0x100000 },
     { "s5l8702.sdci",     SDCI_MEM_BASE,     0x100000 },
-    { "s5l8702.aes",      AES_MEM_BASE,      0x100000 },
+    /* s5l8702.aes (0x38C00000) is a real device now; see the machine init. */
     { "s5l8702.adm-sfr",  ADM_SFR_MEM_BASE,  0x100000 },
     { "s5l8702.lcd-win",  LCD_WIN_MEM_BASE,  0x100000 },
     { "s5l8702.fmc",      FMC_MEM_BASE,      0x100000 },
@@ -1702,6 +1702,16 @@ static void ipod_classic_machine_init(MachineState *machine)
      */
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        s5l8702_get_irq(nms, S5L8702_SM1_IRQ));
+
+    /*
+     * The AES engine (0x38C00000).  Apple's retailOS decrypts the games in
+     * Extras > Games through it, and it was a zero window, so the driver's
+     * poll for "done" never ended and starting a game froze the guest.  See
+     * ipod_classic_aes.c.  Full 1 MB window, as before.
+     */
+    dev = qdev_new(TYPE_IPOD_CLASSIC_AES);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, AES_MEM_BASE);
 
     /* Serial console. */
     exynos4210_uart_create(UART0_MEM_BASE, 256, 0, serial_hd(0),
