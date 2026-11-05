@@ -778,7 +778,9 @@ bool ipod_classic_power_key_event(int keycode)
  * how a firmware turns the device off: Rockbox writes it from power_off(),
  * shows "Shutting down..." and then waits for the supply to drop, which never
  * happens here.  There is no supply to cut, so the machine just remembers that
- * it is off; the screen keeps its last frame and the next key powers it on.
+ * it is off and the next key powers it on.  The PMU cuts the one supply it
+ * models, the backlight's, so the screen goes dark; the panel's image memory,
+ * and so the published frame, keeps what it last showed.
  */
 void ipod_classic_power_off(void)
 {

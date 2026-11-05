@@ -36,6 +36,10 @@
  *   - The hold switch, GPIOSTAT bit 1, and its change interrupt, INT6 bit 1.
  *   - The RTC's time, RTCSC..RTCYR, read from the host's clock in UTC; see
  *     the note at the read.  A write to it is stored and never read back.
+ *   - The LED converter that drives the LCD's backlight, LEDOUT..LEDDIM,
+ *     with its dimming ramp, and its loss of supply when OOCSHDWN cuts the
+ *     power.  The level reaches the page through ipod_wasm_backlight().  See
+ *     THE BACKLIGHT below.
  *
  * WHAT IS NOT
  *
@@ -148,6 +152,172 @@ static void pmu_update_irq(IPodClassicPMUState *s)
     }
     qemu_set_irq(s->nirq, pending);
 }
+
+/*
+ * THE BACKLIGHT.  The LCD's LEDs hang off this chip's LED boost converter,
+ * and both firmwares drive it through the same four registers:
+ *
+ *   LEDOUT 0x28   output current, 0..63 in bits 5:0
+ *   LEDENA 0x29   bit 0 turns the converter on
+ *   LEDCTL 0x2a   over-voltage and over-current protection
+ *   LEDDIM 0x2b   the dimming step time, 16 * LEDDIM / 32768 s
+ *
+ * Rockbox (target/arm/s5l8702/ipod6g/backlight-6g.c) writes the brightness
+ * setting, 1..63 with 0x20 the default, to LEDOUT, and turns the light on and
+ * off with LEDENA.  It sets LEDCTL 0x05 and LEDDIM 0x14, a step of 9.77 ms,
+ * and when it must "kill the backlight, instantly" it writes LEDDIM 0 first.
+ * That is the evidence for the ramp below: a change of LEDOUT or LEDENA walks
+ * the current one step per LEDDIM period, both ways, and LEDDIM 0 jumps.
+ * Rockbox has no software fade on this target, so the ramp is the fade.
+ *
+ * Apple's 2.0.5, MEASURED with PMUPTR: LEDOUT 0x1a and LEDENA 1 at boot; the
+ * backlight timer writes LEDENA 0 and any input LEDENA 1; Settings >
+ * Brightness writes LEDOUT only, 0x06 at 0 % to 0x2e at 100 %.  It writes
+ * neither LEDCTL nor LEDDIM, in a boot, a brightness change or the timer, so
+ * on the hardware its fade is whatever its bootloader left in LEDDIM.
+ *
+ * The reset values are therefore an ASSUMPTION, marked as one: the state a
+ * bootloader leaves, which this machine skips (it starts the OS with the boot
+ * screen already up, see ipod_classic_lcd_paint_boot_screen()).  Rockbox's
+ * bootloader leaves LEDCTL 0x05, LEDDIM 0x14, LEDOUT 0x20, LEDENA 1; Apple's
+ * is not in any of our sources, so it gets the same.
+ *
+ * ALSO ASSUMED: that the light is proportional to LEDOUT.  Nothing we have
+ * says how the 64 steps map to current; 64 equal steps is the plain reading,
+ * and it is the page's business to turn a level into a picture.
+ *
+ * The ramp runs on QEMU_CLOCK_REALTIME, like this chip's RTC above: it is the
+ * PMU's own 32 kHz oscillator, and it has to look like a fade to someone
+ * watching, whatever the virtual clock is doing under -icount.
+ */
+#define PMU_BL_TICK_NS (NANOSECONDS_PER_SECOND / 60)
+
+static uint8_t pmu_bl_target(IPodClassicPMUState *s)
+{
+    if (s->standby || !(s->reg[PCF5063X_REG_LEDENA] & PCF5063X_LEDENA_ON)) {
+        return 0;
+    }
+    return s->reg[PCF5063X_REG_LEDOUT] & PCF5063X_LEDOUT_MASK;
+}
+
+static uint32_t pmu_bl_step_ns(IPodClassicPMUState *s)
+{
+    return (uint64_t)s->reg[PCF5063X_REG_LEDDIM] * 16 *
+           NANOSECONDS_PER_SECOND / 32768;
+}
+
+/* The output current, in LEDOUT steps, at REALTIME `now`. */
+static uint8_t pmu_bl_level_at(IPodClassicPMUState *s, int64_t now)
+{
+    int64_t steps;
+
+    if (s->bl_from == s->bl_to || !s->bl_step_ns) {
+        return s->bl_to;
+    }
+    steps = MAX(now - s->bl_start_ns, 0) / s->bl_step_ns;
+    if (s->bl_from < s->bl_to) {
+        return MIN(s->bl_from + steps, s->bl_to);
+    }
+    return MAX((int64_t)s->bl_from - steps, s->bl_to);
+}
+
+/*
+ * ipod_wasm_backlight()'s word.  Bits 7:0 the level now, 15:8 where the ramp
+ * is going, 21:16 LEDOUT, bit 24 LEDENA, bit 25 standby (the PMU has cut the
+ * power: the machine is off), bit 31 set once there is a PMU at all.
+ */
+static void pmu_bl_publish(IPodClassicPMUState *s, uint8_t level)
+{
+    uint32_t v = level | (uint32_t)s->bl_to << 8 |
+                 (uint32_t)(s->reg[PCF5063X_REG_LEDOUT] &
+                            PCF5063X_LEDOUT_MASK) << 16 |
+                 (uint32_t)(s->reg[PCF5063X_REG_LEDENA] &
+                            PCF5063X_LEDENA_ON) << 24 |
+                 (uint32_t)s->standby << 25 | 1u << 31;
+
+    qatomic_set(&s->bl_published, v);
+}
+
+static void pmu_bl_trace(IPodClassicPMUState *s, uint8_t level)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("BLTRACE") != NULL;
+    }
+    if (on) {
+        fprintf(stderr, "BLTRACE %" PRId64 " level %u -> %u step %u ns%s\n",
+                qemu_clock_get_us(QEMU_CLOCK_REALTIME), (unsigned)level,
+                (unsigned)s->bl_to, (unsigned)s->bl_step_ns,
+                s->standby ? " standby" : "");
+    }
+}
+
+/*
+ * Publish the level now and keep publishing while the ramp walks.  The page
+ * samples the word at its own rate, so one publish per step, or per 60 Hz
+ * frame when the steps are shorter, is all it can use.
+ */
+static void pmu_bl_tick(void *opaque)
+{
+    IPodClassicPMUState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    uint8_t level = pmu_bl_level_at(s, now);
+
+    pmu_bl_publish(s, level);
+    if (level != s->bl_to) {
+        timer_mod_ns(s->bl_ramp, now + MAX(s->bl_step_ns, PMU_BL_TICK_NS));
+    }
+}
+
+/*
+ * A write moved the target or the step time: start a new ramp from wherever
+ * the current is now.  A write that changes neither leaves the ramp alone --
+ * Apple's firmware writes LEDENA 1 twice for every key, and restarting the
+ * ramp on each one would hold a fade back by up to a step per key -- but
+ * still publishes, for a LEDOUT written while the light is off.
+ */
+static void pmu_bl_update(IPodClassicPMUState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    uint8_t target = pmu_bl_target(s);
+    /* A cut supply does not ramp: the converter just stops. */
+    uint32_t step = s->standby ? 0 : pmu_bl_step_ns(s);
+    uint8_t level;
+
+    if (target == s->bl_to && step == s->bl_step_ns) {
+        pmu_bl_publish(s, pmu_bl_level_at(s, now));
+        return;
+    }
+    level = s->standby ? 0 : pmu_bl_level_at(s, now);
+    s->bl_from = level;
+    s->bl_to = target;
+    s->bl_step_ns = step;
+    s->bl_start_ns = now;
+    pmu_bl_trace(s, level);
+    if (level == target || !step) {
+        s->bl_from = target;
+        timer_del(s->bl_ramp);
+        pmu_bl_publish(s, target);
+        return;
+    }
+    pmu_bl_tick(s);
+}
+
+#ifdef EMSCRIPTEN
+#include <emscripten.h>
+
+static IPodClassicPMUState *wasm_pmu_state;
+
+/*
+ * The backlight for the page, packed as pmu_bl_publish() says; 0 before the
+ * PMU exists.  Read from the page's thread, so it is one word written whole.
+ */
+EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_backlight(void)
+{
+    return wasm_pmu_state ? qatomic_read(&wasm_pmu_state->bl_published) : 0;
+}
+#endif
 
 void ipod_classic_pmu_set_hold(IPodClassicPMUState *s, bool on)
 {
@@ -333,11 +503,23 @@ static void pmu_reg_write(IPodClassicPMUState *s, uint8_t addr, uint8_t val)
          * waits for the supply to drop -- which never happens in a model with
          * no supply.  Tell the machine instead, so a later key press can power
          * it back on with a reset (see ipod_classic_power_off()).
+         *
+         * The one supply this model can cut is the backlight's: the screen of
+         * an iPod that is off is dark, whatever the panel last showed, and
+         * that is what tells "off" from "backlight timed out" on the page.
          */
         s->reg[addr] = val;
         if (val) {
+            s->standby = true;
+            pmu_bl_update(s);
             ipod_classic_power_off();
         }
+        return;
+    case PCF5063X_REG_LEDOUT:
+    case PCF5063X_REG_LEDENA:
+    case PCF5063X_REG_LEDDIM:
+        s->reg[addr] = val;
+        pmu_bl_update(s);
         return;
     case PCF5063X_REG_ADCC1:
         s->reg[addr] = val;
@@ -548,6 +730,25 @@ static void ipod_classic_pmu_reset(DeviceState *dev)
     s->reg[PCF5063X_REG_OOCSTAT] = PCF5063X_OOCSTAT_HEALTHY;
     s->reg[PCF5063X_REG_MBCS1] = PCF5063X_MBCS1_HEALTHY;
 
+    /*
+     * The backlight as a bootloader leaves it, lit and at rest: ASSUMED, see
+     * THE BACKLIGHT.  A reset is also how the machine powers on, which is when
+     * the supply comes back.
+     */
+    if (!s->bl_ramp) {
+        s->bl_ramp = timer_new_ns(QEMU_CLOCK_REALTIME, pmu_bl_tick, s);
+    }
+    timer_del(s->bl_ramp);
+    s->reg[PCF5063X_REG_LEDCTL] = 0x05;
+    s->reg[PCF5063X_REG_LEDDIM] = 0x14;
+    s->reg[PCF5063X_REG_LEDOUT] = 0x20;
+    s->reg[PCF5063X_REG_LEDENA] = PCF5063X_LEDENA_ON;
+    s->standby = false;
+    s->bl_to = s->bl_from = pmu_bl_target(s);
+    s->bl_step_ns = pmu_bl_step_ns(s);
+    s->bl_start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    pmu_bl_publish(s, s->bl_to);
+
     pmu_update_irq(s);
 }
 
@@ -556,6 +757,45 @@ static void ipod_classic_pmu_init(Object *obj)
     IPodClassicPMUState *s = IPOD_CLASSIC_PMU(obj);
 
     qdev_init_gpio_out(DEVICE(obj), &s->nirq, 1);
+#ifdef EMSCRIPTEN
+    wasm_pmu_state = s;
+#endif
+}
+
+/*
+ * The ramp is saved as where it stood, and walks on from there after the
+ * restore: its start time is REALTIME, which means nothing in another session.
+ * Where it is going comes from the registers.  `standby` is not saved, like
+ * the machine's own powered_off it pairs with.
+ */
+static int ipod_classic_pmu_pre_save(void *opaque)
+{
+    IPodClassicPMUState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    /* The same ramp, restarted from here, so the running machine is unmoved. */
+    s->bl_from = pmu_bl_level_at(s, now);
+    s->bl_start_ns = now;
+    return 0;
+}
+
+static int ipod_classic_pmu_post_load(void *opaque, int version_id)
+{
+    IPodClassicPMUState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    s->standby = false;
+    s->bl_to = pmu_bl_target(s);
+    s->bl_step_ns = pmu_bl_step_ns(s);
+    s->bl_start_ns = now;
+    if (s->bl_from == s->bl_to || !s->bl_step_ns) {
+        s->bl_from = s->bl_to;
+        timer_del(s->bl_ramp);
+        pmu_bl_publish(s, s->bl_to);
+    } else {
+        pmu_bl_tick(s);
+    }
+    return 0;
 }
 
 /*
@@ -566,8 +806,10 @@ static void ipod_classic_pmu_init(Object *obj)
  */
 static const VMStateDescription vmstate_ipod_classic_pmu = {
     .name = TYPE_IPOD_CLASSIC_PMU,
-    .version_id = 4,
-    .minimum_version_id = 4,
+    .version_id = 5,
+    .minimum_version_id = 5,
+    .pre_save = ipod_classic_pmu_pre_save,
+    .post_load = ipod_classic_pmu_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_I2C_SLAVE(parent_obj, IPodClassicPMUState),
         VMSTATE_UINT8_ARRAY(reg, IPodClassicPMUState, S5L8702_PMU_NUM_REGS),
@@ -577,6 +819,7 @@ static const VMStateDescription vmstate_ipod_classic_pmu = {
         VMSTATE_BOOL(wrote_data, IPodClassicPMUState),
         VMSTATE_TIMER_PTR(rtc_second, IPodClassicPMUState),
         VMSTATE_BOOL(hold, IPodClassicPMUState),
+        VMSTATE_UINT8(bl_from, IPodClassicPMUState),
         VMSTATE_END_OF_LIST()
     },
 };
