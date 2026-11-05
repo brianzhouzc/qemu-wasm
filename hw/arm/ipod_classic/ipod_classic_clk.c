@@ -10,6 +10,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bitops.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "exec/cpu-common.h"
@@ -29,17 +30,30 @@
  */
 #define S5L8702_BOOT_TAG_ADDR   0x2203ff00
 
-static uint64_t ipod_classic_clk_read(void *opaque, hwaddr offset,
-                                      unsigned size)
+/*
+ * Byte and halfword accesses.
+ *
+ * The CG16 clock gates are 16-bit registers in the halves of CLKCON0, 2, 3, 4
+ * and 5: CG16_SYS is the low half of +0x00, CG16_SVID the high half of +0x08,
+ * and so on.  Rockbox's s5l87xx.h declares them as uint16_t ("on HW they are
+ * really halves of 32-bit registers") and its get_system_freqs() reads
+ * CG16_SYS with an LDRH.
+ *
+ * This block used to accept words only.  QEMU answers an access the region
+ * does not accept with a bus error, so that LDRH became a data abort:
+ * Rockbox's System > Debug > View HW info calls get_system_freqs() before it
+ * draws its first page, took the abort, and its panic path then faulted on
+ * its own stack until the machine sat in the abort vector with interrupts
+ * masked (MEASURED on qemu 332b67d, the JIT and TCI alike: "Invalid read at
+ * addr 0x0, size 2, region 's5l8702.clk'", then DFAR 0xfffffff8 for ever).
+ *
+ * So a narrow read returns its lane of the word, and a narrow write changes
+ * only its lane.  Rockbox writes the gates with STRH too, in its bootloader,
+ * which this machine skips; the write path is the same rule for whoever does.
+ */
+static uint32_t ipod_classic_clk_read_word(IPodClassicClkState *s,
+                                           hwaddr offset)
 {
-    IPodClassicClkState *s = opaque;
-
-    if (offset + size > S5L8702_CLK_MEM_SIZE) {
-        qemu_log_mask(LOG_GUEST_ERROR, "%s: read past the block at 0x%"
-                      HWADDR_PRIx "\n", __func__, offset);
-        return 0;
-    }
-
     switch (offset) {
     case S5L8702_CLK_PLLLOCK:
         /*
@@ -64,10 +78,29 @@ static uint64_t ipod_classic_clk_read(void *opaque, hwaddr offset,
     }
 }
 
+static uint64_t ipod_classic_clk_read(void *opaque, hwaddr offset,
+                                      unsigned size)
+{
+    IPodClassicClkState *s = opaque;
+
+    if (offset + size > S5L8702_CLK_MEM_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: read past the block at 0x%"
+                      HWADDR_PRIx "\n", __func__, offset);
+        return 0;
+    }
+
+    return extract32(ipod_classic_clk_read_word(s, offset & ~3),
+                     (offset & 3) * 8, size * 8);
+}
+
 static void ipod_classic_clk_write(void *opaque, hwaddr offset,
                                    uint64_t value, unsigned size)
 {
     IPodClassicClkState *s = opaque;
+    unsigned shift = (offset & 3) * 8;
+    /* The bits this access covers, and the value moved into them. */
+    uint32_t mask = MAKE_64BIT_MASK(shift, size * 8);
+    uint32_t lane = (uint32_t)(value << shift) & mask;
 
     if (offset + size > S5L8702_CLK_MEM_SIZE) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write past the block at 0x%"
@@ -76,9 +109,10 @@ static void ipod_classic_clk_write(void *opaque, hwaddr offset,
         return;
     }
 
+    offset &= ~3;
     switch (offset) {
     case S5L8702_CLK_SWRCON:
-        if (value != 0) {
+        if (lane != 0) {
             char tag[9] = { 0 };
 
             cpu_physical_memory_read(S5L8702_BOOT_TAG_ADDR, tag, 8);
@@ -91,31 +125,32 @@ static void ipod_classic_clk_write(void *opaque, hwaddr offset,
             uint32_t pc = cs ? (uint32_t)CPU_GET_CLASS(cs)->get_pc(cs) : 0;
 
             warn_report("S5L8702: guest asked for a software reset "
-                        "(SWRCON = 0x%" PRIx64 "), next image \"%s\" pc~0x%08x",
-                        value, tag, pc);
+                        "(SWRCON = 0x%" PRIx32 "), next image \"%s\" pc~0x%08x",
+                        lane, tag, pc);
             s->reg[S5L8702_CLK_RSTSR / 4] |= S5L8702_RSTSR_SWR;
             qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         }
-        s->reg[offset / 4] = value;
+        s->reg[offset / 4] = (s->reg[offset / 4] & ~mask) | lane;
         break;
     case S5L8702_CLK_RSTSR:
         /* Write-one-to-clear, the usual Samsung convention for this one. */
-        s->reg[offset / 4] &= ~(uint32_t)value;
+        s->reg[offset / 4] &= ~lane;
         break;
     case S5L8702_CLK_PLLLOCK:
         qemu_log_mask(LOG_GUEST_ERROR, "%s: PLLLOCK is read-only\n", __func__);
         break;
     default:
-        s->reg[offset / 4] = value;
+        s->reg[offset / 4] = (s->reg[offset / 4] & ~mask) | lane;
         break;
     }
 }
 
+/* Words, and the halfwords and bytes in them; see the note above the reads. */
 static const MemoryRegionOps ipod_classic_clk_ops = {
     .read = ipod_classic_clk_read,
     .write = ipod_classic_clk_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid.min_access_size = 4,
+    .valid.min_access_size = 1,
     .valid.max_access_size = 4,
 };
 
