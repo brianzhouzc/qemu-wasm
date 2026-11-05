@@ -48,7 +48,10 @@ void init_wasm32();
 /* How many translation blocks have been compiled into Wasm modules so far. */
 extern unsigned long wasm_tb_compiled_count;
 
-/* Override the run count at which a block is compiled (machine property). */
+/*
+ * Override the run count at which a block is compiled (machine properties
+ * wasm-instantiate and wasm-jit).  INT32_MAX keeps every block in TCI.
+ */
 void wasm_set_instantiate_num(int n);
 
 #endif

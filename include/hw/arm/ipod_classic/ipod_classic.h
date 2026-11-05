@@ -269,6 +269,8 @@ typedef struct {
      */
     uint32_t heartbeat_ms;
     uint32_t wasm_instantiate;
+    /* wasm-jit: compile hot blocks into Wasm (default on); off is TCI only. */
+    bool wasm_jit;
     /*
      * Set when the PMU's ON/OFF controller was asked to cut the power.  The
      * guest keeps running (it spins in its power-off path), and the next key
