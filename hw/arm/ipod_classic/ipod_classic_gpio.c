@@ -8,8 +8,9 @@
  * Deliberately minimal. Reads of PDAT return modelled INPUT levels, which are
  * all zero except pin 86; that is bit-for-bit what create_unimplemented_device()
  * used to return, so nothing else in the machine can have changed behaviour.
- * The other thing it does is tell the wheel when the guest drives its pins low,
- * which is how the hold switch reaches the wheel; see the header.
+ * The other things it does are tell the wheel when the guest drives its pins
+ * low, which is how the hold switch reaches the wheel (see the header), and
+ * drive the chip select of the NOR on SPI0 (see gpio_update_spi0_cs()).
  *
  * GPIOTRACE=1 prints every access with the guest PC, like ATATRACE and
  * LCDTRACE.
@@ -105,6 +106,28 @@ static void gpio_update_wheel_pins(IPodClassicGPIOState *s)
                                  S5L8702_GPIO_WHEEL_PIN_B));
 }
 
+/*
+ * The NOR's chip select, GPIO 0.0, active low.  Rockbox selects it with
+ * GPIOCMD 0x0000e and lets go with 0x0000f (spi_ce() in spi-s5l8702.c); any
+ * other setting of the pin, including the SPI function spi_init() gives
+ * pins 0-3, leaves it deselected.  A select driven through PDAT would be
+ * missed, since outputs are not modelled (see the write path); no driver we
+ * have does that.
+ */
+static void gpio_update_spi0_cs(IPodClassicGPIOState *s)
+{
+    unsigned func = extract32(s->pcon[S5L8702_GPIO_SPI0_CS_GROUP],
+                              S5L8702_GPIO_SPI0_CS_PIN * 4, 4);
+
+    qemu_set_irq(s->spi0_cs, func != 0xe);
+}
+
+static void gpio_update_outputs(IPodClassicGPIOState *s)
+{
+    gpio_update_wheel_pins(s);
+    gpio_update_spi0_cs(s);
+}
+
 static void ipod_classic_gpio_cmd(IPodClassicGPIOState *s, uint32_t value)
 {
     unsigned group = (value >> 16) & 0xff;
@@ -116,7 +139,7 @@ static void ipod_classic_gpio_cmd(IPodClassicGPIOState *s, uint32_t value)
         return;
     }
     s->pcon[group] = deposit32(s->pcon[group], pin * 4, 4, value & 0xf);
-    gpio_update_wheel_pins(s);
+    gpio_update_outputs(s);
 }
 
 static void ipod_classic_gpio_write(void *opaque, hwaddr offset,
@@ -145,7 +168,7 @@ static void ipod_classic_gpio_write(void *opaque, hwaddr offset,
     switch (reg) {
     case S5L8702_GPIO_PCON:
         s->pcon[group] = value;
-        gpio_update_wheel_pins(s);
+        gpio_update_outputs(s);
         break;
     case S5L8702_GPIO_PUNA:
         s->puna[group] = value;
@@ -205,7 +228,7 @@ static void ipod_classic_gpio_reset(DeviceState *dev)
         s->pdat[S5L8702_GPIO_PIN_MEDIA / 8] |=
             1u << (S5L8702_GPIO_PIN_MEDIA % 8);
     }
-    gpio_update_wheel_pins(s);
+    gpio_update_outputs(s);
 }
 
 static Property ipod_classic_gpio_props[] = {
@@ -222,6 +245,7 @@ static void ipod_classic_gpio_realize(DeviceState *dev, Error **errp)
                           TYPE_IPOD_CLASSIC_GPIO, S5L8702_GPIO_MEM_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     qdev_init_gpio_out_named(dev, &s->wheel_pins_low, "wheel-pins-low", 1);
+    qdev_init_gpio_out_named(dev, &s->spi0_cs, "spi0-cs", 1);
 }
 
 static const VMStateDescription vmstate_ipod_classic_gpio = {

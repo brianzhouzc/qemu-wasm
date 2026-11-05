@@ -69,6 +69,7 @@ arm_ss.add(when: 'CONFIG_IPOD_CLASSIC_6G', if_true: files(
   'ipod_classic/ipod_classic.c',
   'ipod_classic/ipod_classic_timer.c',
   'ipod_classic/ipod_classic_clk.c',
+  'ipod_classic/ipod_classic_spi.c',
   'ipod_classic/ipod_classic_i2c.c',
   'ipod_classic/ipod_classic_pmu.c',
   'ipod_classic/ipod_classic_ata.c',

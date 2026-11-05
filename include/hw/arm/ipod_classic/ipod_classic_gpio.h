@@ -115,12 +115,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicGPIOState, IPOD_CLASSIC_GPIO)
 #define S5L8702_GPIO_WHEEL_PIN_A  2
 #define S5L8702_GPIO_WHEEL_PIN_B  4
 
+/* The NOR's chip select on SPI0, active low; see the .c. */
+#define S5L8702_GPIO_SPI0_CS_GROUP  0
+#define S5L8702_GPIO_SPI0_CS_PIN    0
+
 struct IPodClassicGPIOState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     /* 1 while the guest holds the wheel's pins low; goes to the wheel. */
     qemu_irq wheel_pins_low;
+    /* The NOR's chip select: 0 while selected. */
+    qemu_irq spi0_cs;
 
     uint32_t pcon[S5L8702_GPIO_GROUPS];
     uint32_t puna[S5L8702_GPIO_GROUPS];

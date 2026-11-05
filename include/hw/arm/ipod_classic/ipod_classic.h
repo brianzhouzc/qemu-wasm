@@ -113,11 +113,16 @@
 #define I2S_MEM_BASE      0x3CA00000   /* I2S_BASE */
 #define SPDIF_MEM_BASE    0x3CB00000   /* SPD_BASE */
 #define UART0_MEM_BASE    0x3CC00000   /* UARTC_BASE_ADDR */
-#define SPI0_MEM_BASE     0x3CD00000   /* SPI_BASE */
-#define ADC_MEM_BASE      0x3CE00000   /* ADC_BASE */
+/*
+ * The SPI controllers are at Rockbox's SPIBASE(i) for this SoC.  Its SPI_BASE
+ * (0x3CD00000) and ADC_BASE (0x3CE00000) are the S5L8700's; this machine
+ * used them until the SPI0 model, so nothing answered where the NOR is.
+ */
+#define SPI0_MEM_BASE     0x3C300000   /* SPIBASE(0): the NOR, see _spi.h */
+#define SPI1_MEM_BASE     0x3CE00000   /* SPIBASE(1), not modelled */
 #define GPIO_MEM_BASE     0x3CF00000   /* GPIO_BASE */
 #define CHIPID_MEM_BASE   0x3D100000   /* CHIPID_BASE */
-#define RTC_MEM_BASE      0x3D200000   /* RTC_BASE, also SPIBASE(2) */
+#define SPI2_MEM_BASE     0x3D200000   /* SPIBASE(2), not modelled */
 #define ADM_MEM_BASE      0x3F000000   /* ADM_BASE */
 
 /* IRQ numbers, from the IRQ_* macros in s5l87xx.h. */

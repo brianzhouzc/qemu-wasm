@@ -689,6 +689,8 @@ config IPOD_CLASSIC_6G
     select I2C
     select IDE_QDEV
     select IPOD_TOUCH_SHA1
+    select SSI
+    select SSI_M25P80
 
 # The S5L8702 shares its SHA-1 block with the S5L8720. Only this one source
 # file of the Touch machine is needed here; the rest of it needs OpenSSL.
