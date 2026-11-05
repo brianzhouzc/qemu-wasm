@@ -28,6 +28,8 @@
 #include "hw/dma/pl080.h"
 #include "hw/arm/ipod_classic/ipod_classic.h"
 #include "hw/arm/ipod_classic/ipod_classic_cs42l55.h"
+#include "hw/arm/ipod_classic/ipod_classic_spi.h"
+#include "hw/ssi/ssi.h"
 #include "hw/arm/ipod_classic/ipod_classic_timer.h"
 /* The S5L8720's SHA-1 block; the S5L8702 drives the same register map. */
 #include "hw/arm/ipod_touch_sha1.h"
@@ -455,10 +457,10 @@ ipod_classic_unimplemented[] = {
     { "s5l8702.wdt",      WDT_MEM_BASE,      0x100000 },
     /* s5l8702.i2s is a real device now; see the machine init. */
     { "s5l8702.spdif",    SPDIF_MEM_BASE,    0x100000 },
-    { "s5l8702.spi0",     SPI0_MEM_BASE,     0x100000 },
-    { "s5l8702.adc",      ADC_MEM_BASE,      0x100000 },
+    /* s5l8702.spi0 (0x3C300000) is a real device now; see the machine init. */
+    { "s5l8702.spi1",     SPI1_MEM_BASE,     0x100000 },
     { "s5l8702.chipid",   CHIPID_MEM_BASE,   0x100000 },
-    { "s5l8702.rtc",      RTC_MEM_BASE,      0x100000 },
+    { "s5l8702.spi2",     SPI2_MEM_BASE,     0x100000 },
     { "s5l8702.adm",      ADM_MEM_BASE,      0x100000 },
 };
 
@@ -1543,6 +1545,42 @@ static void ipod_classic_machine_init(MachineState *machine)
     qdev_prop_set_bit(gpio, "media-present", drive_get(IF_IDE, 0, 0) != NULL);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(gpio), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(gpio), 0, GPIO_MEM_BASE);
+
+    /*
+     * SPI0 and the NOR on it.  Rockbox reads the NOR from System > Debug:
+     * View SysCfg and Dump bootflash to file.  With nothing at 0x3C300000
+     * both spun for ever on the controller's status (see ipod_classic_spi.c).
+     *
+     * The chip is an SST25VF080B, 1 MB: Rockbox's FLASH_SIZE for the 6G, and
+     * its driver's command set (RDSR 0x05, READ 0x03, EWSR 0x50, AAI word
+     * program 0xad, 4 KB erase 0x20) is that part's.  Its select is GPIO 0.0.
+     *
+     * The contents are erased (0xff) unless a NOR image is given with
+     * -drive if=mtd, for instance a dump of the user's own iPod.  The
+     * firmwares do not need one: Apple's 2.0.5 never touches this port in a
+     * boot or in Settings > About (MEASURED, -d unimp), and this machine
+     * hands it SysInfo directly.  An erased NOR is what Rockbox reports as
+     * "SCfg magic not found".  Without a drive the contents live in the
+     * device and are not in a snapshot, so a write made before one is lost
+     * after a restore.
+     */
+    dev = qdev_new(TYPE_IPOD_CLASSIC_SPI);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SPI0_MEM_BASE);
+    {
+        DeviceState *nor = qdev_new("sst25vf080b");
+        DriveInfo *nor_drive = drive_get(IF_MTD, 0, 0);
+
+        if (nor_drive) {
+            qdev_prop_set_drive_err(nor, "drive",
+                                    blk_by_legacy_dinfo(nor_drive),
+                                    &error_fatal);
+        }
+        ssi_realize_and_unref(nor, IPOD_CLASSIC_SPI(dev)->bus, &error_fatal);
+        qdev_connect_gpio_out_named(gpio, "spi0-cs", 0,
+                                    qdev_get_gpio_in_named(nor, SSI_GPIO_CS,
+                                                           0));
+    }
 
     /*
      * The click wheel at 0x3C200000, and with it the keyboard. This is what
