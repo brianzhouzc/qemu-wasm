@@ -16,6 +16,7 @@
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
 #include "qom/object.h"
+#include "qemu/seqlock.h"
 
 #define TYPE_IPOD_CLASSIC_PMU "pcf50635"
 OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicPMUState, IPOD_CLASSIC_PMU)
@@ -146,21 +147,22 @@ struct IPodClassicPMUState {
     /*
      * The LED converter that lights the LCD; see THE BACKLIGHT in the .c.
      * Its output walks one current step every bl_step_ns, from bl_from at
-     * bl_start_ns (QEMU_CLOCK_REALTIME) towards bl_to.  bl_ramp publishes
-     * the steps while it walks.
+     * bl_start_ns (QEMU_CLOCK_REALTIME) towards bl_to.
      */
     uint8_t bl_from;
     uint8_t bl_to;
     uint32_t bl_step_ns;
     int64_t bl_start_ns;
-    QEMUTimer *bl_ramp;
     /*
      * OOCSHDWN was written: the ON/OFF controller has cut the supplies, the
      * LED converter's with them, until the reset that powers the machine on.
      */
     bool standby;
-    /* What ipod_wasm_backlight() returns; written here, read by the page. */
-    uint32_t bl_published;
+    /*
+     * The page reads the ramp and LEDOUT/LEDENA from its own thread, with no
+     * BQL: every write to them is a write section of this.
+     */
+    QemuSeqLock bl_lock;
 };
 
 /* Slide the switch; the guest hears about it through INT6 and nIRQ. */

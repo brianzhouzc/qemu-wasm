@@ -65,6 +65,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "qemu/seqlock.h"
 #include "hw/i2c/i2c.h"
 #include "hw/irq.h"
 #include "migration/vmstate.h"
@@ -188,10 +189,10 @@ static void pmu_update_irq(IPodClassicPMUState *s)
  *
  * The ramp runs on QEMU_CLOCK_REALTIME, like this chip's RTC above: it is the
  * PMU's own 32 kHz oscillator, and it has to look like a fade to someone
- * watching, whatever the virtual clock is doing under -icount.
+ * watching, whatever the virtual clock is doing under -icount.  Nothing ticks
+ * it: the level is worked out from the ramp's start whenever it is read, by
+ * the page on its own thread too (see ipod_wasm_backlight()).
  */
-#define PMU_BL_TICK_NS (NANOSECONDS_PER_SECOND / 60)
-
 static uint8_t pmu_bl_target(IPodClassicPMUState *s)
 {
     if (s->standby || !(s->reg[PCF5063X_REG_LEDENA] & PCF5063X_LEDENA_ON)) {
@@ -221,23 +222,6 @@ static uint8_t pmu_bl_level_at(IPodClassicPMUState *s, int64_t now)
     return MAX((int64_t)s->bl_from - steps, s->bl_to);
 }
 
-/*
- * ipod_wasm_backlight()'s word.  Bits 7:0 the level now, 15:8 where the ramp
- * is going, 21:16 LEDOUT, bit 24 LEDENA, bit 25 standby (the PMU has cut the
- * power: the machine is off), bit 31 set once there is a PMU at all.
- */
-static void pmu_bl_publish(IPodClassicPMUState *s, uint8_t level)
-{
-    uint32_t v = level | (uint32_t)s->bl_to << 8 |
-                 (uint32_t)(s->reg[PCF5063X_REG_LEDOUT] &
-                            PCF5063X_LEDOUT_MASK) << 16 |
-                 (uint32_t)(s->reg[PCF5063X_REG_LEDENA] &
-                            PCF5063X_LEDENA_ON) << 24 |
-                 (uint32_t)s->standby << 25 | 1u << 31;
-
-    qatomic_set(&s->bl_published, v);
-}
-
 static void pmu_bl_trace(IPodClassicPMUState *s, uint8_t level)
 {
     static int on = -1;
@@ -254,30 +238,14 @@ static void pmu_bl_trace(IPodClassicPMUState *s, uint8_t level)
 }
 
 /*
- * Publish the level now and keep publishing while the ramp walks.  The page
- * samples the word at its own rate, so one publish per step, or per 60 Hz
- * frame when the steps are shorter, is all it can use.
+ * The registers or the supply changed: start a new ramp from wherever the
+ * current is now, towards the new target at the new step time.  A change that
+ * moves neither leaves the ramp alone -- Apple's firmware writes LEDENA 1
+ * twice for every key and Rockbox's Brightness list rewrites LEDOUT a dozen
+ * times a second, and restarting the ramp on each would hold a fade back.
+ * Call it inside bl_lock's write section.
  */
-static void pmu_bl_tick(void *opaque)
-{
-    IPodClassicPMUState *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-    uint8_t level = pmu_bl_level_at(s, now);
-
-    pmu_bl_publish(s, level);
-    if (level != s->bl_to) {
-        timer_mod_ns(s->bl_ramp, now + MAX(s->bl_step_ns, PMU_BL_TICK_NS));
-    }
-}
-
-/*
- * A write moved the target or the step time: start a new ramp from wherever
- * the current is now.  A write that changes neither leaves the ramp alone --
- * Apple's firmware writes LEDENA 1 twice for every key, and restarting the
- * ramp on each one would hold a fade back by up to a step per key -- but
- * still publishes, for a LEDOUT written while the light is off.
- */
-static void pmu_bl_update(IPodClassicPMUState *s)
+static void pmu_bl_retarget(IPodClassicPMUState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     uint8_t target = pmu_bl_target(s);
@@ -286,7 +254,6 @@ static void pmu_bl_update(IPodClassicPMUState *s)
     uint8_t level;
 
     if (target == s->bl_to && step == s->bl_step_ns) {
-        pmu_bl_publish(s, pmu_bl_level_at(s, now));
         return;
     }
     level = s->standby ? 0 : pmu_bl_level_at(s, now);
@@ -295,13 +262,29 @@ static void pmu_bl_update(IPodClassicPMUState *s)
     s->bl_step_ns = step;
     s->bl_start_ns = now;
     pmu_bl_trace(s, level);
-    if (level == target || !step) {
-        s->bl_from = target;
-        timer_del(s->bl_ramp);
-        pmu_bl_publish(s, target);
-        return;
-    }
-    pmu_bl_tick(s);
+}
+
+/* A write to LEDOUT, LEDENA or LEDDIM. */
+static void pmu_bl_write(IPodClassicPMUState *s, uint8_t addr, uint8_t val)
+{
+    seqlock_write_begin(&s->bl_lock);
+    s->reg[addr] = val;
+    pmu_bl_retarget(s);
+    seqlock_write_end(&s->bl_lock);
+}
+
+/*
+ * ipod_wasm_backlight()'s word.  Bits 7:0 the level at `now`, 15:8 where the
+ * ramp is going, 21:16 LEDOUT, bit 24 LEDENA, bit 25 standby (the PMU has cut
+ * the power: the machine is off), bit 31 set once there is a PMU at all.
+ */
+static uint32_t pmu_bl_word(IPodClassicPMUState *s, int64_t now)
+{
+    return pmu_bl_level_at(s, now) | (uint32_t)s->bl_to << 8 |
+           (uint32_t)(s->reg[PCF5063X_REG_LEDOUT] & PCF5063X_LEDOUT_MASK)
+               << 16 |
+           (uint32_t)(s->reg[PCF5063X_REG_LEDENA] & PCF5063X_LEDENA_ON) << 24 |
+           (uint32_t)s->standby << 25 | 1u << 31;
 }
 
 #ifdef EMSCRIPTEN
@@ -310,12 +293,28 @@ static void pmu_bl_update(IPodClassicPMUState *s)
 static IPodClassicPMUState *wasm_pmu_state;
 
 /*
- * The backlight for the page, packed as pmu_bl_publish() says; 0 before the
- * PMU exists.  Read from the page's thread, so it is one word written whole.
+ * The backlight for the page, packed as pmu_bl_word() says; 0 before the PMU
+ * exists.  It runs on the page's thread, without the BQL, so the ramp is read
+ * under bl_lock and retried if a write landed meanwhile.  The clock is the
+ * same one the vCPU thread starts ramps on: Emscripten's monotonic clock is
+ * performance.timeOrigin + performance.now() on every thread.  Working the
+ * level out here, rather than publishing it from a timer, lets the page
+ * sample a fade as often as it draws one, and costs the machine nothing.
  */
 EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_backlight(void)
 {
-    return wasm_pmu_state ? qatomic_read(&wasm_pmu_state->bl_published) : 0;
+    IPodClassicPMUState *s = wasm_pmu_state;
+    unsigned start;
+    uint32_t v;
+
+    if (!s) {
+        return 0;
+    }
+    do {
+        start = seqlock_read_begin(&s->bl_lock);
+        v = pmu_bl_word(s, qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
+    } while (seqlock_read_retry(&s->bl_lock, start));
+    return v;
 }
 #endif
 
@@ -510,16 +509,17 @@ static void pmu_reg_write(IPodClassicPMUState *s, uint8_t addr, uint8_t val)
          */
         s->reg[addr] = val;
         if (val) {
+            seqlock_write_begin(&s->bl_lock);
             s->standby = true;
-            pmu_bl_update(s);
+            pmu_bl_retarget(s);
+            seqlock_write_end(&s->bl_lock);
             ipod_classic_power_off();
         }
         return;
     case PCF5063X_REG_LEDOUT:
     case PCF5063X_REG_LEDENA:
     case PCF5063X_REG_LEDDIM:
-        s->reg[addr] = val;
-        pmu_bl_update(s);
+        pmu_bl_write(s, addr, val);
         return;
     case PCF5063X_REG_ADCC1:
         s->reg[addr] = val;
@@ -735,10 +735,7 @@ static void ipod_classic_pmu_reset(DeviceState *dev)
      * THE BACKLIGHT.  A reset is also how the machine powers on, which is when
      * the supply comes back.
      */
-    if (!s->bl_ramp) {
-        s->bl_ramp = timer_new_ns(QEMU_CLOCK_REALTIME, pmu_bl_tick, s);
-    }
-    timer_del(s->bl_ramp);
+    seqlock_write_begin(&s->bl_lock);
     s->reg[PCF5063X_REG_LEDCTL] = 0x05;
     s->reg[PCF5063X_REG_LEDDIM] = 0x14;
     s->reg[PCF5063X_REG_LEDOUT] = 0x20;
@@ -747,7 +744,7 @@ static void ipod_classic_pmu_reset(DeviceState *dev)
     s->bl_to = s->bl_from = pmu_bl_target(s);
     s->bl_step_ns = pmu_bl_step_ns(s);
     s->bl_start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-    pmu_bl_publish(s, s->bl_to);
+    seqlock_write_end(&s->bl_lock);
 
     pmu_update_irq(s);
 }
@@ -757,6 +754,7 @@ static void ipod_classic_pmu_init(Object *obj)
     IPodClassicPMUState *s = IPOD_CLASSIC_PMU(obj);
 
     qdev_init_gpio_out(DEVICE(obj), &s->nirq, 1);
+    seqlock_init(&s->bl_lock);
 #ifdef EMSCRIPTEN
     wasm_pmu_state = s;
 #endif
@@ -774,8 +772,10 @@ static int ipod_classic_pmu_pre_save(void *opaque)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 
     /* The same ramp, restarted from here, so the running machine is unmoved. */
+    seqlock_write_begin(&s->bl_lock);
     s->bl_from = pmu_bl_level_at(s, now);
     s->bl_start_ns = now;
+    seqlock_write_end(&s->bl_lock);
     return 0;
 }
 
@@ -784,17 +784,12 @@ static int ipod_classic_pmu_post_load(void *opaque, int version_id)
     IPodClassicPMUState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 
+    seqlock_write_begin(&s->bl_lock);
     s->standby = false;
     s->bl_to = pmu_bl_target(s);
     s->bl_step_ns = pmu_bl_step_ns(s);
     s->bl_start_ns = now;
-    if (s->bl_from == s->bl_to || !s->bl_step_ns) {
-        s->bl_from = s->bl_to;
-        timer_del(s->bl_ramp);
-        pmu_bl_publish(s, s->bl_to);
-    } else {
-        pmu_bl_tick(s);
-    }
+    seqlock_write_end(&s->bl_lock);
     return 0;
 }
 
