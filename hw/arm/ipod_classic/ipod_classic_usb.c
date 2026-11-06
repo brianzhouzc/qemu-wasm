@@ -32,15 +32,30 @@
  *  - The PHY is a register file: the drivers write it and read it back.
  *
  * The host.  A page cannot hand the emulated iPod to the real computer (WebUSB
- * is host-side only), so the other end of the cable is emulated too.  For now
- * it is a script: once the device pulls up, the host resets the bus, then
- * enumerates (device descriptor, address, configuration, strings) and sets
- * configuration 1, logging what the firmware answers.  Mass storage comes
- * next.  It runs on QEMU_CLOCK_VIRTUAL, so it waits through the guest's idle
- * like any other device, and it never acts inside a guest register access.
+ * is host-side only), so the other end of the cable is emulated too.  Once
+ * the device pulls up, the host resets the bus, then enumerates (device
+ * descriptor, address, configuration, strings) and sets configuration 1,
+ * logging what the firmware answers.  Then it mounts the disk: the
+ * configuration's mass-storage interface (08/06/50) gets GET_MAX_LUN, then
+ * INQUIRY, TEST UNIT READY until the firmware has handed its disk over, and
+ * READ CAPACITY, in Bulk-Only Transport over the two bulk endpoints.  From
+ * then on it runs the page's requests (ipod_wasm_usb_io(): READ(10),
+ * WRITE(10), eject), one at a time, through a buffer the page fills or reads.
+ * It reacts on QEMU_CLOCK_VIRTUAL as soon as the driver arms an endpoint, and
+ * never acts inside a guest register access; but it waits, polls and times out
+ * in host time as well (usb_host_poll, usb_host_deadline), because the virtual
+ * clock warps while the vCPU sleeps and Rockbox's tick runs on host time.
  *
- * USBTRACE=1 logs host events and descriptors; 2 adds register writes; 3 adds
- * reads.
+ * MEASURED (Node, JIT): Rockbox's disk is 4096-byte blocks, the whole disk;
+ * its first TEST UNIT READY says "medium not present" (2/3A/00), the next one
+ * is ready; a 256 KB read takes 31 ms (16 ms a request in Chrome).  Apple's
+ * 2.0.5 says "becoming ready" (2/04/01) for 80 s of guest time, about 9 s of
+ * host time, then exports only its FAT32 data partition, in 4096-byte blocks;
+ * it keeps written blocks in RAM until the eject, which it answers with "OK to
+ * Disconnect".
+ *
+ * USBTRACE=1 logs host events, descriptors and the mass-storage setup; 2 adds
+ * the page's SCSI commands and register writes; 3 adds reads.
  */
 
 #include "qemu/osdep.h"
@@ -87,9 +102,34 @@ void ipod_classic_set_usb_cable(bool on);
 #define USB_REQ_GET_DESCRIPTOR     6
 #define USB_REQ_SET_ADDRESS        5
 #define USB_REQ_SET_CONFIGURATION  9
+#define USB_REQ_CLEAR_FEATURE      1
 #define USB_DT_DEVICE              1
 #define USB_DT_CONFIG              2
 #define USB_DT_STRING              3
+/* Mass-storage class requests and Bulk-Only Transport. */
+#define USB_REQ_GET_MAX_LUN        0xfe
+#define USB_BOT_CBW_SIG            0x43425355u   /* "USBC" */
+#define USB_BOT_CSW_SIG            0x53425355u   /* "USBS" */
+#define SCSI_TEST_UNIT_READY       0x00
+#define SCSI_REQUEST_SENSE         0x03
+#define SCSI_INQUIRY               0x12
+#define SCSI_START_STOP_UNIT       0x1b
+#define SCSI_SYNCHRONIZE_CACHE_10  0x35
+#define SCSI_READ_CAPACITY_10      0x25
+#define SCSI_READ_10               0x28
+#define SCSI_WRITE_10              0x2a
+/*
+ * How long one command may take.  Hosts allow about 30 s; stock 2.0.5 is still
+ * busy after 5 s of guest time when it is ejected (MEASURED: no status by
+ * then, yet it showed "OK to Disconnect").
+ */
+#define USB_BOT_TIMEOUT_NS         (30 * NANOSECONDS_PER_SECOND)
+#define USB_CTRL_TIMEOUT_NS        (5 * NANOSECONDS_PER_SECOND)
+/* How long the firmware may take to hand its disk over (TEST UNIT READY). */
+#define USB_MSC_RETRY_NS           (100 * SCALE_MS)
+
+/* The page's transfers; see USB_IO_MAX. */
+static uint8_t usb_io_buf[USB_IO_MAX];
 
 /* Steps, in order; usb_host_next() builds each SETUP. */
 enum {
@@ -102,12 +142,15 @@ enum {
     STEP_GET_PRODUCT,
     STEP_GET_SERIAL,
     STEP_SET_CONFIGURATION,
+    STEP_GET_MAX_LUN,
     STEP_DONE,
+    /* Not in the script: clearing a halted bulk pipe, mid-command. */
+    STEP_CLEAR_HALT,
 };
 
 static const char *const usb_host_state_names[] = {
     "detached", "attaching", "reset", "setup", "data-in", "status-out",
-    "status-in", "configured", "failed",
+    "status-in", "configured", "failed", "bulk-out", "bulk-in",
 };
 
 static int usb_trace_level(void)
@@ -219,16 +262,55 @@ static void usb_host_arm(IPodClassicUSBState *s, int64_t delay_ns)
                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ns);
 }
 
+/*
+ * Look again later, in host time.  Under -icount sleep=off the virtual clock
+ * warps to the next virtual timer whenever the vCPU sleeps, and Rockbox's
+ * kernel tick runs on host time (docs/architecture.md, "Wall-clock sources
+ * are host time").  So while its USB thread slept a tick or two, a 1 ms
+ * virtual poll warped through seconds of "guest time" in a few milliseconds,
+ * spinning the emulator: MEASURED in Chrome, the host gave up on
+ * SET_CONFIGURATION after 5 s of virtual time and 60 ms of wall time.  The
+ * driver's own register writes still kick the virtual timer (usb_host_arm),
+ * so a transfer the device is ready for goes at once.
+ */
+static void usb_host_poll(IPodClassicUSBState *s, int64_t delay_ns)
+{
+    timer_mod_ns(s->host_timer_rt,
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT) + delay_ns);
+}
+
+/*
+ * A wait for the device ends after `ns` of guest time and `ns` of host time
+ * both: the warp cannot end it early, and neither can a slow emulation.
+ */
+static void usb_host_deadline(IPodClassicUSBState *s, int64_t ns)
+{
+    s->host_deadline_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns;
+    s->host_deadline_rt = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT) + ns;
+}
+
+static bool usb_host_overdue(IPodClassicUSBState *s, int64_t now)
+{
+    return s->host_deadline_ns && now > s->host_deadline_ns &&
+           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT) > s->host_deadline_rt;
+}
+
 static void usb_host_set_state(IPodClassicUSBState *s, int state)
 {
     if (s->host_state != state) {
-        USB_TRACE(1, "host: %s -> %s\n", usb_host_state_names[s->host_state],
+        bool bulk = state >= USB_HOST_BULK_OUT ||
+                    s->host_state >= USB_HOST_BULK_OUT;
+
+        USB_TRACE(bulk ? 3 : 1, "host: %s -> %s\n",
+                  usb_host_state_names[s->host_state],
                   usb_host_state_names[state]);
     }
     s->host_state = state;
-    /* Every wait for the device has a limit: 2 s of guest time. */
-    s->host_deadline_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                          2 * NANOSECONDS_PER_SECOND;
+    /*
+     * Every wait for the device has a limit: 5 s for a control transfer,
+     * Linux's USB_CTRL_SET_TIMEOUT (see usb_host_deadline).
+     */
+    usb_host_deadline(s, USB_CTRL_TIMEOUT_NS);
 }
 
 /* The device is attached when VBUS is up and it is not soft-disconnected. */
@@ -248,7 +330,16 @@ static void usb_host_detach(IPodClassicUSBState *s)
     s->address = 0;
     s->configuration = 0;
     s->sof_base_ns = 0;
+    s->msc_iface = -1;
+    s->msc_ready = false;
+    s->msc_blocks = 0;
+    s->msc_block_size = 0;
+    s->bot_phase = USB_BOT_IDLE;
+    if (qatomic_read(&s->io_status) == USB_IO_BUSY) {
+        qatomic_set(&s->io_status, USB_IO_FAILED);
+    }
     timer_del(s->host_timer);
+    timer_del(s->host_timer_rt);
 }
 
 /* Call after anything that may attach or detach the device. */
@@ -314,6 +405,23 @@ static bool usb_host_next(IPodClassicUSBState *s)
             req = USB_REQ_SET_CONFIGURATION;
             value = s->config_len >= 9 ? s->config[5] : 1;
             break;
+        case STEP_CLEAR_HALT:
+            /* CLEAR_FEATURE(ENDPOINT_HALT) to the endpoint. */
+            req_type = 0x02;
+            req = USB_REQ_CLEAR_FEATURE;
+            index = s->bot_halted;
+            break;
+        case STEP_GET_MAX_LUN:
+            if (s->msc_iface < 0) {
+                s->host_step++;
+                continue;
+            }
+            /* Class, interface, IN: a single LUN may stall it. */
+            req_type = 0xa1;
+            req = USB_REQ_GET_MAX_LUN;
+            index = s->msc_iface;
+            length = 1;
+            break;
         default:
             return false;
         }
@@ -369,22 +477,50 @@ static void usb_host_data_done(IPodClassicUSBState *s)
         memcpy(s->config, s->buf, MIN(s->got, sizeof(s->config)));
         USB_TRACE(1, "host: configuration %u, %u bytes, %u interface(s)\n",
                   s->config[5], s->got, s->config[4]);
-        /* Every interface and endpoint, for the log. */
-        for (uint32_t at = 0; at + 2 <= s->got && s->config[at]; ) {
-            const uint8_t *d = s->config + at;
+        /*
+         * Every interface and endpoint, for the log; and the mass-storage
+         * interface (class 8, SCSI transparent, Bulk-Only) with its two bulk
+         * endpoints, which the host talks to once configured.
+         */
+        {
+            bool in_msc = false;
 
-            if (d[1] == 4 && d[0] >= 9) {
-                USB_TRACE(1, "host:   interface %u alt %u class %02x/%02x/%02x"
-                          ", %u endpoint(s)\n", d[2], d[3], d[5], d[6], d[7],
-                          d[4]);
-            } else if (d[1] == 5 && d[0] >= 7) {
-                USB_TRACE(1, "host:     endpoint 0x%02x type %u mps %u\n",
-                          d[2], d[3] & 3, lduw_le_p(d + 4));
+            s->msc_iface = -1;
+            s->msc_in = s->msc_out = 0;
+            for (uint32_t at = 0; at + 2 <= s->got && s->config[at]; ) {
+                const uint8_t *d = s->config + at;
+
+                if (d[1] == 4 && d[0] >= 9) {
+                    USB_TRACE(1, "host:   interface %u alt %u class "
+                              "%02x/%02x/%02x, %u endpoint(s)\n", d[2], d[3],
+                              d[5], d[6], d[7], d[4]);
+                    in_msc = d[5] == 8 && d[6] == 6 && d[7] == 0x50 &&
+                             d[3] == 0 && s->msc_iface < 0;
+                    if (in_msc) {
+                        s->msc_iface = d[2];
+                    }
+                } else if (d[1] == 5 && d[0] >= 7) {
+                    USB_TRACE(1, "host:     endpoint 0x%02x type %u mps %u\n",
+                              d[2], d[3] & 3, lduw_le_p(d + 4));
+                    if (in_msc && (d[3] & 3) == 2) {
+                        if (d[2] & 0x80) {
+                            s->msc_in = d[2] & 0x0f;
+                        } else {
+                            s->msc_out = d[2] & 0x0f;
+                        }
+                    }
+                }
+                at += d[0];
             }
-            at += d[0];
+            if (s->msc_iface >= 0 && (!s->msc_in || !s->msc_out)) {
+                s->msc_iface = -1;
+            }
         }
         break;
     }
+    case STEP_GET_MAX_LUN:
+        USB_TRACE(1, "host: max LUN %d\n", s->stalled ? 0 : s->buf[0]);
+        break;
     case STEP_GET_MANUFACTURER:
         usb_host_log_string(s, "manufacturer");
         break;
@@ -408,6 +544,11 @@ static bool usb_host_try_setup(IPodClassicUSBState *s)
     if (!(*ctl & EPCTL_EPENA)) {
         return false;
     }
+    /* A SETUP clears a stall on EP0, as the core does. */
+    *ctl &= ~EPCTL_STALL;
+    *usb_ep(s, true, 0, DWC_EPCTL) &= ~EPCTL_STALL;
+    s->stalled = false;
+    s->setup_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     address_space_write(&address_space_memory, *dma, MEMTXATTRS_UNSPECIFIED,
                         s->setup, sizeof(s->setup));
     USB_TRACE(1, "host: SETUP %02x %02x %04x %04x %04x -> 0x%08x\n",
@@ -446,6 +587,12 @@ static bool usb_host_try_in(IPodClassicUSBState *s, bool *done)
     uint32_t size, n, room;
 
     *done = false;
+    if (*ctl & EPCTL_STALL) {
+        /* The device refused the request: no data, no status stage. */
+        s->stalled = true;
+        *done = true;
+        return true;
+    }
     if (!(*ctl & EPCTL_EPENA) || (*ctl & EPCTL_NAKSTS)) {
         return false;
     }
@@ -502,6 +649,435 @@ static bool usb_host_try_zlp(IPodClassicUSBState *s, bool in)
     return true;
 }
 
+/* ---- bulk transfers ---- */
+
+/*
+ * Host to device on bulk OUT endpoint `n`: up to `len` bytes from `src`.
+ * Returns the bytes the device took, -1 while it is not armed, -2 when it
+ * stalled the pipe.  The
+ * transfer ends, as on the wire, when the device's XferSize runs out or a
+ * packet is short.
+ */
+static int usb_host_bulk_out(IPodClassicUSBState *s, int n,
+                             const uint8_t *src, uint32_t len)
+{
+    uint32_t *ctl = usb_ep(s, false, n, DWC_EPCTL);
+    uint32_t *tsiz = usb_ep(s, false, n, DWC_EPTSIZ);
+    uint32_t *dma = usb_ep(s, false, n, DWC_EPDMA);
+    uint32_t mps = (*ctl & EPCTL_MPS_MASK) ? (*ctl & EPCTL_MPS_MASK) : 512;
+    uint32_t size, take, pk, used;
+
+    if (*ctl & EPCTL_STALL) {
+        return -2;
+    }
+    if (!(*ctl & EPCTL_EPENA) || (*ctl & EPCTL_NAKSTS)) {
+        return -1;
+    }
+    size = EPTSIZ_XFERSIZE(*tsiz);
+    take = MIN(size, len);
+    if (take) {
+        address_space_write(&address_space_memory, *dma,
+                            MEMTXATTRS_UNSPECIFIED, src, take);
+    }
+    *dma += take;
+    pk = EPTSIZ_PKTCNT(*tsiz);
+    used = take ? DIV_ROUND_UP(take, mps) : 1;
+    pk = pk > used ? pk - used : 0;
+    *tsiz = (*tsiz & ~(0x7ffffu | (0x3ffu << 19))) | (size - take) |
+            (pk << 19);
+    if (size == take || (take % mps) != 0 || take == 0) {
+        *ctl &= ~EPCTL_EPENA;
+        *usb_ep(s, false, n, DWC_EPINT) |= EPINT_XFERCOMPL;
+        usb_update_irq(s);
+    }
+    return take;
+}
+
+/*
+ * Device to host on bulk IN endpoint `n`: up to `room` bytes into `dst`.
+ * Returns the bytes taken (0 for a zero-length packet), -1 while the device
+ * has nothing armed, -2 when it stalled the pipe.  *end says the device's
+ * transfer ended on a short packet, which ends a data phase early.
+ */
+static int usb_host_bulk_in(IPodClassicUSBState *s, int n, uint8_t *dst,
+                            uint32_t room, bool *end)
+{
+    uint32_t *ctl = usb_ep(s, true, n, DWC_EPCTL);
+    uint32_t *tsiz = usb_ep(s, true, n, DWC_EPTSIZ);
+    uint32_t *dma = usb_ep(s, true, n, DWC_EPDMA);
+    uint32_t mps = (*ctl & EPCTL_MPS_MASK) ? (*ctl & EPCTL_MPS_MASK) : 512;
+    uint32_t size, take, pk, used;
+
+    *end = false;
+    if (*ctl & EPCTL_STALL) {
+        return -2;
+    }
+    if (!(*ctl & EPCTL_EPENA) || (*ctl & EPCTL_NAKSTS)) {
+        return -1;
+    }
+    size = EPTSIZ_XFERSIZE(*tsiz);
+    take = MIN(size, room);
+    if (take < size) {
+        take -= take % mps;   /* whole packets, unless it is the last */
+    }
+    if (take) {
+        address_space_read(&address_space_memory, *dma,
+                           MEMTXATTRS_UNSPECIFIED, dst, take);
+    }
+    *dma += take;
+    pk = EPTSIZ_PKTCNT(*tsiz);
+    used = take ? DIV_ROUND_UP(take, mps) : 1;
+    pk = pk > used ? pk - used : 0;
+    *tsiz = (*tsiz & ~(0x7ffffu | (0x3ffu << 19))) | (size - take) |
+            (pk << 19);
+    if (size == take) {
+        *ctl &= ~EPCTL_EPENA;
+        *usb_ep(s, true, n, DWC_EPINT) |= EPINT_XFERCOMPL;
+        usb_update_irq(s);
+        *end = (size % mps) != 0 || size == 0;
+    }
+    return take;
+}
+
+/* ---- Bulk-Only Transport ---- */
+
+static uint8_t *usb_bot_data(IPodClassicUSBState *s)
+{
+    return s->bot_page ? usb_io_buf : s->bot_buf;
+}
+
+/* Send one command block; its data and status follow from the tick. */
+static void usb_bot_start(IPodClassicUSBState *s, const uint8_t *cdb,
+                          int cdb_len, uint32_t len, bool in, bool page)
+{
+    uint8_t *w = s->bot_cbw;
+
+    memset(w, 0, sizeof(s->bot_cbw));
+    stl_le_p(w, USB_BOT_CBW_SIG);
+    stl_le_p(w + 4, ++s->bot_tag);
+    stl_le_p(w + 8, len);
+    w[12] = in ? 0x80 : 0;
+    w[13] = 0;                       /* LUN 0 */
+    w[14] = cdb_len;
+    memcpy(w + 15, cdb, cdb_len);
+    s->bot_len = len;
+    s->bot_done = 0;
+    s->bot_retried = false;
+    s->bot_in = in;
+    s->bot_page = page;
+    s->bot_phase = USB_BOT_CBW;
+    USB_TRACE(page || cdb[0] == SCSI_TEST_UNIT_READY ||
+              cdb[0] == SCSI_REQUEST_SENSE ? 2 : 1,
+              "host: SCSI %02x, %u byte(s) %s\n", cdb[0], len,
+              len ? (in ? "in" : "out") : "");
+    usb_host_set_state(s, USB_HOST_BULK_OUT);
+    usb_host_deadline(s, USB_BOT_TIMEOUT_NS);
+    usb_host_arm(s, 50 * SCALE_US);
+}
+
+/* The page's request, if there is one and the device is free for it. */
+static bool usb_msc_page_start(IPodClassicUSBState *s)
+{
+    uint8_t cdb[10] = { 0 };
+    uint32_t len = 0;
+    bool in = false;
+
+    if (!s->msc_ready || s->bot_phase != USB_BOT_IDLE ||
+        qatomic_read(&s->io_status) != USB_IO_BUSY || !s->io_op) {
+        return false;
+    }
+    switch (s->io_op) {
+    case USB_IO_EJECT + 0x10:
+        /* The eject after a refused flush and its auto-sense. */
+        cdb[0] = SCSI_START_STOP_UNIT;
+        cdb[4] = 0x02;
+        break;
+    case USB_IO_READ:
+    case USB_IO_WRITE:
+        cdb[0] = s->io_op == USB_IO_READ ? SCSI_READ_10 : SCSI_WRITE_10;
+        stl_be_p(cdb + 2, s->io_lba);
+        stw_be_p(cdb + 7, s->io_count);
+        len = s->io_count * s->msc_block_size;
+        in = s->io_op == USB_IO_READ;
+        break;
+    case USB_IO_EJECT:
+    case USB_IO_FLUSH:
+        /*
+         * What a computer does before it lets go: write back the device's
+         * cache (stock keeps writes in RAM: MEASURED, a written block read
+         * back over USB was not yet on its disk), then eject.
+         */
+        cdb[0] = SCSI_SYNCHRONIZE_CACHE_10;   /* LBA 0, 0 blocks: all */
+        s->io_then_eject = s->io_op == USB_IO_EJECT;
+        break;
+    }
+    s->io_op = 0;
+    usb_bot_start(s, cdb, cdb[0] == SCSI_START_STOP_UNIT ? 6 : 10, len, in,
+                  true);
+    return true;
+}
+
+/* The init sequence's next command; false when it is over. */
+static bool usb_msc_init_next(IPodClassicUSBState *s)
+{
+    static const uint8_t inquiry[6] = { SCSI_INQUIRY, 0, 0, 0, 36, 0 };
+    static const uint8_t tur[6] = { SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0 };
+    static const uint8_t sense[6] = { SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0 };
+    static const uint8_t capacity[10] = { SCSI_READ_CAPACITY_10 };
+
+    switch (s->msc_init) {
+    case 0:
+        usb_bot_start(s, inquiry, 6, 36, true, false);
+        return true;
+    case 1:
+        usb_bot_start(s, tur, 6, 0, false, false);
+        return true;
+    case 2:
+        usb_bot_start(s, sense, 6, 18, true, false);
+        return true;
+    case 3:
+        usb_bot_start(s, capacity, 10, 8, true, false);
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* A command's status is in: the init sequence or the page moves on. */
+static void usb_bot_finish(IPodClassicUSBState *s, bool ok)
+{
+    uint8_t *d = s->bot_buf;
+    uint8_t op = s->bot_cbw[15];
+
+    s->bot_phase = USB_BOT_IDLE;
+    usb_host_set_state(s, USB_HOST_CONFIGURED);
+    s->host_deadline_ns = 0;
+    if (s->bot_page) {
+        USB_TRACE(2, "host: SCSI %02x %s\n", op, ok ? "done" : "failed");
+        if (op == SCSI_SYNCHRONIZE_CACHE_10 && !ok) {
+            /*
+             * Rockbox has no SYNCHRONIZE CACHE (it writes through): a
+             * refusal means nothing is held back.  The sense is logged.
+             */
+            s->msc_autosense = true;
+            s->msc_failed_op = op;
+            ok = true;
+        }
+        if (op == SCSI_SYNCHRONIZE_CACHE_10 && s->io_then_eject) {
+            static const uint8_t eject[6] = {
+                SCSI_START_STOP_UNIT, 0, 0, 0, 0x02, 0,   /* LoEj, not Start */
+            };
+
+            s->io_then_eject = false;
+            if (s->msc_autosense) {
+                /* The sense first; the eject follows from the tick. */
+                s->io_op = USB_IO_EJECT + 0x10;
+                usb_host_arm(s, 50 * SCALE_US);
+            } else {
+                usb_bot_start(s, eject, 6, 0, false, true);
+            }
+            return;
+        }
+        if (op == SCSI_START_STOP_UNIT && ok) {
+            /* The medium is gone, as far as this host is concerned. */
+            USB_TRACE(1, "host: ejected\n");
+            s->msc_ready = false;
+        }
+        /* Ask why it failed, as hosts do, before the next request. */
+        if (!ok) {
+            s->msc_autosense = op != SCSI_REQUEST_SENSE;
+            s->msc_failed_op = op;
+        }
+        qatomic_set(&s->io_status, ok ? USB_IO_DONE : USB_IO_FAILED);
+        /* A request that came in meanwhile is taken from the tick. */
+        usb_host_arm(s, 50 * SCALE_US);
+        return;
+    }
+    switch (op) {
+    case SCSI_INQUIRY:
+        if (ok) {
+            USB_TRACE(1, "host: INQUIRY \"%.8s\" \"%.16s\" \"%.4s\", "
+                      "type %u%s\n", d + 8, d + 16, d + 32, d[0] & 0x1f,
+                      d[1] & 0x80 ? ", removable" : "");
+        }
+        s->msc_init = 1;
+        break;
+    case SCSI_TEST_UNIT_READY:
+        if (ok) {
+            s->msc_init = 3;
+        } else {
+            /* As a real host does: ask why, and ask again, while plugged. */
+            s->msc_tries++;
+            s->msc_init = 2;
+        }
+        break;
+    case SCSI_REQUEST_SENSE: {
+        uint32_t sense = ((d[2] & 0x0f) << 16) | (d[12] << 8) | d[13];
+
+        if (s->msc_ready) {
+            /* The auto-sense after a page command failed. */
+            USB_TRACE(1, "host: SCSI %02x failed: sense %x/%02x/%02x\n",
+                      s->msc_failed_op, sense >> 16, (sense >> 8) & 0xff,
+                      sense & 0xff);
+            break;
+        }
+
+        /* Each new reason, and every 10 s of guest time the same one. */
+        if (sense != s->msc_sense || s->msc_tries % 100 == 0) {
+            USB_TRACE(1, "host: not ready (sense %x/%02x/%02x), try %d, "
+                      "%.1f s\n", sense >> 16, (sense >> 8) & 0xff,
+                      sense & 0xff, s->msc_tries,
+                      (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                       s->sof_base_ns) / 1e9);
+        }
+        s->msc_sense = sense;
+        s->msc_init = 1;
+        /*
+         * Hosts poll TEST UNIT READY every so often in their own time: let
+         * the firmware get on with it.  The driver re-arming its OUT endpoint
+         * kicks the virtual timer at once (see usb_write_epctl), so the pause
+         * is kept as a time, not only a timer, and in host time for the same
+         * reason as usb_host_poll.
+         */
+        s->msc_retry_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT) +
+                          USB_MSC_RETRY_NS;
+        usb_host_poll(s, USB_MSC_RETRY_NS);
+        return;
+    }
+    case SCSI_READ_CAPACITY_10:
+        s->msc_init = 99;
+        if (ok) {
+            s->msc_blocks = ldl_be_p(d) + 1;
+            s->msc_block_size = ldl_be_p(d + 4);
+            s->msc_ready = s->msc_block_size > 0;
+            USB_TRACE(1, "host: mass storage ready: %u blocks of %u bytes "
+                      "(%u MB), after %d TEST UNIT READY, %.1f s\n",
+                      s->msc_blocks, s->msc_block_size,
+                      (uint32_t)((uint64_t)s->msc_blocks *
+                                 s->msc_block_size >> 20),
+                      s->msc_tries + 1,
+                      (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                       s->sof_base_ns) / 1e9);
+        }
+        break;
+    default:
+        break;
+    }
+    usb_host_arm(s, 50 * SCALE_US);
+}
+
+/*
+ * The device halted a bulk pipe, as it does for a command it rejects with
+ * data to move: clear the halt with CLEAR_FEATURE on EP0, then read the
+ * status (BOT 6.7.2 and 6.7.3); usb_host_tick() comes back to USB_BOT_CSW.
+ */
+static void usb_bot_clear_halt(IPodClassicUSBState *s, bool in)
+{
+    s->bot_halted = in ? (0x80 | s->msc_in) : s->msc_out;
+    USB_TRACE(1, "host: endpoint 0x%02x halted in SCSI %02x, clearing it\n",
+              s->bot_halted, s->bot_cbw[15]);
+    s->host_step = STEP_CLEAR_HALT;
+    usb_host_next(s);
+    usb_host_set_state(s, USB_HOST_SETUP);
+}
+
+/* One step of the command in flight; true when something moved. */
+static bool usb_bot_tick(IPodClassicUSBState *s)
+{
+    uint8_t *data = usb_bot_data(s);
+    bool end;
+    int n;
+
+    switch (s->bot_phase) {
+    case USB_BOT_CBW:
+        n = usb_host_bulk_out(s, s->msc_out, s->bot_cbw, sizeof(s->bot_cbw));
+        if (n == -2) {
+            /* It refuses commands: only a reset recovery would help. */
+            USB_TRACE(1, "host: the device stalled a command block\n");
+            usb_bot_finish(s, false);
+            return true;
+        }
+        if (n < 0) {
+            return false;
+        }
+        if (!s->bot_len) {
+            s->bot_phase = USB_BOT_CSW;
+        } else {
+            s->bot_phase = s->bot_in ? USB_BOT_DATA_IN : USB_BOT_DATA_OUT;
+        }
+        usb_host_set_state(s, s->bot_phase == USB_BOT_DATA_OUT
+                              ? USB_HOST_BULK_OUT : USB_HOST_BULK_IN);
+        return true;
+    case USB_BOT_DATA_OUT:
+        n = usb_host_bulk_out(s, s->msc_out, data + s->bot_done,
+                              s->bot_len - s->bot_done);
+        if (n == -2) {
+            usb_bot_clear_halt(s, false);
+            return true;
+        }
+        if (n < 0) {
+            return false;
+        }
+        s->bot_done += n;
+        if (s->bot_done >= s->bot_len) {
+            s->bot_phase = USB_BOT_CSW;
+            usb_host_set_state(s, USB_HOST_BULK_IN);
+        }
+        return true;
+    case USB_BOT_DATA_IN:
+        n = usb_host_bulk_in(s, s->msc_in, data + s->bot_done,
+                             s->bot_len - s->bot_done, &end);
+        if (n == -2) {
+            usb_bot_clear_halt(s, true);
+            return true;
+        }
+        if (n < 0) {
+            return false;
+        }
+        s->bot_done += n;
+        if (s->bot_done >= s->bot_len || end || n == 0) {
+            s->bot_phase = USB_BOT_CSW;
+        }
+        return true;
+    case USB_BOT_CSW:
+        n = usb_host_bulk_in(s, s->msc_in, s->bot_csw, sizeof(s->bot_csw),
+                             &end);
+        if (n == -2 && !s->bot_retried) {
+            /* A stalled status is cleared and read once more (BOT 5.3.3). */
+            s->bot_retried = true;
+            usb_bot_clear_halt(s, true);
+            return true;
+        }
+        if (n == -2) {
+            usb_bot_finish(s, false);
+            return true;
+        }
+        if (n < 0) {
+            return false;
+        }
+        if (n != sizeof(s->bot_csw) ||
+            ldl_le_p(s->bot_csw) != USB_BOT_CSW_SIG ||
+            ldl_le_p(s->bot_csw + 4) != s->bot_tag) {
+            USB_TRACE(1, "host: bad status wrapper (%d bytes) for SCSI %02x\n",
+                      n, s->bot_cbw[15]);
+            usb_bot_finish(s, false);
+        } else {
+            /* A residue means less moved than asked: not a whole request. */
+            uint32_t residue = ldl_le_p(s->bot_csw + 8);
+
+            if (residue && s->bot_page) {
+                USB_TRACE(1, "host: SCSI %02x left %u byte(s) unmoved\n",
+                          s->bot_cbw[15], residue);
+            }
+            usb_bot_finish(s, s->bot_csw[12] == 0 &&
+                              !(residue && s->bot_page));
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* Begin the next request, or settle once the script is done. */
 static void usb_host_begin(IPodClassicUSBState *s)
 {
@@ -510,6 +1086,14 @@ static void usb_host_begin(IPodClassicUSBState *s)
         s->host_deadline_ns = 0;
         USB_TRACE(1, "host: enumeration done, configuration %u\n",
                   s->configuration);
+        if (s->msc_iface >= 0) {
+            /* Mass storage: what any host asks before it mounts a disk. */
+            s->msc_init = 0;
+            s->msc_tries = 0;
+            s->msc_sense = 0;
+            s->msc_retry_ns = 0;
+            usb_host_arm(s, SCALE_MS);
+        }
         return;
     }
     usb_host_set_state(s, USB_HOST_SETUP);
@@ -555,8 +1139,13 @@ static void usb_host_tick(void *opaque)
     case USB_HOST_DATA_IN:
         if (usb_host_try_in(s, &done)) {
             progress = true;
-            s->host_deadline_ns = now + 2 * NANOSECONDS_PER_SECOND;
-            if (done) {
+            usb_host_deadline(s, USB_CTRL_TIMEOUT_NS);
+            if (done && s->stalled) {
+                /* Refused: no status stage; the script goes on. */
+                usb_host_data_done(s);
+                s->host_step++;
+                usb_host_begin(s);
+            } else if (done) {
                 usb_host_data_done(s);
                 usb_host_set_state(s, USB_HOST_STATUS_OUT);
             }
@@ -572,6 +1161,11 @@ static void usb_host_tick(void *opaque)
     case USB_HOST_STATUS_IN:
         if (usb_host_try_zlp(s, true)) {
             progress = true;
+            if (now - s->setup_ns > 100 * SCALE_MS) {
+                USB_TRACE(1, "host: request %02x took %" PRId64 " ms of guest "
+                          "time\n", s->setup[1],
+                          (now - s->setup_ns) / SCALE_MS);
+            }
             if (s->setup[1] == USB_REQ_SET_ADDRESS) {
                 s->address = s->setup[2];
                 USB_TRACE(1, "host: address %u (DCFG.DevAddr %u)\n",
@@ -580,12 +1174,48 @@ static void usb_host_tick(void *opaque)
             } else if (s->setup[1] == USB_REQ_SET_CONFIGURATION) {
                 s->configuration = s->setup[2];
             }
+            if (s->host_step == STEP_CLEAR_HALT) {
+                /* The pipe is clear: on to the command's status. */
+                s->bot_phase = USB_BOT_CSW;
+                usb_host_set_state(s, USB_HOST_BULK_IN);
+                break;
+            }
             s->host_step++;
             usb_host_begin(s);
         }
         break;
+    case USB_HOST_CONFIGURED:
+        if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT) < s->msc_retry_ns) {
+            /*
+             * MEASURED with stock 2.0.5: without this, its re-armed OUT
+             * endpoint brought the next TEST UNIT READY in a millisecond, 300
+             * of them in 0.1 s of guest time, and it never became ready.
+             */
+            timer_mod_ns(s->host_timer_rt, s->msc_retry_ns);
+            return;
+        }
+        /* Between commands: the init sequence, then the page's requests. */
+        if (s->msc_iface >= 0 && !s->msc_ready && s->msc_init < 99) {
+            usb_msc_init_next(s);
+        } else if (s->msc_autosense) {
+            static const uint8_t sense[6] = { SCSI_REQUEST_SENSE, 0, 0, 0,
+                                              18, 0 };
+
+            s->msc_autosense = false;
+            usb_bot_start(s, sense, 6, 18, true, false);
+        } else {
+            usb_msc_page_start(s);
+        }
+        return;
+    case USB_HOST_BULK_OUT:
+    case USB_HOST_BULK_IN:
+        if (usb_bot_tick(s)) {
+            progress = true;
+            usb_host_deadline(s, USB_BOT_TIMEOUT_NS);
+        }
+        break;
     default:
-        return;   /* detached, configured or failed: nothing to do */
+        return;   /* detached or failed: nothing to do */
     }
 
     if (s->host_state == USB_HOST_CONFIGURED) {
@@ -596,19 +1226,28 @@ static void usb_host_tick(void *opaque)
         usb_host_arm(s, 50 * SCALE_US);
         return;
     }
-    if (s->host_deadline_ns && now > s->host_deadline_ns) {
-        USB_TRACE(1, "host: the device stopped answering in %s (step %d); "
-                  "DOEPCTL0 0x%08x DIEPCTL0 0x%08x DIEPTSIZ0 0x%08x\n",
+    if (usb_host_overdue(s, now)) {
+        bool bulk = s->host_state >= USB_HOST_BULK_OUT;
+        int in = bulk ? s->msc_in : 0, out = bulk ? s->msc_out : 0;
+
+        USB_TRACE(1, "host: the device stopped answering in %s (step %d, "
+                  "SCSI %02x phase %d); DOEPCTL%d 0x%08x DIEPCTL%d 0x%08x "
+                  "DIEPTSIZ%d 0x%08x\n",
                   usb_host_state_names[s->host_state], s->host_step,
-                  *usb_ep(s, false, 0, DWC_EPCTL),
-                  *usb_ep(s, true, 0, DWC_EPCTL),
-                  *usb_ep(s, true, 0, DWC_EPTSIZ));
+                  bulk ? s->bot_cbw[15] : 0, s->bot_phase,
+                  out, *usb_ep(s, false, out, DWC_EPCTL),
+                  in, *usb_ep(s, true, in, DWC_EPCTL),
+                  in, *usb_ep(s, true, in, DWC_EPTSIZ));
         usb_host_set_state(s, USB_HOST_FAILED);
         s->host_deadline_ns = 0;
+        s->msc_ready = false;
+        if (qatomic_read(&s->io_status) == USB_IO_BUSY) {
+            qatomic_set(&s->io_status, USB_IO_FAILED);
+        }
         return;
     }
-    /* Not ready yet: look again in a millisecond (a USB frame). */
-    usb_host_arm(s, SCALE_MS);
+    /* Not ready yet: look again in a millisecond (a USB frame) of host time. */
+    usb_host_poll(s, SCALE_MS);
 }
 
 /* ---- the cable ---- */
@@ -913,6 +1552,25 @@ static const MemoryRegionOps usb_phy_ops = {
 
 static IPodClassicUSBState *usb_state;
 
+/* The page's request (ipod_wasm_usb_io), taken with the BQL held. */
+static void usb_io_bh(void *opaque)
+{
+    IPodClassicUSBState *s = opaque;
+    int req = qatomic_xchg(&s->io_request, 0);
+
+    if (!req) {
+        return;
+    }
+    s->io_op = (req >> 28) & 0xf;
+    s->io_count = req & 0xfffffff;
+    s->io_lba = qatomic_read(&s->io_request_lba);
+    if (s->host_state == USB_HOST_CONFIGURED && !s->msc_autosense) {
+        usb_msc_page_start(s);
+    } else {
+        usb_host_arm(s, 50 * SCALE_US);   /* the tick takes it */
+    }
+}
+
 static void usb_cable_bh(void *opaque)
 {
     IPodClassicUSBState *s = opaque;
@@ -942,7 +1600,8 @@ EMSCRIPTEN_KEEPALIVE void ipod_wasm_usb_cable(int on)
 
 /*
  * bits 0-3: the host's state (IPodClassicUSBHostState); bit 4 VBUS; bit 5 the
- * device pulled up; bits 8-15 the address; bits 16-23 the configuration.
+ * device pulled up; bit 6 its disk ready for ipod_wasm_usb_io(); bits 8-15
+ * the address; bits 16-23 the configuration.
  */
 EMSCRIPTEN_KEEPALIVE int ipod_wasm_usb_state(void)
 {
@@ -952,7 +1611,8 @@ EMSCRIPTEN_KEEPALIVE int ipod_wasm_usb_state(void)
         return 0;
     }
     return (s->host_state & 0xf) | (s->vbus ? 0x10 : 0) |
-           (usb_pulled_up(s) ? 0x20 : 0) | (s->address << 8) |
+           (usb_pulled_up(s) ? 0x20 : 0) | (s->msc_ready ? 0x40 : 0) |
+           (s->address << 8) |
            (s->configuration << 16);
 }
 
@@ -960,6 +1620,64 @@ EMSCRIPTEN_KEEPALIVE int ipod_wasm_usb_state(void)
 EMSCRIPTEN_KEEPALIVE unsigned ipod_wasm_usb_id(void)
 {
     return usb_state ? usb_state->vid_pid : 0;
+}
+
+/*
+ * Mass storage, for the page.  Once ipod_wasm_usb_state() says the disk is
+ * ready (bit 6), ipod_wasm_usb_io() asks the iPod, through its own USB
+ * driver, to read or write `count` blocks at `lba` (data in the buffer at
+ * ipod_wasm_usb_buffer(), at most USB_IO_MAX bytes) or to eject.  It returns
+ * 0 when the request is taken, -1 when the disk is not ready or still busy;
+ * ipod_wasm_usb_io_status() then goes from USB_IO_BUSY to USB_IO_DONE or
+ * USB_IO_FAILED.  One request at a time.
+ */
+EMSCRIPTEN_KEEPALIVE int ipod_wasm_usb_io(int op, unsigned lba,
+                                          unsigned count)
+{
+    IPodClassicUSBState *s = usb_state;
+
+    if (!s || !s->io_bh || !s->msc_ready ||
+        qatomic_read(&s->io_status) == USB_IO_BUSY ||
+        op < USB_IO_READ || op > USB_IO_FLUSH ||
+        ((op == USB_IO_READ || op == USB_IO_WRITE) &&
+         (!count || (uint64_t)count * s->msc_block_size > USB_IO_MAX ||
+          (uint64_t)lba + count > s->msc_blocks))) {
+        return -1;
+    }
+    qatomic_set(&s->io_status, USB_IO_BUSY);
+    qatomic_set(&s->io_request_lba, lba);
+    qatomic_set(&s->io_request,
+                (op << 28) | (op == USB_IO_READ || op == USB_IO_WRITE
+                              ? count : 0));
+    qemu_bh_schedule(s->io_bh);
+    qemu_notify_event();
+    return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int ipod_wasm_usb_io_status(void)
+{
+    return usb_state ? qatomic_read(&usb_state->io_status) : USB_IO_IDLE;
+}
+
+EMSCRIPTEN_KEEPALIVE unsigned ipod_wasm_usb_buffer(void)
+{
+    return (unsigned)(uintptr_t)usb_io_buf;
+}
+
+EMSCRIPTEN_KEEPALIVE unsigned ipod_wasm_usb_buffer_size(void)
+{
+    return USB_IO_MAX;
+}
+
+/* The disk as READ CAPACITY gave it: blocks, and bytes per block. */
+EMSCRIPTEN_KEEPALIVE unsigned ipod_wasm_usb_blocks(void)
+{
+    return usb_state ? usb_state->msc_blocks : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE unsigned ipod_wasm_usb_block_size(void)
+{
+    return usb_state ? usb_state->msc_block_size : 0;
 }
 #endif
 
@@ -994,8 +1712,11 @@ static void ipod_classic_usb_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->phy_iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
     s->host_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, usb_host_tick, s);
+    s->host_timer_rt = timer_new_ns(QEMU_CLOCK_VIRTUAL_RT, usb_host_tick, s);
     s->cable_bh = qemu_bh_new(usb_cable_bh, s);
     s->cable_request = -1;
+    s->io_bh = qemu_bh_new(usb_io_bh, s);
+    s->msc_iface = -1;
     usb_state = s;
 }
 
@@ -1007,7 +1728,7 @@ static int ipod_classic_usb_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_ipod_classic_usb = {
     .name = TYPE_IPOD_CLASSIC_USB,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = ipod_classic_usb_post_load,
     .fields = (VMStateField[]) {
@@ -1033,6 +1754,31 @@ static const VMStateDescription vmstate_ipod_classic_usb = {
         VMSTATE_UINT32(vid_pid, IPodClassicUSBState),
         VMSTATE_INT64(sof_base_ns, IPodClassicUSBState),
         VMSTATE_UINT32(sof_cleared, IPodClassicUSBState),
+        VMSTATE_INT32_V(msc_iface, IPodClassicUSBState, 2),
+        VMSTATE_UINT8_V(msc_in, IPodClassicUSBState, 2),
+        VMSTATE_UINT8_V(msc_out, IPodClassicUSBState, 2),
+        VMSTATE_BOOL_V(stalled, IPodClassicUSBState, 2),
+        VMSTATE_BOOL_V(msc_ready, IPodClassicUSBState, 2),
+        VMSTATE_INT32_V(msc_init, IPodClassicUSBState, 2),
+        VMSTATE_INT32_V(msc_tries, IPodClassicUSBState, 2),
+        VMSTATE_UINT32_V(msc_sense, IPodClassicUSBState, 2),
+        VMSTATE_BOOL_V(msc_autosense, IPodClassicUSBState, 2),
+        VMSTATE_UINT8_V(msc_failed_op, IPodClassicUSBState, 2),
+        VMSTATE_BOOL_V(io_then_eject, IPodClassicUSBState, 2),
+        VMSTATE_INT64_V(setup_ns, IPodClassicUSBState, 2),
+        VMSTATE_UINT32_V(msc_blocks, IPodClassicUSBState, 2),
+        VMSTATE_UINT32_V(msc_block_size, IPodClassicUSBState, 2),
+        VMSTATE_INT32_V(bot_phase, IPodClassicUSBState, 2),
+        VMSTATE_UINT8_ARRAY_V(bot_cbw, IPodClassicUSBState, 31, 2),
+        VMSTATE_UINT8_ARRAY_V(bot_csw, IPodClassicUSBState, 13, 2),
+        VMSTATE_UINT32_V(bot_tag, IPodClassicUSBState, 2),
+        VMSTATE_UINT32_V(bot_len, IPodClassicUSBState, 2),
+        VMSTATE_UINT32_V(bot_done, IPodClassicUSBState, 2),
+        VMSTATE_BOOL_V(bot_in, IPodClassicUSBState, 2),
+        VMSTATE_BOOL_V(bot_page, IPodClassicUSBState, 2),
+        VMSTATE_UINT8_ARRAY_V(bot_buf, IPodClassicUSBState, 64, 2),
+        VMSTATE_BOOL_V(bot_retried, IPodClassicUSBState, 2),
+        VMSTATE_UINT8_V(bot_halted, IPodClassicUSBState, 2),
         VMSTATE_END_OF_LIST()
     },
 };
