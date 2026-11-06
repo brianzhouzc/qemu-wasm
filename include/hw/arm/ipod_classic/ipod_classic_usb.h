@@ -126,9 +126,32 @@ typedef enum {
     USB_HOST_DATA_IN,        /* collecting a control read's data */
     USB_HOST_STATUS_OUT,     /* the ZLP that ends a control read */
     USB_HOST_STATUS_IN,      /* the ZLP that ends a no-data request */
-    USB_HOST_CONFIGURED,     /* SET_CONFIGURATION done; nothing more yet */
+    USB_HOST_CONFIGURED,     /* configured; between mass-storage commands */
     USB_HOST_FAILED,         /* the device stopped answering */
+    USB_HOST_BULK_OUT,       /* a command block or data, to the device */
+    USB_HOST_BULK_IN,        /* data or a status, from the device */
 } IPodClassicUSBHostState;
+
+/* Bulk-Only Transport, one command at a time. */
+typedef enum {
+    USB_BOT_IDLE = 0,
+    USB_BOT_CBW,
+    USB_BOT_DATA_IN,
+    USB_BOT_DATA_OUT,
+    USB_BOT_CSW,
+} IPodClassicUSBBotPhase;
+
+/* The page's block requests (ipod_wasm_usb_io) and their outcome. */
+#define USB_IO_READ     1
+#define USB_IO_WRITE    2
+#define USB_IO_EJECT    3       /* flushes first, as computers do */
+#define USB_IO_FLUSH    4       /* SYNCHRONIZE CACHE */
+#define USB_IO_IDLE     0
+#define USB_IO_BUSY     1
+#define USB_IO_DONE     2
+#define USB_IO_FAILED   3
+/* The page's transfers go through this buffer, a pointer the page reads. */
+#define USB_IO_MAX      (256 * 1024)
 
 struct IPodClassicUSBState {
     SysBusDevice parent_obj;
@@ -158,6 +181,42 @@ struct IPodClassicUSBState {
     uint8_t address;
     uint8_t configuration;
     uint32_t vid_pid;           /* 0 until the device descriptor is in */
+    /* Mass storage: the interface, its bulk endpoints, what it reported. */
+    int32_t msc_iface;          /* -1: none */
+    uint8_t msc_in;             /* endpoint numbers */
+    uint8_t msc_out;
+    bool stalled;               /* the last control read was stalled */
+    bool msc_ready;
+    int32_t msc_init;           /* the init sequence's next command */
+    int32_t msc_tries;          /* TEST UNIT READY attempts */
+    uint32_t msc_sense;         /* the last not-ready reason: key/ASC/ASCQ */
+    int64_t msc_retry_ns;       /* no TEST UNIT READY before this */
+    bool msc_autosense;         /* a page command failed: REQUEST SENSE next */
+    uint8_t msc_failed_op;      /* its opcode, for the log */
+    bool io_then_eject;         /* the flush before an eject is running */
+    uint32_t msc_blocks;
+    uint32_t msc_block_size;
+    /* The command in flight. */
+    int32_t bot_phase;
+    uint8_t bot_cbw[31];
+    uint8_t bot_csw[13];
+    uint32_t bot_tag;
+    uint32_t bot_len;
+    uint32_t bot_done;
+    bool bot_in;
+    bool bot_page;              /* the page's command, not the init sequence */
+    bool bot_retried;           /* the status was stalled once already */
+    uint8_t bot_halted;         /* the endpoint being cleared */
+    uint8_t bot_buf[64];        /* the init sequence's data */
+    /* The page's request, handed over by ipod_wasm_usb_io(). */
+    int32_t io_op;
+    uint32_t io_lba;
+    uint32_t io_count;
+    int io_status;              /* USB_IO_*; atomic */
+    int io_request;             /* op << 28 | count, posted; atomic */
+    uint32_t io_request_lba;    /* atomic */
+    QEMUBH *io_bh;
+
     int64_t sof_base_ns;        /* when SOFs began; 0 = none (see usb_microframe) */
     uint32_t sof_cleared;       /* the microframe in which GINTSTS.Sof was cleared */
 
