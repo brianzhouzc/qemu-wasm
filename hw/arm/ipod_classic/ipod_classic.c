@@ -438,8 +438,9 @@ ipod_classic_unimplemented[] = {
     /* s5l8702.sha1 (0x38000000) is a real device now; see the machine init. */
     { "s5l8702.miu",      MIU_MEM_BASE,      0x100000 },
     /* DMAC0 and DMAC1 are real PL080s now; see the machine init. */
-    { "s5l8702.usb-otg",  USBOTG_MEM_BASE,   0x100000 },
     /* s5l8702.sm1 (0x38500000) is a real (minimal) device now; see below. */
+    /* s5l8702.usb-otg (0x38400000) and its PHY (0x3C400000) are a real device
+     * now; see the machine init. */
     { "s5l8702.usb-hc",   USB_HC_MEM_BASE,   0x100000 },
     { "s5l8702.usb-fc",   USB_FC_MEM_BASE,   0x100000 },
     { "s5l8702.ata-unk",  ATA_UNK_MEM_BASE,  0x100000 },
@@ -453,7 +454,6 @@ ipod_classic_unimplemented[] = {
     { "s5l8702.int",      INT_MEM_BASE,      0x100000 },
     { "s5l8702.ecc",      ECC_MEM_BASE,      0x100000 },
     /* The click wheel is a real device now; see the machine init. */
-    { "s5l8702.usb-phy",  USBPHYS_MEM_BASE,  0x100000 },
     { "s5l8702.wdt",      WDT_MEM_BASE,      0x100000 },
     /* s5l8702.i2s is a real device now; see the machine init. */
     { "s5l8702.spdif",    SPDIF_MEM_BASE,    0x100000 },
@@ -825,6 +825,23 @@ void ipod_classic_set_hold(bool on)
 bool ipod_classic_get_hold(void)
 {
     return ipod_machine && ipod_machine->pmu && ipod_machine->pmu->hold;
+}
+
+/*
+ * The USB cable.  VBUS reaches the firmware through the PMU's EXTON2 and its
+ * interrupt (see ipod_classic_pmu_set_vbus()); the USB core sees it as its
+ * B-session and, through it, the emulated host on the other end.
+ */
+void ipod_classic_set_usb_cable(bool on)
+{
+    if (!ipod_machine) {
+        return;
+    }
+    ipod_classic_pmu_set_vbus(ipod_machine->pmu, on);
+    if (ipod_machine->usb) {
+        ipod_classic_usb_set_vbus(ipod_machine->usb, on);
+    }
+    ipod_classic_wake_vcpu();
 }
 
 /* INTSTAT of the PMU's group, with the line in it. See the note on the window. */
@@ -1712,6 +1729,19 @@ static void ipod_classic_machine_init(MachineState *machine)
     dev = qdev_new(TYPE_IPOD_CLASSIC_AES);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, AES_MEM_BASE);
+
+    /*
+     * USB: the DesignWare OTG core (device mode) and its PHY, on VIC line 19
+     * (Rockbox's IRQ_USB_FUNC).  Both firmwares bring it up when the cable's
+     * VBUS reaches the PMU; see ipod_classic_usb.c.
+     */
+    dev = qdev_new(TYPE_IPOD_CLASSIC_USB);
+    nms->usb = IPOD_CLASSIC_USB(dev);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, USBOTG_MEM_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, USBPHYS_MEM_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       s5l8702_get_irq(nms, S5L8702_USB_FUNC_IRQ));
 
     /* Serial console. */
     exynos4210_uart_create(UART0_MEM_BASE, 256, 0, serial_hd(0),

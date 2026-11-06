@@ -82,7 +82,8 @@ arm_ss.add(when: 'CONFIG_IPOD_CLASSIC_6G', if_true: files(
   'ipod_classic/ipod_classic_cs42l55.c',
   'ipod_classic/ipod_classic_sm1.c',
   'ipod_classic/ipod_classic_sm1_codec.c',
-  'ipod_classic/ipod_classic_aes.c'))
+  'ipod_classic/ipod_classic_aes.c',
+  'ipod_classic/ipod_classic_usb.c'))
 # The decoders behind the SM1 engine: upstream's code, built with its own flags
 # and none of QEMU's warnings.  codecs/README says what they are.
 ipod_classic_codecs = static_library('ipod_classic_codecs', files(
