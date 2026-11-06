@@ -41,15 +41,18 @@
  * READ CAPACITY, in Bulk-Only Transport over the two bulk endpoints.  From
  * then on it runs the page's requests (ipod_wasm_usb_io(): READ(10),
  * WRITE(10), eject), one at a time, through a buffer the page fills or reads.
- * It runs on QEMU_CLOCK_VIRTUAL, so it waits through the guest's idle like any
- * other device, and it never acts inside a guest register access.
+ * It reacts on QEMU_CLOCK_VIRTUAL as soon as the driver arms an endpoint, and
+ * never acts inside a guest register access; but it waits, polls and times out
+ * in host time as well (usb_host_poll, usb_host_deadline), because the virtual
+ * clock warps while the vCPU sleeps and Rockbox's tick runs on host time.
  *
  * MEASURED (Node, JIT): Rockbox's disk is 4096-byte blocks, the whole disk;
  * its first TEST UNIT READY says "medium not present" (2/3A/00), the next one
- * is ready; a 256 KB read takes 31 ms.  Apple's 2.0.5 says "becoming ready"
- * (2/04/01) for 80 s of guest time (polled every 100 ms), then exports only
- * its FAT32 data partition, in 4096-byte blocks; it keeps written blocks in
- * RAM until the eject, which it answers with "OK to Disconnect".
+ * is ready; a 256 KB read takes 31 ms (16 ms a request in Chrome).  Apple's
+ * 2.0.5 says "becoming ready" (2/04/01) for 80 s of guest time, about 9 s of
+ * host time, then exports only its FAT32 data partition, in 4096-byte blocks;
+ * it keeps written blocks in RAM until the eject, which it answers with "OK to
+ * Disconnect".
  *
  * USBTRACE=1 logs host events, descriptors and the mass-storage setup; 2 adds
  * the page's SCSI commands and register writes; 3 adds reads.
@@ -121,6 +124,7 @@ void ipod_classic_set_usb_cable(bool on);
  * then, yet it showed "OK to Disconnect").
  */
 #define USB_BOT_TIMEOUT_NS         (30 * NANOSECONDS_PER_SECOND)
+#define USB_CTRL_TIMEOUT_NS        (5 * NANOSECONDS_PER_SECOND)
 /* How long the firmware may take to hand its disk over (TEST UNIT READY). */
 #define USB_MSC_RETRY_NS           (100 * SCALE_MS)
 
@@ -258,6 +262,39 @@ static void usb_host_arm(IPodClassicUSBState *s, int64_t delay_ns)
                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ns);
 }
 
+/*
+ * Look again later, in host time.  Under -icount sleep=off the virtual clock
+ * warps to the next virtual timer whenever the vCPU sleeps, and Rockbox's
+ * kernel tick runs on host time (docs/architecture.md, "Wall-clock sources
+ * are host time").  So while its USB thread slept a tick or two, a 1 ms
+ * virtual poll warped through seconds of "guest time" in a few milliseconds,
+ * spinning the emulator: MEASURED in Chrome, the host gave up on
+ * SET_CONFIGURATION after 5 s of virtual time and 60 ms of wall time.  The
+ * driver's own register writes still kick the virtual timer (usb_host_arm),
+ * so a transfer the device is ready for goes at once.
+ */
+static void usb_host_poll(IPodClassicUSBState *s, int64_t delay_ns)
+{
+    timer_mod_ns(s->host_timer_rt,
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT) + delay_ns);
+}
+
+/*
+ * A wait for the device ends after `ns` of guest time and `ns` of host time
+ * both: the warp cannot end it early, and neither can a slow emulation.
+ */
+static void usb_host_deadline(IPodClassicUSBState *s, int64_t ns)
+{
+    s->host_deadline_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns;
+    s->host_deadline_rt = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT) + ns;
+}
+
+static bool usb_host_overdue(IPodClassicUSBState *s, int64_t now)
+{
+    return s->host_deadline_ns && now > s->host_deadline_ns &&
+           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT) > s->host_deadline_rt;
+}
+
 static void usb_host_set_state(IPodClassicUSBState *s, int state)
 {
     if (s->host_state != state) {
@@ -269,9 +306,11 @@ static void usb_host_set_state(IPodClassicUSBState *s, int state)
                   usb_host_state_names[state]);
     }
     s->host_state = state;
-    /* Every wait for the device has a limit: 2 s of guest time. */
-    s->host_deadline_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                          2 * NANOSECONDS_PER_SECOND;
+    /*
+     * Every wait for the device has a limit: 5 s for a control transfer,
+     * Linux's USB_CTRL_SET_TIMEOUT (see usb_host_deadline).
+     */
+    usb_host_deadline(s, USB_CTRL_TIMEOUT_NS);
 }
 
 /* The device is attached when VBUS is up and it is not soft-disconnected. */
@@ -300,6 +339,7 @@ static void usb_host_detach(IPodClassicUSBState *s)
         qatomic_set(&s->io_status, USB_IO_FAILED);
     }
     timer_del(s->host_timer);
+    timer_del(s->host_timer_rt);
 }
 
 /* Call after anything that may attach or detach the device. */
@@ -508,6 +548,7 @@ static bool usb_host_try_setup(IPodClassicUSBState *s)
     *ctl &= ~EPCTL_STALL;
     *usb_ep(s, true, 0, DWC_EPCTL) &= ~EPCTL_STALL;
     s->stalled = false;
+    s->setup_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     address_space_write(&address_space_memory, *dma, MEMTXATTRS_UNSPECIFIED,
                         s->setup, sizeof(s->setup));
     USB_TRACE(1, "host: SETUP %02x %02x %04x %04x %04x -> 0x%08x\n",
@@ -730,8 +771,7 @@ static void usb_bot_start(IPodClassicUSBState *s, const uint8_t *cdb,
               "host: SCSI %02x, %u byte(s) %s\n", cdb[0], len,
               len ? (in ? "in" : "out") : "");
     usb_host_set_state(s, USB_HOST_BULK_OUT);
-    s->host_deadline_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                          USB_BOT_TIMEOUT_NS;
+    usb_host_deadline(s, USB_BOT_TIMEOUT_NS);
     usb_host_arm(s, 50 * SCALE_US);
 }
 
@@ -893,13 +933,15 @@ static void usb_bot_finish(IPodClassicUSBState *s, bool ok)
         s->msc_sense = sense;
         s->msc_init = 1;
         /*
-         * Hosts poll TEST UNIT READY: let the firmware get on with it.  The
-         * driver re-arming its OUT endpoint kicks the timer at once (see
-         * usb_write_epctl), so the pause is kept as a time, not a timer.
+         * Hosts poll TEST UNIT READY every so often in their own time: let
+         * the firmware get on with it.  The driver re-arming its OUT endpoint
+         * kicks the virtual timer at once (see usb_write_epctl), so the pause
+         * is kept as a time, not only a timer, and in host time for the same
+         * reason as usb_host_poll.
          */
-        s->msc_retry_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+        s->msc_retry_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT) +
                           USB_MSC_RETRY_NS;
-        usb_host_arm(s, USB_MSC_RETRY_NS);
+        usb_host_poll(s, USB_MSC_RETRY_NS);
         return;
     }
     case SCSI_READ_CAPACITY_10:
@@ -1097,7 +1139,7 @@ static void usb_host_tick(void *opaque)
     case USB_HOST_DATA_IN:
         if (usb_host_try_in(s, &done)) {
             progress = true;
-            s->host_deadline_ns = now + 2 * NANOSECONDS_PER_SECOND;
+            usb_host_deadline(s, USB_CTRL_TIMEOUT_NS);
             if (done && s->stalled) {
                 /* Refused: no status stage; the script goes on. */
                 usb_host_data_done(s);
@@ -1119,6 +1161,11 @@ static void usb_host_tick(void *opaque)
     case USB_HOST_STATUS_IN:
         if (usb_host_try_zlp(s, true)) {
             progress = true;
+            if (now - s->setup_ns > 100 * SCALE_MS) {
+                USB_TRACE(1, "host: request %02x took %" PRId64 " ms of guest "
+                          "time\n", s->setup[1],
+                          (now - s->setup_ns) / SCALE_MS);
+            }
             if (s->setup[1] == USB_REQ_SET_ADDRESS) {
                 s->address = s->setup[2];
                 USB_TRACE(1, "host: address %u (DCFG.DevAddr %u)\n",
@@ -1138,13 +1185,13 @@ static void usb_host_tick(void *opaque)
         }
         break;
     case USB_HOST_CONFIGURED:
-        if (now < s->msc_retry_ns) {
+        if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT) < s->msc_retry_ns) {
             /*
              * MEASURED with stock 2.0.5: without this, its re-armed OUT
              * endpoint brought the next TEST UNIT READY in a millisecond, 300
              * of them in 0.1 s of guest time, and it never became ready.
              */
-            timer_mod_ns(s->host_timer, s->msc_retry_ns);
+            timer_mod_ns(s->host_timer_rt, s->msc_retry_ns);
             return;
         }
         /* Between commands: the init sequence, then the page's requests. */
@@ -1164,7 +1211,7 @@ static void usb_host_tick(void *opaque)
     case USB_HOST_BULK_IN:
         if (usb_bot_tick(s)) {
             progress = true;
-            s->host_deadline_ns = now + USB_BOT_TIMEOUT_NS;
+            usb_host_deadline(s, USB_BOT_TIMEOUT_NS);
         }
         break;
     default:
@@ -1179,7 +1226,7 @@ static void usb_host_tick(void *opaque)
         usb_host_arm(s, 50 * SCALE_US);
         return;
     }
-    if (s->host_deadline_ns && now > s->host_deadline_ns) {
+    if (usb_host_overdue(s, now)) {
         bool bulk = s->host_state >= USB_HOST_BULK_OUT;
         int in = bulk ? s->msc_in : 0, out = bulk ? s->msc_out : 0;
 
@@ -1199,8 +1246,8 @@ static void usb_host_tick(void *opaque)
         }
         return;
     }
-    /* Not ready yet: look again in a millisecond (a USB frame). */
-    usb_host_arm(s, SCALE_MS);
+    /* Not ready yet: look again in a millisecond (a USB frame) of host time. */
+    usb_host_poll(s, SCALE_MS);
 }
 
 /* ---- the cable ---- */
@@ -1665,6 +1712,7 @@ static void ipod_classic_usb_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->phy_iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
     s->host_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, usb_host_tick, s);
+    s->host_timer_rt = timer_new_ns(QEMU_CLOCK_VIRTUAL_RT, usb_host_tick, s);
     s->cable_bh = qemu_bh_new(usb_cable_bh, s);
     s->cable_request = -1;
     s->io_bh = qemu_bh_new(usb_io_bh, s);
@@ -1714,10 +1762,10 @@ static const VMStateDescription vmstate_ipod_classic_usb = {
         VMSTATE_INT32_V(msc_init, IPodClassicUSBState, 2),
         VMSTATE_INT32_V(msc_tries, IPodClassicUSBState, 2),
         VMSTATE_UINT32_V(msc_sense, IPodClassicUSBState, 2),
-        VMSTATE_INT64_V(msc_retry_ns, IPodClassicUSBState, 2),
         VMSTATE_BOOL_V(msc_autosense, IPodClassicUSBState, 2),
         VMSTATE_UINT8_V(msc_failed_op, IPodClassicUSBState, 2),
         VMSTATE_BOOL_V(io_then_eject, IPodClassicUSBState, 2),
+        VMSTATE_INT64_V(setup_ns, IPodClassicUSBState, 2),
         VMSTATE_UINT32_V(msc_blocks, IPodClassicUSBState, 2),
         VMSTATE_UINT32_V(msc_block_size, IPodClassicUSBState, 2),
         VMSTATE_INT32_V(bot_phase, IPodClassicUSBState, 2),

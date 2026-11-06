@@ -168,9 +168,11 @@ struct IPodClassicUSBState {
 
     /* The emulated host. */
     QEMUTimer *host_timer;
+    QEMUTimer *host_timer_rt;   /* idle polls in host time: usb_host_poll */
     int32_t host_state;
     int32_t host_step;          /* index into the enumeration script */
     int64_t host_deadline_ns;   /* QEMU_CLOCK_VIRTUAL; 0 = none */
+    int64_t host_deadline_rt;   /* QEMU_CLOCK_VIRTUAL_RT; not migrated */
     uint8_t setup[8];
     uint32_t want;              /* wLength of the current control read */
     uint32_t got;               /* bytes of it received */
@@ -190,10 +192,11 @@ struct IPodClassicUSBState {
     int32_t msc_init;           /* the init sequence's next command */
     int32_t msc_tries;          /* TEST UNIT READY attempts */
     uint32_t msc_sense;         /* the last not-ready reason: key/ASC/ASCQ */
-    int64_t msc_retry_ns;       /* no TEST UNIT READY before this */
+    int64_t msc_retry_ns;       /* next TEST UNIT READY; VIRTUAL_RT, unsaved */
     bool msc_autosense;         /* a page command failed: REQUEST SENSE next */
     uint8_t msc_failed_op;      /* its opcode, for the log */
     bool io_then_eject;         /* the flush before an eject is running */
+    int64_t setup_ns;           /* when the last SETUP went in */
     uint32_t msc_blocks;
     uint32_t msc_block_size;
     /* The command in flight. */
