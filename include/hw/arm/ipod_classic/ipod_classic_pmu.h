@@ -86,6 +86,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicPMUState, IPOD_CLASSIC_PMU)
  * presence and this is the state it already expects).
  */
 #define PCF5063X_OOCSTAT_HEALTHY  0xe1   /* ONKEY|SYSOK|BATOK|TMPOK */
+/* EXTON2 carries the USB cable's VBUS on the 6G (Rockbox's pmu-6g.c). */
+#define PCF5063X_OOCSTAT_EXTON2   0x04
+#define PCF5063X_INT2_EXTON2R     0x10   /* EXTON2 rose: cable in */
+#define PCF5063X_INT2_EXTON2F     0x20   /* EXTON2 fell: cable out */
 #define PCF5063X_MBCS1_USBPRES    0x01
 #define PCF5063X_MBCS1_USBOK      0x02
 #define PCF5063X_MBCS1_ADAPTPRES  0x04
@@ -143,6 +147,11 @@ struct IPodClassicPMUState {
      * move it, and GPIOSTAT reads follow it whatever the guest wrote there.
      */
     bool hold;
+    /*
+     * The USB cable's VBUS, also a physical fact rather than a register: it
+     * shows in OOCSTAT (EXTON2) and its edges in INT2.  A reset leaves it.
+     */
+    bool vbus;
 
     /*
      * The LED converter that lights the LCD; see THE BACKLIGHT in the .c.
@@ -167,5 +176,8 @@ struct IPodClassicPMUState {
 
 /* Slide the switch; the guest hears about it through INT6 and nIRQ. */
 void ipod_classic_pmu_set_hold(IPodClassicPMUState *s, bool on);
+
+/* Plug or pull the USB cable; the guest hears about it through INT2 and nIRQ. */
+void ipod_classic_pmu_set_vbus(IPodClassicPMUState *s, bool on);
 
 #endif

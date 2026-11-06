@@ -328,6 +328,34 @@ void ipod_classic_pmu_set_hold(IPodClassicPMUState *s, bool on)
     pmu_update_irq(s);
 }
 
+/*
+ * The USB cable.  On the 6G its VBUS reaches the PCF50635 on EXTON2, not on
+ * the charger's USB input: Rockbox's pmu-6g.c reads OOCSTAT & EXTON2 when INT2
+ * reports EXTON2R or EXTON2F and calls usb_insert_int()/usb_remove_int(), and
+ * its header says "EXTON2: USB Vbus (High when present)".
+ *
+ * MEASURED on Apple's 2.0.5 with a probe build: raising only MBCS1 USBPRES and
+ * INT1 USBINS, the firmware read and cleared INT1 and did nothing else for
+ * 40 s.  Raising EXTON2 instead, it read INT2, re-read OOCSTAT, powered the USB
+ * PHY and brought the DesignWare core up as a device within a millisecond, and
+ * on EXTON2F it tore the core down again.  2.0.5 writes INT2M = 0x00 at boot
+ * and Rockbox 0x0f, so both see both edges.
+ *
+ * MBCS1 is left alone: the charger state is a separate question (the 6G
+ * charges through its own LTC4066, whose status is a GPIO), and the model's
+ * PMUCHARGER switch still answers it.
+ */
+void ipod_classic_pmu_set_vbus(IPodClassicPMUState *s, bool on)
+{
+    if (s->vbus == on) {
+        return;
+    }
+    s->vbus = on;
+    s->reg[PCF5063X_REG_INT2] |= on ? PCF5063X_INT2_EXTON2R
+                                    : PCF5063X_INT2_EXTON2F;
+    pmu_update_irq(s);
+}
+
 static uint8_t pmu_reg_read(IPodClassicPMUState *s, uint8_t addr)
 {
     uint8_t val = s->reg[addr];
@@ -361,6 +389,10 @@ static uint8_t pmu_reg_read(IPodClassicPMUState *s, uint8_t addr)
          * A plain register file leaves it stale/zero. See the header.
          */
         val = PCF5063X_OOCSTAT_HEALTHY;
+        /* The USB cable's VBUS is EXTON2; see ipod_classic_pmu_set_vbus(). */
+        if (s->vbus) {
+            val |= PCF5063X_OOCSTAT_EXTON2;
+        }
         break;
     case PCF5063X_REG_MBCS1:
         /*
@@ -801,7 +833,7 @@ static int ipod_classic_pmu_post_load(void *opaque, int version_id)
  */
 static const VMStateDescription vmstate_ipod_classic_pmu = {
     .name = TYPE_IPOD_CLASSIC_PMU,
-    .version_id = 5,
+    .version_id = 6,
     .minimum_version_id = 5,
     .pre_save = ipod_classic_pmu_pre_save,
     .post_load = ipod_classic_pmu_post_load,
@@ -815,6 +847,8 @@ static const VMStateDescription vmstate_ipod_classic_pmu = {
         VMSTATE_TIMER_PTR(rtc_second, IPodClassicPMUState),
         VMSTATE_BOOL(hold, IPodClassicPMUState),
         VMSTATE_UINT8(bl_from, IPodClassicPMUState),
+        /* Like the hold switch: where the cable is, saved with the machine. */
+        VMSTATE_BOOL_V(vbus, IPodClassicPMUState, 6),
         VMSTATE_END_OF_LIST()
     },
 };

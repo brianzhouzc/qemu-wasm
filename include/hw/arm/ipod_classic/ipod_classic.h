@@ -27,6 +27,7 @@
 #include "hw/arm/ipod_classic/ipod_classic_i2s.h"
 #include "hw/arm/ipod_classic/ipod_classic_sm1.h"
 #include "hw/arm/ipod_classic/ipod_classic_aes.h"
+#include "hw/arm/ipod_classic/ipod_classic_usb.h"
 
 #define TYPE_IPOD_CLASSIC "iPod-Classic"
 
@@ -251,6 +252,7 @@ typedef struct {
     IPodClassicDispState *disp;
     IPodClassicWheelState *wheel;
     IPodClassicI2SState *i2s;
+    IPodClassicUSBState *usb;
     Clock *sysclk;
     bool semihosting;
     /*
@@ -319,5 +321,6 @@ void ipod_classic_power_on(void);
  */
 void ipod_classic_set_hold(bool on);
 bool ipod_classic_get_hold(void);
+void ipod_classic_set_usb_cable(bool on);
 
 #endif
