@@ -37,6 +37,7 @@
 static int64_t icount_get_limit(void)
 {
     int64_t deadline;
+    int64_t realtime;
 
     if (replay_mode != REPLAY_MODE_PLAY) {
         /*
@@ -46,9 +47,22 @@ static int64_t icount_get_limit(void)
         deadline = qemu_clock_deadline_ns_all(QEMU_CLOCK_VIRTUAL,
                                               QEMU_TIMER_ATTR_ALL);
         /* Check realtime timers, because they help with input processing */
-        deadline = qemu_soonest_timeout(deadline,
-                qemu_clock_deadline_ns_all(QEMU_CLOCK_REALTIME,
-                                           QEMU_TIMER_ATTR_ALL));
+        realtime = qemu_clock_deadline_ns_all(QEMU_CLOCK_REALTIME,
+                                              QEMU_TIMER_ATTR_ALL);
+#ifdef EMSCRIPTEN
+        /*
+         * A host timer that is due holds this budget at zero, which stops the
+         * guest, until the main loop has run it.  The main loop must not be
+         * left to wake by itself for that: its timed sleep is an Atomics.wait,
+         * and MEASURED on Windows any timeout from 1 to 10 ms takes about
+         * 15.4 ms, the system's timer tick.  With no wake here the 30 Hz frame
+         * tick alone took a busy guest from 34 to 25 M instructions a second.
+         */
+        if (realtime == 0) {
+            qemu_notify_event();
+        }
+#endif
+        deadline = qemu_soonest_timeout(deadline, realtime);
 
         /*
          * Maintain prior (possibly buggy) behaviour where if no deadline
