@@ -885,8 +885,11 @@ EMSCRIPTEN_KEEPALIVE int ipod_wasm_key_ack(void)
 
 /*
  * Slide the hold switch.  Off the page's thread like every other input (Q11):
- * the bottom half does it.  Called before the machine exists it does nothing,
- * which is why the page sets the position again once a boot has finished.
+ * the bottom half does it.  Called before the machine has its wheel it does
+ * nothing, so the page sends the position from the moment it creates the
+ * machine, on every screen tick, until ipod_wasm_hold_state() reads back the
+ * same one (holdTick() in iPodWasm's src/page.html).  A restored machine
+ * brings its own position, which the page reads instead.
  */
 EMSCRIPTEN_KEEPALIVE void ipod_wasm_hold(int on)
 {
