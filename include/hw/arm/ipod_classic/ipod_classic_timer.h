@@ -103,7 +103,10 @@ typedef struct {
     uint32_t host_count;
     bool host_anchor;
 
-    /* Channel B's dedicated host-time tick (Rockbox kernel tick). */
+    /*
+     * Channel B's dedicated host-time tick: Rockbox's kernel tick, and the
+     * retailOS's once the boot is over (tick_follows_host below).
+     */
     QEMUTimer *host_tick;
     uint64_t host_tick_period_ns;
     uint32_t host_tick_backlog;         /* periods passed, not yet raised */
@@ -120,6 +123,28 @@ struct IPodClassicTimerState {
 
     qemu_irq irq16;             /* IRQ 8, shared by A..D */
     qemu_irq irq32;             /* IRQ 7, shared by E..H */
+
+    /*
+     * When the retailOS's tick may follow the host (chan_is_host_tick()):
+     * the boot is over (set by the page through ipod_wasm_tick_follows_host(),
+     * tick_bh and tick_request; cleared by a reset), the guest has been seen
+     * idle since the last input (idle, which idle_check decides) and the
+     * cable is out.
+     */
+    bool tick_follows_host;
+    bool idle;
+    bool cable;
+    int tick_request;           /* -1, or the page's 0 or 1 */
+    QEMUBH *tick_bh;
+    QEMUTimer *idle_check;
+    unsigned idle_windows;      /* idle-looking checks in a row */
+    int64_t check_rt_ms;        /* the last sample idle_check took */
+    int64_t check_virtual_ns;
+    int64_t check_icount;
 };
+
+/* A key, the hold switch or the cable: the machine is in use. */
+void ipod_classic_timer_note_input(IPodClassicTimerState *s);
+void ipod_classic_timer_set_cable(IPodClassicTimerState *s, bool on);
 
 #endif

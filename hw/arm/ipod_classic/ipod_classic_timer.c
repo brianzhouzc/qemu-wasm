@@ -9,11 +9,17 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
+#include "sysemu/cpu-timers.h"
 #include "hw/arm/ipod_classic/ipod_classic_timer.h"
+
+#ifdef EMSCRIPTEN
+#include <emscripten.h>
+#endif
 
 /* Cached: this is checked on every channel reload (Q18). */
 static bool timer_trace_on(void)
@@ -231,16 +237,87 @@ static uint32_t chan_freq(IPodClassicTimerChannel *c)
 #define S5L8702_TIMER_B 1
 #define S5L8702_TIMER_E 4
 
+/* The shortest tick that follows the host because the guest is idle: 1 ms. */
+#define S5L8702_HOST_TICK_MIN_NS 1000000ULL
+
 /*
- * Rockbox's kernel tick: timer B at 12 MHz / 16 / 75 = 10 kHz, DATA0 = 100.
- * Only this configuration runs from host time.  The retailOS programs timer B
- * at 6 MHz / 6000 and stays on the virtual ptimer, or its boot would wait in
- * real time instead of warping (66 s against 35.6 s).
+ * When the retailOS counts as idle: for S5L8702_IDLE_WINDOWS windows of
+ * S5L8702_IDLE_CHECK_MS of host time in a row since the last input, the
+ * virtual clock ran at least S5L8702_IDLE_RACE times as fast as the host's
+ * while the guest executed for less than S5L8702_IDLE_BUSY_PCT of it.
+ *
+ * That is the warp loop itself, the tick's handler and nothing else: MEASURED
+ * at the Language screen and in the Games list, 16 to 17 times as fast,
+ * executing for 0.4 to 0.5% of it, second after second.  A busy guest's
+ * virtual clock runs at the pace it executes, about real time or slower.  A
+ * job that sleeps between chunks of work races too, and is what the other two
+ * conditions are for: loading the Games list's artwork ran 9 to 14 times as
+ * fast, its seconds executing for 0.7, 2.4, 4.2 and 0.6%.  One quiet second
+ * inside it is not idle; three in a row are.
+ */
+#define S5L8702_IDLE_CHECK_MS   1000
+#define S5L8702_IDLE_WINDOWS    3
+#define S5L8702_IDLE_RACE       2
+#define S5L8702_IDLE_BUSY_PCT   1
+
+static uint64_t chan_period_ns(IPodClassicTimerChannel *c)
+{
+    return (uint64_t)c->data0 * 1000000000ULL / chan_freq(c);
+}
+
+/*
+ * Does timer B's tick run from host time rather than the virtual ptimer?
+ *
+ * Rockbox's kernel tick, 12 MHz / 16 / 75 = 10 kHz with DATA0 = 100, always
+ * does.  The retailOS's, 6 MHz / 6000 = 1 kHz, does only while nothing needs
+ * it on the virtual clock:
+ *
+ *   - The boot is over (tick_follows_host, set by the page).  On host time
+ *     from reset the boot waits in real time instead of warping (66 s
+ *     against 35.6 s).
+ *   - The guest is idle (idle, which timer_idle_check() decides): since the
+ *     last input its virtual clock has raced ahead of the host's, with next
+ *     to nothing executed, for three seconds in a row.
+ *
+ *     The wheel's pacing counts on this tick: the firmware's wheel task has
+ *     to run between a gesture's arming packet and its first movement
+ *     (constraint 2 in ipod_classic_wheel.h), which on the virtual clock it
+ *     always did, 40 ticks fitting in the 40 ms between the two.  On host
+ *     time an idle guest warps from one packet to the next in under a
+ *     millisecond, before its next tick, and MEASURED on stock 2.0.5 at the
+ *     Language screen 10 of 12 single detents were acknowledged and did
+ *     nothing.  So every key, the hold switch and the cable put the tick back
+ *     on the virtual clock, where input behaves exactly as it did.
+ *
+ *     And a guest that is still working keeps it there too, whether busy or
+ *     sleeping between chunks of work: the short waits in what it is doing
+ *     are worth keeping warped (see timer_idle_check()).
+ *   - The cable is out.  The USB session (the firmware's and the emulated
+ *     host's polls and timeouts) was measured on the virtual tick, and stays
+ *     on it.
+ *
+ * WHY THE RETAILOS'S MOVES AT ALL.  Under -icount sleep=off a halted vCPU
+ * warps QEMU_CLOCK_VIRTUAL straight to the next virtual deadline, and an idle
+ * retailOS's next deadline is always its next tick, 1 ms ahead.  So it never
+ * waits: it takes the tick, runs its handler and halts again, as fast as the
+ * vCPU and the main loop can hand each warp to each other.  MEASURED on stock
+ * 2.0.5 idling at the Language screen (headless Chrome, iPodWasm c721b5b):
+ * 4.6 M guest instructions a second, about 265 a tick, virtual time 17x the
+ * host's, and 1.18 s of host CPU a second, on two of the emulator's threads,
+ * for a screen on which nothing changed.  Rockbox, whose tick has followed the
+ * host since qemu-wasm#14, idles at virtual time 0.04x and about 0.08 s.
  */
 static bool chan_is_host_tick(IPodClassicTimerChannel *c)
 {
-    return c->index == S5L8702_TIMER_B && c->data0 == 100 &&
-           chan_freq(c) == 10000;
+    if (c->index != S5L8702_TIMER_B) {
+        return false;
+    }
+    if (c->data0 == 100 && chan_freq(c) == 10000) {
+        return true;
+    }
+    return c->parent->tick_follows_host && c->parent->idle &&
+           !c->parent->cable &&
+           chan_period_ns(c) >= S5L8702_HOST_TICK_MIN_NS;
 }
 
 /*
@@ -272,8 +349,7 @@ static void chan_host_tick_update(IPodClassicTimerChannel *c)
         return;
     }
     if (chan_is_host_tick(c) && (c->cmd & S5L8702_TIMER_CMD_EN)) {
-        c->host_tick_period_ns =
-            (uint64_t)c->data0 * 1000000000ULL / chan_freq(c);
+        c->host_tick_period_ns = chan_period_ns(c);
         c->host_tick_next_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
                                c->host_tick_period_ns;
         c->host_tick_backlog = 0;
@@ -373,6 +449,153 @@ static void chan_reload(IPodClassicTimerChannel *c)
         }
     }
 }
+
+static IPodClassicTimerState *timer_state;
+
+/*
+ * Put timer B's running tick on the clock chan_is_host_tick() now asks for.
+ * Its configuration, its count and any interrupt it has raised stay as they
+ * are; a host tick starts a fresh period, so the guest sees at most one period
+ * of jitter, and only when the clock actually changes.
+ */
+static void timer_retime_b(IPodClassicTimerState *s)
+{
+    IPodClassicTimerChannel *c = &s->chan[S5L8702_TIMER_B];
+    bool host = chan_is_host_tick(c) && (c->cmd & S5L8702_TIMER_CMD_EN);
+
+    if (host == c->host_tick_enabled) {
+        return;
+    }
+    chan_host_tick_update(c);
+    ptimer_transaction_begin(c->ptimer);
+    if (chan_ptimer_wanted(c)) {
+        ptimer_run(c->ptimer, 0);
+    } else {
+        ptimer_stop(c->ptimer);
+    }
+    ptimer_transaction_commit(c->ptimer);
+}
+
+static int64_t timer_icount(void)
+{
+    return icount_enabled() ? icount_get_raw() : 0;
+}
+
+/* Watch again from now: the guest is not idle until idle_check says so. */
+static void timer_watch_idle(IPodClassicTimerState *s)
+{
+    s->idle = false;
+    s->idle_windows = 0;
+    s->check_rt_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    s->check_virtual_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->check_icount = timer_icount();
+    if (s->tick_follows_host) {
+        timer_mod(s->idle_check, s->check_rt_ms + S5L8702_IDLE_CHECK_MS);
+    } else {
+        timer_del(s->idle_check);
+    }
+    timer_retime_b(s);
+}
+
+/*
+ * Once a second while the tick is on the virtual clock: was the guest idle,
+ * its virtual clock racing ahead of the host's with next to nothing executed,
+ * and has it been for S5L8702_IDLE_WINDOWS seconds in a row since the last
+ * input?  Then the tick follows the host until the next input.
+ *
+ * Not on quiet alone, nor on racing alone, nor on one idle second: work the
+ * firmware paces with its tick, sleeping between chunks, is worth keeping
+ * warped.  MEASURED on the way, opening the Games list, whose artwork the
+ * virtual tick has in place 1.3 s after the list: with the tick on host time
+ * 2 s after the Select that opened it it took 2.9 s (racing, executing under
+ * 5%), and on one window under 1% it took 4.2 s.  perf/stock-games.js failed
+ * iPod Quiz's return to the list on the pixels that changed.
+ */
+static void timer_idle_check(void *opaque)
+{
+    IPodClassicTimerState *s = opaque;
+    int64_t rt = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    int64_t virt = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t icount = timer_icount();
+    int64_t rt_ns = (rt - s->check_rt_ms) * 1000000;
+    int64_t virt_ns = virt - s->check_virtual_ns;
+    int64_t ran_ns = icount_to_ns(icount - s->check_icount);
+    bool racing = rt_ns > 0 && virt_ns >= S5L8702_IDLE_RACE * rt_ns;
+    bool resting = ran_ns * 100 < S5L8702_IDLE_BUSY_PCT * virt_ns;
+
+    if (!s->tick_follows_host) {
+        return;
+    }
+    s->check_rt_ms = rt;
+    s->check_virtual_ns = virt;
+    s->check_icount = icount;
+    s->idle_windows = racing && resting ? s->idle_windows + 1 : 0;
+    if (s->idle_windows >= S5L8702_IDLE_WINDOWS) {
+        s->idle = true;
+        timer_retime_b(s);
+        return;
+    }
+    timer_mod(s->idle_check, rt + S5L8702_IDLE_CHECK_MS);
+}
+
+static void timer_tick_bh(void *opaque)
+{
+    IPodClassicTimerState *s = opaque;
+    int req = qatomic_xchg(&s->tick_request, -1);
+
+    if (req >= 0) {
+        s->tick_follows_host = req;
+        timer_watch_idle(s);
+    }
+}
+
+void ipod_classic_timer_note_input(IPodClassicTimerState *s)
+{
+    timer_watch_idle(s);
+}
+
+void ipod_classic_timer_set_cable(IPodClassicTimerState *s, bool on)
+{
+    s->cable = on;
+    ipod_classic_timer_note_input(s);
+}
+
+#ifdef EMSCRIPTEN
+/*
+ * The boot is over (1): from here the retailOS's tick follows the host while
+ * it sits idle.  Off the page's thread like every other input: the
+ * bottom half does it with the BQL held.  The page calls it once its boot or
+ * restore is done (tickFollowsHost in iPodWasm's src/harness.js); see
+ * chan_is_host_tick() for why and when.
+ */
+EMSCRIPTEN_KEEPALIVE void ipod_wasm_tick_follows_host(int on)
+{
+    IPodClassicTimerState *s = timer_state;
+
+    if (!s || !s->tick_bh) {
+        return;
+    }
+    qatomic_set(&s->tick_request, on ? 1 : 0);
+    qemu_bh_schedule(s->tick_bh);
+    qemu_notify_event();
+}
+
+/*
+ * bit 0: the switch above is on; bit 1: timer B is ticking from the host;
+ * bit 2: the guest counts as idle (timer_idle_check()); bit 3: cable in.
+ */
+EMSCRIPTEN_KEEPALIVE int ipod_wasm_tick_state(void)
+{
+    IPodClassicTimerState *s = timer_state;
+
+    if (!s) {
+        return 0;
+    }
+    return (s->tick_follows_host ? 1 : 0) |
+           (s->chan[S5L8702_TIMER_B].host_tick_enabled ? 2 : 0) |
+           (s->idle ? 4 : 0) | (s->cable ? 8 : 0);
+}
+#endif
 
 /* Map an MMIO offset to a channel and a register, or return false. */
 static bool decode_offset(hwaddr offset, unsigned *chan, hwaddr *reg)
@@ -576,6 +799,14 @@ static void ipod_classic_timer_reset(DeviceState *dev)
     IPodClassicTimerState *s = IPOD_CLASSIC_TIMER(dev);
 
     s->tstat = 0;
+    /*
+     * A reboot is a boot: it warps through its waits again, and the page does
+     * not see it happen, so until the page boots a new machine the retailOS's
+     * idle costs what it did before the switch existed.  The cable stays in.
+     */
+    s->tick_follows_host = false;
+    s->idle = false;
+    timer_del(s->idle_check);
     for (unsigned i = 0; i < S5L8702_NUM_TIMERS; i++) {
         IPodClassicTimerChannel *c = &s->chan[i];
 
@@ -619,6 +850,42 @@ static void ipod_classic_timer_init(Object *obj)
     }
 }
 
+static void ipod_classic_timer_realize(DeviceState *dev, Error **errp)
+{
+    IPodClassicTimerState *s = IPOD_CLASSIC_TIMER(dev);
+
+    s->tick_request = -1;
+    s->tick_bh = qemu_bh_new(timer_tick_bh, s);
+    s->idle_check = timer_new_ms(QEMU_CLOCK_REALTIME, timer_idle_check, s);
+    timer_state = s;
+}
+
+/*
+ * A host tick restored from a snapshot is due at a time on the saving
+ * process's QEMU_CLOCK_REALTIME, which starts again with every page: from a
+ * session older than this one it would not fire for that long, and timer B
+ * would stop.  Start a fresh period from now instead.  A restore also counts
+ * as use, like a key: whether the guest is idle is host time and was not
+ * saved.
+ */
+static int ipod_classic_timer_post_load(void *opaque, int version_id)
+{
+    IPodClassicTimerState *s = opaque;
+
+    for (unsigned i = 0; i < S5L8702_NUM_TIMERS; i++) {
+        IPodClassicTimerChannel *c = &s->chan[i];
+
+        if (c->host_tick_enabled) {
+            c->host_tick_next_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                                   c->host_tick_period_ns;
+            c->host_tick_backlog = 0;
+            timer_mod_ns(c->host_tick, c->host_tick_next_ns);
+        }
+    }
+    ipod_classic_timer_note_input(s);
+    return 0;
+}
+
 static const VMStateDescription vmstate_ipod_classic_timer_channel = {
     .name = "ipod_classic_timer_channel",
     .version_id = 3,
@@ -644,13 +911,16 @@ static const VMStateDescription vmstate_ipod_classic_timer_channel = {
 
 static const VMStateDescription vmstate_ipod_classic_timer = {
     .name = TYPE_IPOD_CLASSIC_TIMER,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
+    .post_load = ipod_classic_timer_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(chan, IPodClassicTimerState, S5L8702_NUM_TIMERS,
                              1, vmstate_ipod_classic_timer_channel,
                              IPodClassicTimerChannel),
         VMSTATE_UINT32(tstat, IPodClassicTimerState),
+        VMSTATE_BOOL_V(tick_follows_host, IPodClassicTimerState, 2),
+        VMSTATE_BOOL_V(cable, IPodClassicTimerState, 2),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -660,6 +930,7 @@ static void ipod_classic_timer_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->reset = ipod_classic_timer_reset;
+    dc->realize = ipod_classic_timer_realize;
     dc->vmsd = &vmstate_ipod_classic_timer;
     dc->desc = "S5L8702 timers";
 }
