@@ -714,6 +714,18 @@ void ipod_classic_wake_vcpu(void)
 }
 
 /*
+ * Someone is using the machine: the retailOS's tick goes back on the virtual
+ * clock for a while, which the wheel's pacing needs (see chan_is_host_tick()
+ * in ipod_classic_timer.c).
+ */
+static void ipod_classic_note_input(void)
+{
+    if (ipod_machine && ipod_machine->timer) {
+        ipod_classic_timer_note_input(ipod_machine->timer);
+    }
+}
+
+/*
  * A key has arrived, so wake the guest even if it is asleep.  This has to be
  * driven by the input itself and not by the wheel's interrupt: while it sleeps
  * the firmware can mask that interrupt inside the device (s->mask), so no
@@ -728,6 +740,7 @@ void ipod_classic_wake_vcpu(void)
  */
 bool ipod_classic_input_wake(void)
 {
+    ipod_classic_note_input();
     if (ipod_machine && ipod_machine->powered_off) {
         if (!ipod_classic_get_hold()) {
             ipod_classic_power_on();
@@ -755,6 +768,7 @@ bool ipod_classic_power_key_event(int keycode)
     if (!ipod_machine) {
         return false;
     }
+    ipod_classic_note_input();
     if (ipod_machine->powered_off) {
         if (!release && !ipod_classic_get_hold()) {
             ipod_machine->power_release_pending = true;
@@ -818,6 +832,10 @@ void ipod_classic_set_hold(bool on)
     if (!ipod_machine) {
         return;
     }
+    /* The page repeats the position until it reads it back: only a move counts. */
+    if (on != ipod_classic_get_hold()) {
+        ipod_classic_note_input();
+    }
     ipod_classic_pmu_set_hold(ipod_machine->pmu, on);
     ipod_classic_wake_vcpu();
 }
@@ -840,6 +858,9 @@ void ipod_classic_set_usb_cable(bool on)
     ipod_classic_pmu_set_vbus(ipod_machine->pmu, on);
     if (ipod_machine->usb) {
         ipod_classic_usb_set_vbus(ipod_machine->usb, on);
+    }
+    if (ipod_machine->timer) {
+        ipod_classic_timer_set_cable(ipod_machine->timer, on);
     }
     ipod_classic_wake_vcpu();
 }
