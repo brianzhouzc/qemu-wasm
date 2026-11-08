@@ -47,6 +47,51 @@
 #include "../../tcg/wasm32.h"
 #endif
 
+#ifdef EMSCRIPTEN
+/*
+ * Longest the vCPU thread keeps a halted guest's warps to itself before it
+ * lets the main loop have a turn.  See rr_warp_here().
+ */
+#define RR_WARP_HANDOFF_NS SCALE_MS
+
+static int64_t rr_last_handoff_ns;
+
+/*
+ * Advance the virtual clock from this thread, and say whether that made a timer
+ * due, in which case the caller goes straight back and runs it.
+ *
+ * Under -icount sleep=off a warp is otherwise a round trip: the idle vCPU wakes
+ * the main loop, main_loop_wait() calls icount_start_warp_timer(), that moves
+ * the clock and queues work to wake the vCPU, and the vCPU then runs the timers
+ * in icount_handle_deadline().  The main loop's part is that one call, and
+ * nothing in it needs that thread.  The virtual timers already run here under
+ * the BQL, and a timer callback that rearms while the guest is halted already
+ * warps from here, through timerlist_rearm().  MEASURED on stock 2.0.5: 23,000
+ * round trips in a boot, 22 us each, 2% of it, and 10,000 a second when idle.
+ *
+ * THE VCPU MUST STILL LET GO OF THE BQL.  A guest that runs between warps
+ * releases it in tcg_cpus_exec(), but a timer whose interrupt is masked warps
+ * again with no guest code in between, and everything on host time lives on
+ * the main loop.  So the round trip is still taken once a millisecond, which
+ * releases the lock until the main loop has been round.  It costs 9% of the old
+ * round trips, and tests/warp-spin.test.js in iPodWasm is that guest.
+ *
+ * A stopped VM must not get here: a timer already due would then spin on this
+ * path instead of waiting for the resume.  all_cpu_threads_idle() calls a
+ * stopped vCPU idle, which is right for everyone else.
+ */
+static bool rr_warp_here(void)
+{
+    if (!cpu_can_run(first_cpu) ||
+        get_clock() - rr_last_handoff_ns >= RR_WARP_HANDOFF_NS) {
+        return false;
+    }
+    icount_start_warp_timer();
+    return qemu_clock_deadline_ns_all(QEMU_CLOCK_VIRTUAL,
+                                      ~QEMU_TIMER_ATTR_EXTERNAL) == 0;
+}
+#endif
+
 /* Kick all RR vCPUs */
 void rr_kick_vcpu_thread(CPUState *unused)
 {
@@ -238,6 +283,7 @@ static void *rr_cpu_thread_fn(void *arg)
     while (1) {
         /* Only used for icount_enabled() */
         int64_t cpu_budget = 0;
+        bool idle;
 
         qemu_mutex_unlock_iothread();
         replay_mutex_lock();
@@ -311,7 +357,13 @@ static void *rr_cpu_thread_fn(void *arg)
             qatomic_set_mb(&cpu->exit_request, 0);
         }
 
-        if (icount_enabled() && all_cpu_threads_idle()) {
+        idle = icount_enabled() && all_cpu_threads_idle();
+        if (idle) {
+#ifdef EMSCRIPTEN
+            if (rr_warp_here()) {
+                continue;
+            }
+#endif
             /*
              * When all cpus are sleeping (e.g in WFI), to avoid a deadlock
              * in the main_loop, wake it up in order to start the warp timer.
@@ -320,6 +372,11 @@ static void *rr_cpu_thread_fn(void *arg)
         }
 
         rr_wait_io_event();
+#ifdef EMSCRIPTEN
+        if (idle) {
+            rr_last_handoff_ns = get_clock();
+        }
+#endif
         rr_deal_with_unplugged_cpus();
     }
 
