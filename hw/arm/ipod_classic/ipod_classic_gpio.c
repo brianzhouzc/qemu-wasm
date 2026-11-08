@@ -9,8 +9,9 @@
  * all zero except pin 86; that is bit-for-bit what create_unimplemented_device()
  * used to return, so nothing else in the machine can have changed behaviour.
  * The other things it does are tell the wheel when the guest drives its pins
- * low, which is how the hold switch reaches the wheel (see the header), and
- * drive the chip select of the NOR on SPI0 (see gpio_update_spi0_cs()).
+ * low, which is how the hold switch reaches the wheel (see the header), drive
+ * the chip select of the NOR on SPI0 (see gpio_update_spi0_cs()), and tell
+ * the piezo when its pins carry timer A's output (gpio_update_piezo()).
  *
  * GPIOTRACE=1 prints every access with the guest PC, like ATATRACE and
  * LCDTRACE.
@@ -24,6 +25,7 @@
 #include "migration/vmstate.h"
 #include "hw/core/cpu.h"
 #include "hw/arm/ipod_classic/ipod_classic_gpio.h"
+#include "hw/arm/ipod_classic/ipod_classic_piezo.h"
 
 static int gpiotrace = -1;
 
@@ -122,10 +124,38 @@ static void gpio_update_spi0_cs(IPodClassicGPIOState *s)
     qemu_set_irq(s->spi0_cs, func != 0xe);
 }
 
+/*
+ * The piezo hangs on GPIO 0.6 and 0.7.  Both firmwares give it timer A's
+ * output by setting the two pins to functions 3 and 5 (Rockbox's PCON0 |=
+ * 0x53000000, Apple's GPIOCMD 0x603 and 0x705) and take it away with 0xe,
+ * both low.  Either pin carrying the timer is a drive; what function 5 on
+ * 0.7 is exactly is not known (ipod_classic_piezo.c).
+ */
+static void gpio_update_piezo(IPodClassicGPIOState *s)
+{
+    uint32_t pcon = s->pcon[S5L8702_GPIO_PIEZO_GROUP];
+
+    ipod_classic_piezo_set_route(
+        extract32(pcon, S5L8702_GPIO_PIEZO_PIN_A * 4, 4) == 3 ||
+        extract32(pcon, S5L8702_GPIO_PIEZO_PIN_B * 4, 4) == 5);
+}
+
 static void gpio_update_outputs(IPodClassicGPIOState *s)
 {
     gpio_update_wheel_pins(s);
     gpio_update_spi0_cs(s);
+    gpio_update_piezo(s);
+}
+
+/*
+ * The piezo keeps no state of its own to restore: tell it the route again.
+ * Only the piezo: the wheel and the NOR restore their own view of their
+ * pins, and an edge on their lines now would act on it.
+ */
+static int ipod_classic_gpio_post_load(void *opaque, int version_id)
+{
+    gpio_update_piezo(opaque);
+    return 0;
 }
 
 static void ipod_classic_gpio_cmd(IPodClassicGPIOState *s, uint32_t value)
@@ -252,6 +282,7 @@ static const VMStateDescription vmstate_ipod_classic_gpio = {
     .name = TYPE_IPOD_CLASSIC_GPIO,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = ipod_classic_gpio_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32_ARRAY(pcon, IPodClassicGPIOState, S5L8702_GPIO_GROUPS),
         VMSTATE_UINT32_ARRAY(pdat, IPodClassicGPIOState, S5L8702_GPIO_GROUPS),

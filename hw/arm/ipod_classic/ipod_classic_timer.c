@@ -16,6 +16,7 @@
 #include "migration/vmstate.h"
 #include "sysemu/cpu-timers.h"
 #include "hw/arm/ipod_classic/ipod_classic_timer.h"
+#include "hw/arm/ipod_classic/ipod_classic_piezo.h"
 
 #ifdef EMSCRIPTEN
 #include <emscripten.h>
@@ -281,6 +282,7 @@ static uint32_t chan_freq(IPodClassicTimerChannel *c)
  * the one that was measurably wrong, and that one IS fixed; see the CON case
  * in ipod_classic_timer_write().
  */
+#define S5L8702_TIMER_A 0
 #define S5L8702_TIMER_B 1
 #define S5L8702_TIMER_E 4
 
@@ -437,6 +439,32 @@ static uint32_t timer_e_count(IPodClassicTimerChannel *c)
     }
     return c->host_count +
            (uint32_t)((uint64_t)elapsed * chan_freq(c) / 1000000000ULL);
+}
+
+/*
+ * TOUT's period in ns while the channel toggles it, else 0: twice the
+ * interval in interval mode (it toggles at the end of each), the period in
+ * PWM mode.
+ */
+static uint64_t chan_tout_period_ns(IPodClassicTimerChannel *c)
+{
+    uint32_t mode = chan_mode(c);
+
+    if (!(c->cmd & S5L8702_TIMER_CMD_EN) ||
+        (mode != S5L8702_TIMER_MODE_INTERVAL &&
+         mode != S5L8702_TIMER_MODE_PWM)) {
+        return 0;
+    }
+    return chan_limit(c) * (mode == S5L8702_TIMER_MODE_INTERVAL ? 2 : 1) *
+           1000000000ULL / chan_freq(c);
+}
+
+/* Timer A's output is the piezo's drive (ipod_classic_piezo.c). */
+static void chan_piezo_update(IPodClassicTimerChannel *c)
+{
+    if (c->index == S5L8702_TIMER_A) {
+        ipod_classic_piezo_set_tout(chan_tout_period_ns(c));
+    }
 }
 
 static void chan_reload(IPodClassicTimerChannel *c)
@@ -787,6 +815,7 @@ static void ipod_classic_timer_write(void *opaque, hwaddr offset,
         if (new_cfg != old_cfg) {
             chan_reload(c);
         }
+        chan_piezo_update(c);
         ipod_classic_timer_update_irq(s);
         /* The ack is what lets the next owed tick through. */
         if (c->host_tick_enabled) {
@@ -813,10 +842,12 @@ static void ipod_classic_timer_write(void *opaque, hwaddr offset,
             ptimer_stop(c->ptimer);
         }
         ptimer_transaction_commit(c->ptimer);
+        chan_piezo_update(c);
         break;
     case S5L8702_TIMER_DATA0:
         c->data0 = value;
         chan_reload(c);
+        chan_piezo_update(c);
         break;
     case S5L8702_TIMER_DATA1:
         c->data1 = value;
@@ -827,11 +858,13 @@ static void ipod_classic_timer_write(void *opaque, hwaddr offset,
          */
         if (chan_mode(c) == S5L8702_TIMER_MODE_PWM) {
             chan_reload(c);
+            chan_piezo_update(c);
         }
         break;
     case S5L8702_TIMER_PRE:
         c->pre = value;
         chan_reload(c);
+        chan_piezo_update(c);
         break;
     case S5L8702_TIMER_CNT:
         qemu_log_mask(LOG_GUEST_ERROR, "%s: CNT of timer %c is read-only\n",
@@ -880,6 +913,7 @@ static void ipod_classic_timer_reset(DeviceState *dev)
         ptimer_stop(c->ptimer);
         ptimer_transaction_commit(c->ptimer);
     }
+    chan_piezo_update(&s->chan[S5L8702_TIMER_A]);
     ipod_classic_timer_update_irq(s);
 }
 
@@ -940,6 +974,7 @@ static int ipod_classic_timer_post_load(void *opaque, int version_id)
             timer_mod_ns(c->host_tick, c->host_tick_next_ns);
         }
     }
+    chan_piezo_update(&s->chan[S5L8702_TIMER_A]);
     ipod_classic_timer_note_input(s);
     return 0;
 }
