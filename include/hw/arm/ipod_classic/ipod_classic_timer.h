@@ -73,7 +73,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicTimerState, IPOD_CLASSIC_TIMER)
 #define S5L8702_TIMER_CON_CS_SHIFT        8     /* clock select, 3 bits */
 #define S5L8702_TIMER_CON_CS_MASK         0x7
 #define S5L8702_TIMER_CON_ECLK            (1 << 6)
-#define S5L8702_TIMER_CON_MODE_SHIFT      4
+#define S5L8702_TIMER_CON_MODE_SHIFT      4     /* mode, 2 bits */
+#define S5L8702_TIMER_MODE_INTERVAL       0
+#define S5L8702_TIMER_MODE_PWM            1
 
 /* CMD bits. */
 #define S5L8702_TIMER_CMD_EN     (1 << 0)

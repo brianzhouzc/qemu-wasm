@@ -119,6 +119,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicGPIOState, IPOD_CLASSIC_GPIO)
 #define S5L8702_GPIO_SPI0_CS_GROUP  0
 #define S5L8702_GPIO_SPI0_CS_PIN    0
 
+/* The piezo's two pins, 0.6 and 0.7 (see gpio_update_piezo()). */
+#define S5L8702_GPIO_PIEZO_GROUP    0
+#define S5L8702_GPIO_PIEZO_PIN_A    6
+#define S5L8702_GPIO_PIEZO_PIN_B    7
+
 struct IPodClassicGPIOState {
     SysBusDevice parent_obj;
 

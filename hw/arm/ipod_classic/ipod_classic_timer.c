@@ -2,9 +2,9 @@
  * S5L8702 timer block.
  *
  * See include/hw/arm/ipod_classic/ipod_classic_timer.h for where the register
- * layout comes from. Only interval mode is modelled, which is the only mode
- * Rockbox uses; anything else is logged as unimplemented rather than silently
- * doing the wrong thing.
+ * layout comes from. Interval mode and PWM mode are modelled, the two modes
+ * the firmwares use (PWM only for the piezo, see chan_limit()); the other two
+ * are logged as unimplemented rather than silently doing the wrong thing.
  */
 
 #include "qemu/osdep.h"
@@ -16,6 +16,7 @@
 #include "migration/vmstate.h"
 #include "sysemu/cpu-timers.h"
 #include "hw/arm/ipod_classic/ipod_classic_timer.h"
+#include "hw/arm/ipod_classic/ipod_classic_piezo.h"
 
 #ifdef EMSCRIPTEN
 #include <emscripten.h>
@@ -73,22 +74,69 @@ static void ipod_classic_timer_update_irq(IPodClassicTimerState *s)
     qemu_set_irq(s->irq32, level32);
 }
 
-/* Raise INT0 for a channel, i.e. "the counter reached DATA0". */
-static void chan_set_int0(IPodClassicTimerChannel *c)
+/* Latch interrupt status bits (INT0 = 1, INT1 = 2) for a channel. */
+static void chan_set_status(IPodClassicTimerChannel *c, uint32_t bits)
 {
     if (chan_is_32bit(c)) {
         uint32_t shift = S5L8702_TSTAT_SHIFT(c->index - S5L8702_NUM_TIMERS_16);
-        c->parent->tstat |= 1u << shift;
+        c->parent->tstat |= bits << shift;
     } else {
-        c->con |= 1u << S5L8702_TIMER_CON_INT_STAT_SHIFT;
+        c->con |= bits << S5L8702_TIMER_CON_INT_STAT_SHIFT;
     }
+}
+
+/* Raise INT0 for a channel, i.e. "the counter reached DATA0". */
+static void chan_set_int0(IPodClassicTimerChannel *c)
+{
+    chan_set_status(c, 1);
+}
+
+static uint32_t chan_mode(const IPodClassicTimerChannel *c)
+{
+    return (c->con >> S5L8702_TIMER_CON_MODE_SHIFT) & 0x3;
+}
+
+/*
+ * Where a period ends: DATA0 in interval mode, DATA1 in PWM mode.
+ *
+ * PWM MODE is the S5L8700 timer's (Rockbox's s5l87xx.h says A..D are "very
+ * similar to 16-bit timers described in S5L8700 DS"), as Rockbox's piezo
+ * driver uses it: DATA1 is the period and DATA0 the point in it where TOUT
+ * changes level, INT1 is the end of a period and INT0 the DATA0 match.
+ * piezo-6g.c sets DATA0 = cycles and DATA1 = 2 * cycles, enables INT1 alone
+ * and counts the periods in its handler.  Before this was modelled the
+ * channel ran in interval mode at DATA0 and INT1 never came: the first click
+ * never ended, `beeping` stayed true so there was never a second one, and
+ * timer A ran on at 2.5 kHz on the virtual clock for good.
+ */
+static uint64_t chan_limit(const IPodClassicTimerChannel *c)
+{
+    uint64_t limit = chan_mode(c) == S5L8702_TIMER_MODE_PWM ? c->data1
+                                                            : c->data0;
+
+    /* A zero period would make the ptimer fire continuously. */
+    if (limit == 0) {
+        limit = chan_is_32bit(c) ? 0x100000000ULL : 0x10000;
+    }
+    return limit;
+}
+
+/*
+ * The status a period's end latches.  In PWM mode the DATA0 match has
+ * happened within the period as well, so INT0 is latched with INT1: at the
+ * period's end rather than at its own point in it.  Neither firmware enables
+ * INT0 in PWM mode, and chan_reload() says so if one does.
+ */
+static uint32_t chan_tick_status(const IPodClassicTimerChannel *c)
+{
+    return chan_mode(c) == S5L8702_TIMER_MODE_PWM ? 3 : 1;
 }
 
 static void ipod_classic_timer_tick(void *opaque)
 {
     IPodClassicTimerChannel *c = opaque;
 
-    chan_set_int0(c);
+    chan_set_status(c, chan_tick_status(c));
     ipod_classic_timer_update_irq(c->parent);
 }
 
@@ -234,6 +282,7 @@ static uint32_t chan_freq(IPodClassicTimerChannel *c)
  * the one that was measurably wrong, and that one IS fixed; see the CON case
  * in ipod_classic_timer_write().
  */
+#define S5L8702_TIMER_A 0
 #define S5L8702_TIMER_B 1
 #define S5L8702_TIMER_E 4
 
@@ -392,15 +441,47 @@ static uint32_t timer_e_count(IPodClassicTimerChannel *c)
            (uint32_t)((uint64_t)elapsed * chan_freq(c) / 1000000000ULL);
 }
 
+/*
+ * TOUT's period in ns while the channel toggles it, else 0: twice the
+ * interval in interval mode (it toggles at the end of each), the period in
+ * PWM mode.
+ */
+static uint64_t chan_tout_period_ns(IPodClassicTimerChannel *c)
+{
+    uint32_t mode = chan_mode(c);
+
+    if (!(c->cmd & S5L8702_TIMER_CMD_EN) ||
+        (mode != S5L8702_TIMER_MODE_INTERVAL &&
+         mode != S5L8702_TIMER_MODE_PWM)) {
+        return 0;
+    }
+    return chan_limit(c) * (mode == S5L8702_TIMER_MODE_INTERVAL ? 2 : 1) *
+           1000000000ULL / chan_freq(c);
+}
+
+/* Timer A's output is the piezo's drive (ipod_classic_piezo.c). */
+static void chan_piezo_update(IPodClassicTimerChannel *c)
+{
+    if (c->index == S5L8702_TIMER_A) {
+        ipod_classic_piezo_set_tout(chan_tout_period_ns(c));
+    }
+}
+
 static void chan_reload(IPodClassicTimerChannel *c)
 {
-    uint64_t limit = c->data0;
-    uint32_t mode = (c->con >> S5L8702_TIMER_CON_MODE_SHIFT) & 0x3;
+    uint64_t limit;
+    uint32_t mode = chan_mode(c);
 
-    if (mode != 0) {
+    if (mode != S5L8702_TIMER_MODE_INTERVAL &&
+        mode != S5L8702_TIMER_MODE_PWM) {
         qemu_log_mask(LOG_UNIMP, "%s: timer %c mode %u is not modelled, "
                       "treating it as interval mode\n", __func__,
                       'A' + c->index, mode);
+    }
+    if (mode == S5L8702_TIMER_MODE_PWM && (chan_enabled_ints(c) & 1)) {
+        qemu_log_mask(LOG_UNIMP, "%s: timer %c enables INT0 in PWM mode; "
+                      "it comes at the end of each period, not at DATA0\n",
+                      __func__, 'A' + c->index);
     }
 
     /*
@@ -412,18 +493,15 @@ static void chan_reload(IPodClassicTimerChannel *c)
      * -- chan_freq substitutes ECLK for it -- so a channel the guest programmed
      * against PCLK comes out at the wrong rate, and this says by how much.
      */
+    limit = chan_limit(c);
     if (timer_trace_on()) {
         uint32_t f = chan_freq(c);
-        fprintf(stderr, "TIMERTRACE: chan %c  freq=%u Hz  data0=%u  pre=%u  "
-                        "con=%08x cmd=%08x  -> period %.3f ms\n",
-                'A' + c->index, f, (unsigned)c->data0, (unsigned)c->pre,
-                (unsigned)c->con, (unsigned)c->cmd,
+        fprintf(stderr, "TIMERTRACE: chan %c  freq=%u Hz  data0=%u  "
+                        "data1=%u  pre=%u  con=%08x cmd=%08x  -> period "
+                        "%.3f ms\n",
+                'A' + c->index, f, (unsigned)c->data0, (unsigned)c->data1,
+                (unsigned)c->pre, (unsigned)c->con, (unsigned)c->cmd,
                 f ? (double)limit * 1000.0 / (double)f : 0.0);
-    }
-
-    /* A zero period would make the ptimer fire continuously. */
-    if (limit == 0) {
-        limit = chan_is_32bit(c) ? 0x100000000ULL : 0x10000;
     }
 
     ptimer_transaction_begin(c->ptimer);
@@ -654,7 +732,7 @@ static uint64_t ipod_classic_timer_read(void *opaque, hwaddr offset,
         if (c->index == S5L8702_TIMER_E) {
             return timer_e_count(c);
         }
-        return c->data0 - ptimer_get_count(c->ptimer);
+        return chan_limit(c) - ptimer_get_count(c->ptimer);
     default:
         qemu_log_mask(LOG_GUEST_ERROR, "%s: bad register 0x%" HWADDR_PRIx
                       " of timer %c\n", __func__, reg, 'A' + ch);
@@ -737,6 +815,7 @@ static void ipod_classic_timer_write(void *opaque, hwaddr offset,
         if (new_cfg != old_cfg) {
             chan_reload(c);
         }
+        chan_piezo_update(c);
         ipod_classic_timer_update_irq(s);
         /* The ack is what lets the next owed tick through. */
         if (c->host_tick_enabled) {
@@ -763,17 +842,29 @@ static void ipod_classic_timer_write(void *opaque, hwaddr offset,
             ptimer_stop(c->ptimer);
         }
         ptimer_transaction_commit(c->ptimer);
+        chan_piezo_update(c);
         break;
     case S5L8702_TIMER_DATA0:
         c->data0 = value;
         chan_reload(c);
+        chan_piezo_update(c);
         break;
     case S5L8702_TIMER_DATA1:
         c->data1 = value;
+        /*
+         * The period in PWM mode, so it reloads there as DATA0 does in
+         * interval mode.  Rockbox writes it after its last CLR, just before
+         * EN.
+         */
+        if (chan_mode(c) == S5L8702_TIMER_MODE_PWM) {
+            chan_reload(c);
+            chan_piezo_update(c);
+        }
         break;
     case S5L8702_TIMER_PRE:
         c->pre = value;
         chan_reload(c);
+        chan_piezo_update(c);
         break;
     case S5L8702_TIMER_CNT:
         qemu_log_mask(LOG_GUEST_ERROR, "%s: CNT of timer %c is read-only\n",
@@ -822,6 +913,7 @@ static void ipod_classic_timer_reset(DeviceState *dev)
         ptimer_stop(c->ptimer);
         ptimer_transaction_commit(c->ptimer);
     }
+    chan_piezo_update(&s->chan[S5L8702_TIMER_A]);
     ipod_classic_timer_update_irq(s);
 }
 
@@ -882,6 +974,7 @@ static int ipod_classic_timer_post_load(void *opaque, int version_id)
             timer_mod_ns(c->host_tick, c->host_tick_next_ns);
         }
     }
+    chan_piezo_update(&s->chan[S5L8702_TIMER_A]);
     ipod_classic_timer_note_input(s);
     return 0;
 }
