@@ -41,36 +41,78 @@ static bool cs42_trace_on(void)
     return cs42trace == 1;
 }
 
-/* The volume registers are two's complement, of 7 bits or of 8. */
-static double cs42l55_db(uint8_t raw, int bits, double step)
+/*
+ * The three volumes, as the register tables in the datasheet (DS773F1, 6.15,
+ * 6.20 and 6.21) give them.  None is plain two's complement: each counts down
+ * from its top code, 0x18, through 0 and round to its bottom, so a code above
+ * the top is not a gain but the far end of the attenuation, or a clamp.
+ */
+
+/*
+ * Headphone amp: 1 dB steps, +12 dB from 0x0c to 0x3f, -60 dB from 0x40 to
+ * 0x44.  The datasheet says the bottom is about -58 dB in fact and the steps
+ * may stray from 1 dB (its figure 26); this keeps to the table.
+ */
+static double cs42l55_hp_db(uint8_t raw)
 {
-    return sextract32(raw, 0, bits) * step;
+    int v = sextract32(raw, 0, 7);
+
+    return MAX(-60, MIN(12, v));
 }
 
-static uint32_t cs42l55_channel_gain(IPodClassicCS42L55State *s, int channel)
+/* PCM mixer: 0.5 dB steps, +12 dB at 0x18, -0.5 dB at 0x7f, -51.5 dB at 0x19. */
+static double cs42l55_pmix_db(uint8_t raw)
 {
-    uint8_t power = s->reg[CS42L55_REG_PWRCTL1];
-    uint8_t amp = s->reg[CS42L55_REG_PWRCTL2];
-    uint8_t play = s->reg[CS42L55_REG_PLAYCTL];
-    uint8_t hp = s->reg[CS42L55_REG_HPACTL + channel];
-    uint8_t pmix = s->reg[CS42L55_REG_PMIXACTL + channel];
+    int v = raw & CS42L55_VOL_MASK;
+
+    return (v <= 0x18 ? v : v - 0x80) * 0.5;
+}
+
+/* Master: 0.5 dB steps, +12 dB at 0x18, -0.5 at 0xff, -102 from 0x34 to 0x19. */
+static double cs42l55_master_db(uint8_t raw)
+{
+    return MAX(-102.0, (raw <= 0x18 ? raw : raw - 0x100) * 0.5);
+}
+
+/*
+ * The gain from the serial input to the headphone amp, for one channel.  The
+ * PCM mixer is in the DSP engine and powering that down (PDN_DSP) takes it out
+ * of the path, its mute with it; the master volume and its mute come after the
+ * engine, ahead of the DAC, and apply either way (6.13.1, and 4.6: the master
+ * volume sets the beep's level too).  PLYBCKB=A gangs channel B's volumes to
+ * channel A's registers but leaves B's mutes its own (6.13.3).
+ */
+static double cs42l55_channel_db(const uint8_t *reg, int channel)
+{
+    uint8_t play = reg[CS42L55_REG_PLAYCTL];
     uint8_t amp_off = channel ? CS42L55_PWRCTL2_PDN_HPB
                               : CS42L55_PWRCTL2_PDN_HPA;
     uint8_t mute = channel ? CS42L55_PLAYCTL_MSTBMUTE
                            : CS42L55_PLAYCTL_MSTAMUTE;
+    int vol = (play & CS42L55_PLAYCTL_PLYBCKB_A) ? 0 : channel;
+    uint8_t hp = reg[CS42L55_REG_HPACTL + channel];
+    uint8_t pmix = reg[CS42L55_REG_PMIXACTL + channel];
+    bool dsp = !(play & CS42L55_PLAYCTL_PDN_DSP);
     double db;
 
-    if ((power & CS42L55_PWRCTL1_PDN_CODEC) || (amp & amp_off) == amp_off ||
-        (play & mute) || (hp & CS42L55_VOL_MUTE) ||
-        (pmix & CS42L55_VOL_MUTE)) {
-        return 0;
+    if ((reg[CS42L55_REG_PWRCTL1] & CS42L55_PWRCTL1_PDN_CODEC) ||
+        (reg[CS42L55_REG_PWRCTL2] & amp_off) == amp_off || (play & mute) ||
+        (hp & CS42L55_VOL_MUTE) || (dsp && (pmix & CS42L55_VOL_MUTE))) {
+        return -INFINITY;
     }
-    db = cs42l55_db(hp, 7, 1.0) + cs42l55_db(pmix, 7, 0.5);
-    /* The master volume is in the signal processing engine. */
-    if (!(play & CS42L55_PLAYCTL_PDN_DSP)) {
-        db += cs42l55_db(s->reg[CS42L55_REG_MSTAVOL + channel], 8, 0.5);
+    db = cs42l55_hp_db(reg[CS42L55_REG_HPACTL + vol]) +
+         cs42l55_master_db(reg[CS42L55_REG_MSTAVOL + vol]);
+    if (dsp) {
+        db += cs42l55_pmix_db(reg[CS42L55_REG_PMIXACTL + vol]);
     }
-    return lrint(pow(10.0, db / 20.0) * IPOD_AUDIO_OUT_UNITY);
+    return db;
+}
+
+static uint32_t cs42l55_channel_gain(IPodClassicCS42L55State *s, int channel)
+{
+    double db = cs42l55_channel_db(s->reg, channel);
+
+    return isinf(db) ? 0 : lrint(pow(10.0, db / 20.0) * IPOD_AUDIO_OUT_UNITY);
 }
 
 static void cs42l55_publish_gain(IPodClassicCS42L55State *s)

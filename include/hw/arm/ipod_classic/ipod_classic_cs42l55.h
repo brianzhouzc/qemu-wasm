@@ -42,6 +42,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicCS42L55State, IPOD_CLASSIC_CS42L55)
 #define CS42L55_REG_PLAYCTL        0x0f
 #define CS42L55_PLAYCTL_MSTAMUTE   0x01
 #define CS42L55_PLAYCTL_MSTBMUTE   0x02
+#define CS42L55_PLAYCTL_PLYBCKB_A  0x10   /* B's volumes follow A's registers */
 #define CS42L55_PLAYCTL_PDN_DSP    0x80
 #define CS42L55_REG_PMIXACTL       0x12   /* PCM mixer, 0.5 dB steps */
 #define CS42L55_REG_PMIXBCTL       0x13
