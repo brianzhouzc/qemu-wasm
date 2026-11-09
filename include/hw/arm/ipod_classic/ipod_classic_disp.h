@@ -363,6 +363,12 @@ struct IPodClassicDispState {
  * true if anything was drawn. Called by the LCD device, because on this SoC the
  * panel's image memory is what the user finally sees -- see ipod_classic_lcd.c.
  */
+/*
+ * The latency trace (ipod_classic_lat.h): a frame was composed, so the next
+ * register write is the first of a new one.
+ */
+void ipod_classic_disp_lat_frame(void);
+
 bool ipod_classic_disp_compose(IPodClassicDispState *s, uint16_t *fb,
                                unsigned width, unsigned height);
 

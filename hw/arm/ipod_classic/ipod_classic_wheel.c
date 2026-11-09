@@ -35,9 +35,11 @@
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "ui/console.h"
+#include "hw/core/cpu.h"
 #include "hw/arm/ipod_classic/ipod_classic_wheel.h"
 /* ipod_classic_wake_vcpu() / ipod_classic_input_wake(): see the machine header. */
 #include "hw/arm/ipod_classic/ipod_classic.h"
+#include "hw/arm/ipod_classic/ipod_classic_lat.h"
 
 /*
  * INSTRUMENTATION ONLY -- nothing below changes what the model does. Same
@@ -123,6 +125,7 @@ static void wheel_update_irq(IPodClassicWheelState *s)
     }
     if (level && !s->irq_level) {
         wheel_irq_raises++;
+        ipod_lat_mark(IPOD_LAT_IRQ, 0);
 #ifdef EMSCRIPTEN
         ipod_classic_wake_vcpu();
 #endif
@@ -145,6 +148,7 @@ static void wheel_fifo_push(IPodClassicWheelState *s, uint32_t word)
     s->fifo[(s->fifo_head + s->fifo_len) % S5L8702_WHEEL_FIFO_LEN] = word;
     s->fifo_len++;
     wheel_packets++;
+    ipod_lat_mark(IPOD_LAT_PUSH, word);
     if (wheel_packets == 1 && wheel_trace_on()) {
         fprintf(stderr, "WHEELTRACE first packet queued: 0x%08x\n", word);
     }
@@ -161,6 +165,7 @@ static uint32_t wheel_fifo_pop(IPodClassicWheelState *s)
     word = s->fifo[s->fifo_head];
     s->fifo_head = (s->fifo_head + 1) % S5L8702_WHEEL_FIFO_LEN;
     s->fifo_len--;
+    ipod_lat_mark(IPOD_LAT_POP, word);
 #ifdef EMSCRIPTEN
     if (s->wasm_release_timer &&
         timer_pending(s->wasm_release_timer) &&
@@ -170,6 +175,9 @@ static uint32_t wheel_fifo_pop(IPodClassicWheelState *s)
          * polls and is cleared again by the release (Q12).
          */
         s->wasm_consumed = qatomic_read(&s->wasm_consumed) + 1;
+        if (!s->wasm_read_at) {
+            s->wasm_read_at = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        }
     }
 #endif
     wheel_update_irq(s);
@@ -275,7 +283,8 @@ static void wheel_run_command(IPodClassicWheelState *s)
 static void wheel_key_event(void *opaque, int keycode);
 
 /*
- * The next tick is a tick of guest time or of host time, whichever comes first.
+ * The next tick is a tick of guest time (40 ms) or of host time
+ * (S5L8702_WHEEL_TICK_RT_MS, 10 ms), whichever comes first.
  *
  * Guest time alone is what makes scrolling fast: an idle guest warps straight to
  * the tick, and a detent takes 5 ms.  But on a busy guest that clock crawls, and
@@ -294,17 +303,25 @@ static void wheel_kick(IPodClassicWheelState *s)
     timer_mod(s->tick, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->tick_ns);
     if (!timer_pending(s->tick_rt)) {
         timer_mod(s->tick_rt,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT) + s->tick_ns);
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT) + s->tick_rt_ns);
     }
 }
 
 #ifdef EMSCRIPTEN
-/* Whether the guest has had enough of the press in flight to let it go. */
-static bool wasm_press_taken(IPodClassicWheelState *s)
+/*
+ * Whether the guest has had enough of the press in flight to let it go: a
+ * detent once it is paid out, a button once the guest has read four packets
+ * of it and the hold has passed since it read the first.
+ */
+static bool wasm_press_taken(IPodClassicWheelState *s, int64_t now)
 {
     uint32_t seen = qatomic_read(&s->wasm_consumed) - s->wasm_consumed0;
 
-    return seen >= (s->wasm_press_mask ? S5L8702_WHEEL_PRESS_PACKETS : 1);
+    if (!s->wasm_press_mask) {
+        return seen >= 1;
+    }
+    return seen >= S5L8702_WHEEL_PRESS_PACKETS && s->wasm_read_at &&
+           now >= s->wasm_read_at + s->wasm_hold_ns;
 }
 
 /*
@@ -328,12 +345,13 @@ static void wasm_release_timer_cb(void *opaque)
     IPodClassicWheelState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 
-    if (!wasm_press_taken(s) && now < s->wasm_release_cap) {
+    if (!wasm_press_taken(s, now) && now < s->wasm_release_cap) {
         timer_mod_ns(s->wasm_release_timer,
                      now + S5L8702_WHEEL_RELEASE_POLL_MS * 1000000LL);
         return;
     }
     s->wasm_press_mask = 0;
+    ipod_lat_mark(IPOD_LAT_RELEASE, s->wasm_keycode);
     wheel_key_event(s, s->wasm_keycode | 0x80);
 }
 #endif
@@ -345,6 +363,12 @@ static void wheel_tick(void *opaque)
     bool busy;
 
     s->tick_rt_last = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT);
+    if (ipod_lat_on()) {
+        ipod_lat_mark2(IPOD_LAT_TICK, s->tick_from_rt,
+                       current_cpu ?
+                       CPU_GET_CLASS(current_cpu)->get_pc(current_cpu) : 0);
+    }
+    s->tick_from_rt = false;
 
     /*
      * If the guest has not drained what it already has, do not add to it.
@@ -424,7 +448,7 @@ static void wheel_tick(void *opaque)
 static void wheel_tick_rt(void *opaque)
 {
     IPodClassicWheelState *s = opaque;
-    int64_t due = s->tick_rt_last + s->tick_ns;
+    int64_t due = s->tick_rt_last + s->tick_rt_ns;
 
     if (!timer_pending(s->tick)) {
         return;
@@ -434,6 +458,7 @@ static void wheel_tick_rt(void *opaque)
         return;
     }
     timer_del(s->tick);
+    s->tick_from_rt = true;
     wheel_tick(s);
 }
 
@@ -573,6 +598,16 @@ static void wheel_key_event(void *opaque, int keycode)
      */
     s->button_repeat_until = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
                            + s->button_repeat_ns;
+    /*
+     * An edge on a quiet wheel goes out now, as the arm of a gesture does:
+     * the last packet was a tick or more ago, so the guest has had its
+     * interrupt and its task since (constraint 2), and waiting for the tick
+     * cost a press up to the tick's backstop on a busy guest.  A wheel that
+     * is still sending waits for its tick, as before.
+     */
+    if (!timer_pending(s->tick) && s->fifo_len < S5L8702_WHEEL_FIFO_LEN / 2) {
+        wheel_send_event(s);
+    }
     wheel_kick(s);
 }
 
@@ -797,12 +832,13 @@ static void wasm_key_do_press(IPodClassicWheelState *s, int keycode,
         timer_del(s->wasm_release_timer);
         wheel_key_event(s, s->wasm_keycode | 0x80);
     }
+    s->wasm_read_at = 0;
     wheel_key_event(s, keycode);
     s->wasm_keycode = keycode;
     s->wasm_press_mask = s->buttons;
     s->wasm_consumed0 = qatomic_read(&s->wasm_consumed);
-    hold_end = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
-               (int64_t)MAX(hold_ms, 0) * 1000000;
+    s->wasm_hold_ns = (int64_t)MAX(hold_ms, 0) * 1000000;
+    hold_end = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + s->wasm_hold_ns;
     s->wasm_release_cap = hold_end + S5L8702_WHEEL_RELEASE_CAP_MS * 1000000LL;
     timer_mod_ns(s->wasm_release_timer, hold_end);
 }
@@ -840,6 +876,7 @@ static void wasm_key_bh_fn(void *opaque)
             continue;
         }
         if (op == 1) {
+            ipod_lat_mark2(IPOD_LAT_KEY, arg, hold);
             wasm_key_do_press(s, arg, hold);
         }
         tail++;
@@ -936,6 +973,9 @@ static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
                                 S5L8702_WHEEL_KEY_STEP, 1, 35);
     s->tick_ns = 1000000LL * wheel_env_int("IPOD_WHEEL_TICK_MS",
                                            S5L8702_WHEEL_TICK_MS, 1, 1000);
+    s->tick_rt_ns = 1000000LL * wheel_env_int("IPOD_WHEEL_TICK_RT_MS",
+                                              S5L8702_WHEEL_TICK_RT_MS,
+                                              1, 1000);
     s->untouch_ns = 1000000LL * wheel_env_int("IPOD_WHEEL_UNTOUCH_MS",
                                               S5L8702_WHEEL_UNTOUCH_MS,
                                               10, 60000);

@@ -243,6 +243,20 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicWheelState, IPOD_CLASSIC_WHEEL)
 #define S5L8702_WHEEL_UNTOUCH_MS    1500
 
 /*
+ * The tick's host-time backstop (wheel_kick()): a tick comes after this much
+ * host time if the guest's 40 ms have not passed by then.  It was the tick's
+ * own 40 ms, which on a guest too busy to warp was 40 ms of host time between
+ * a press and its packet: Rockbox redraws its unchanged menu about fifteen
+ * times a second, 7 to 22 ms of pixels through the port each time, and a
+ * detent that landed in one waited for it to end, 24 ms where an idle guest
+ * took 2 (iPodWasm's perf/input-latency.js).  10 ms of host time is a
+ * million instructions of a guest that busy, 16 ms of its own time: still
+ * far more than its interrupt and its wheel task need between two packets
+ * (constraint 2).  Tunable with IPOD_WHEEL_TICK_RT_MS.
+ */
+#define S5L8702_WHEEL_TICK_RT_MS    10
+
+/*
  * BUTTONS ARE REPEATED, and this is the same constraint 2 as above, applied to
  * the half of the wheel that used to be exempt from it.
  *
@@ -292,9 +306,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicWheelState, IPOD_CLASSIC_WHEEL)
  * How much of a browser press the guest must read before it can end. Four
  * packets is what the 150 ms press behind the table above lands, per the note
  * under it: the retailOS needs its wheel task to run with the bit set, and one
- * packet does not promise that. The cap is host time past the end of the hold,
- * long enough to outlast the two seconds the page waits for an ack, and the poll
- * is how often the release looks; see wasm_release_timer_cb().
+ * packet does not promise that. The hold itself is counted from the guest's
+ * first read of the press, not from the key: Rockbox reads its buttons once a
+ * tick of host time, so a press must be down that long where it can see it,
+ * and a press that waited for a busy guest was not.  The cap is host time past
+ * the end of the hold, long enough to outlast the two seconds the page waits
+ * for an ack, and the poll is how often the release looks; see
+ * wasm_release_timer_cb().
  */
 #define S5L8702_WHEEL_PRESS_PACKETS     4
 #define S5L8702_WHEEL_RELEASE_CAP_MS    3000
@@ -322,6 +340,8 @@ struct IPodClassicWheelState {
     uint32_t wasm_consumed;      /* presses the guest has consumed */
     uint32_t wasm_consumed0;     /* counter value when the press started */
     int64_t wasm_release_cap;    /* host ns: release now, taken or not */
+    int64_t wasm_hold_ns;        /* how long the press is held, host ns */
+    int64_t wasm_read_at;        /* host ns the guest first read it, or 0 */
     QEMUTimer *wasm_release_timer;
     /* Mailbox: the page queues a key, the main loop's BH performs it (Q11). */
     QEMUBH *wasm_key_bh;
@@ -392,8 +412,10 @@ struct IPodClassicWheelState {
     QEMUTimer *tick;
     QEMUTimer *tick_rt;     /* the host-time backstop: see wheel_kick() */
     int64_t tick_rt_last;   /* when the last tick ran, on that timer's clock */
+    bool tick_from_rt;      /* the latency trace: host time made this tick */
     uint32_t key_step;
     int64_t tick_ns;
+    int64_t tick_rt_ns;     /* the backstop's period: S5L8702_WHEEL_TICK_RT_MS */
     int64_t untouch_ns;
     int64_t button_repeat_ns;
     bool irq_level;

@@ -69,6 +69,7 @@
 #include "qemu/timer.h"
 #include "hw/arm/ipod_classic/ipod_classic_piezo.h"
 #include "hw/arm/ipod_classic/ipod_classic_audio_out.h"
+#include "hw/arm/ipod_classic/ipod_classic_lat.h"
 
 #if defined(EMSCRIPTEN)
 #include <emscripten.h>
@@ -141,6 +142,7 @@ static void piezo_publish(uint32_t period, uint32_t duration, uint32_t gap)
     qatomic_set(&r[5], drive_kind);
     qatomic_store_release(&r[3], n);
     qatomic_store_release(&out.head, n);
+    ipod_lat_mark2(IPOD_LAT_PIEZO_OFF, n, drive_frame);
 #if defined(EMSCRIPTEN)
     emscripten_futex_wake(&out.head, INT_MAX);
 #endif
@@ -180,6 +182,7 @@ static void piezo_update(void)
         drive_start = now;
         drive_gap = ended_once ? saturate32(now - last_end) : UINT32_MAX;
         drive_kind = ipod_classic_audio_out_next(&drive_frame);
+        ipod_lat_mark2(IPOD_LAT_PIEZO_ON, saturate32(want), drive_frame);
     }
     qatomic_set(&out.driving, driving ? saturate32(drive_period) : 0);
 }

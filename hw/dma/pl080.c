@@ -17,6 +17,8 @@
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "qapi/error.h"
+#include "exec/memory.h"
+#include "qemu/rcu.h"
 
 #define PL080_CONF_E    0x1
 #define PL080_CONF_M1   0x2
@@ -151,6 +153,50 @@ static void pl080_ch_load_lli(PL080State *s, pl080_channel *ch, uint32_t lli)
                                     MEMTXATTRS_UNSPECIFIED, NULL);
     ch->lli  = address_space_ldl_le(&s->downstream_as, lli + 8,
                                     MEMTXATTRS_UNSPECIFIED, NULL);
+}
+
+/*
+ * A block from memory to one peripheral register, the shape of Rockbox's
+ * frames to the LCD's data port: 76,800 elements a frame, about fifteen
+ * frames a second while its menu shows.  One element at a time through
+ * address_space_read() and address_space_write() was about 80 ns each, 6 ms
+ * a frame with the BQL held and the guest's clock stopped, which held up the
+ * wheel's packets, the piezo's end and the frame itself behind it (iPodWasm's
+ * perf/input-latency.js).  This reads the source in one go and writes the
+ * register through its region, found once: the device sees the same writes,
+ * of the same width, in the same order.  It declines (0) where the
+ * destination is memory or will not take the width in one access, and the
+ * element-at-a-time path below does it as before.
+ */
+static int pl080_burst_to_register(PL080State *s, pl080_channel *ch, int size,
+                                   int width)
+{
+    uint8_t block[4096];
+    int n = MIN(size, (int)(sizeof(block) / width));
+    hwaddr xlat, len = width;
+    MemoryRegion *mr;
+    int i;
+
+    RCU_READ_LOCK_GUARD();
+    mr = address_space_translate(&s->downstream_as, ch->dest, &xlat, &len,
+                                 true, MEMTXATTRS_UNSPECIFIED);
+    if (len < width || memory_access_is_direct(mr, true) || !mr->ops ||
+        (mr->ops->valid.max_access_size &&
+         mr->ops->valid.max_access_size < width) ||
+        (mr->ops->valid.min_access_size &&
+         mr->ops->valid.min_access_size > width)) {
+        return 0;
+    }
+    address_space_read(&s->downstream_as, ch->src, MEMTXATTRS_UNSPECIFIED,
+                       block, n * width);
+    ch->src += n * width;
+    for (i = 0; i < n; i++) {
+        memory_region_dispatch_write(mr, xlat, ldn_he_p(block + i * width,
+                                                        width),
+                                     size_memop(width),
+                                     MEMTXATTRS_UNSPECIFIED);
+    }
+    return n;
 }
 
 static void pl080_run(PL080State *s)
@@ -311,7 +357,14 @@ again:
                                    moved * swidth);
                 ch->src += moved * swidth;
                 s->paced_sink(s->paced_opaque, block, moved * swidth);
+            } else if (!paced && swidth == dwidth
+                       && (ch->ctrl & PL080_CCTRL_SI)
+                       && !(ch->ctrl & PL080_CCTRL_DI)
+                       && (moved = pl080_burst_to_register(s, ch, size,
+                                                           dwidth)) > 0) {
+                /* Moved as a block: see pl080_burst_to_register(). */
             } else {
+                moved = 1;
                 for (n = 0; n < dwidth; n+= swidth) {
                     address_space_read(&s->downstream_as, ch->src,
                                        MEMTXATTRS_UNSPECIFIED, buff + n, swidth);
