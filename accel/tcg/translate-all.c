@@ -595,6 +595,72 @@ void tb_check_watchpoint(CPUState *cpu, uintptr_t retaddr)
 
 #ifndef CONFIG_USER_ONLY
 /*
+ * The I/O hint.  Under -icount only the last instruction of a block may
+ * reach a device (can_do_io).  An access from anywhere else goes through
+ * cpu_io_recompile() below: rewind to the instruction, leave the block by
+ * longjmp, run that instruction as a block of its own.  The block itself
+ * stays as it was, so a loop that reads a register from the middle of a
+ * block pays all of that on every pass.  In the wasm build a longjmp is a
+ * thrown JS exception: stock 2.0.5 spent 22% of the emulator thread there
+ * while going through its menus, and 11% of a boot.
+ *
+ * So the pc of such an instruction is remembered, its block is dropped,
+ * and translator_loop() gives the instruction a block of its own from then
+ * on: the block that cpu_io_recompile() made it for one pass, without the
+ * rewind or the longjmp, and with the boundaries where they were.  The hint
+ * is the guest pc alone: at a pc that reaches RAM the next time it costs
+ * two more block boundaries and nothing else.  A full table takes no more
+ * hints and leaves those blocks as they are.  One vCPU translates at a time
+ * (the round-robin thread); the relaxed accesses only keep a racing reader
+ * from tearing.
+ */
+#define TB_IO_HINT_BITS 11
+#define TB_IO_HINT_MAX ((1 << TB_IO_HINT_BITS) * 3 / 4)
+
+/* pc | 1 per used slot (pcs are at least 2-aligned), 0 when empty. */
+static vaddr tb_io_hint[1 << TB_IO_HINT_BITS];
+static unsigned tb_io_hint_count;
+
+static unsigned tb_io_hint_slot(vaddr pc)
+{
+    return (uint32_t)((pc >> 1) * 0x9e3779b1u) >> (32 - TB_IO_HINT_BITS);
+}
+
+bool tb_io_hint_test(vaddr pc)
+{
+    vaddr key = pc | 1, cur;
+    unsigned i = tb_io_hint_slot(pc);
+
+    while ((cur = qatomic_read(&tb_io_hint[i])) != 0) {
+        if (cur == key) {
+            return true;
+        }
+        i = (i + 1) & ((1 << TB_IO_HINT_BITS) - 1);
+    }
+    return false;
+}
+
+/* Remember @pc; false if the table is full and @pc is not in it. */
+static bool tb_io_hint_add(vaddr pc)
+{
+    vaddr key = pc | 1, cur;
+    unsigned i = tb_io_hint_slot(pc);
+
+    while ((cur = qatomic_read(&tb_io_hint[i])) != 0) {
+        if (cur == key) {
+            return true;
+        }
+        i = (i + 1) & ((1 << TB_IO_HINT_BITS) - 1);
+    }
+    if (tb_io_hint_count >= TB_IO_HINT_MAX) {
+        return false;
+    }
+    tb_io_hint_count++;
+    qatomic_set(&tb_io_hint[i], key);
+    return true;
+}
+
+/*
  * In deterministic execution mode, instructions doing device I/Os
  * must be at the end of the TB.
  *
@@ -624,6 +690,16 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
         cc->tcg_ops->io_recompile_replay_branch(cpu, tb)) {
         cpu->neg.icount_decr.u16.low++;
         n = 2;
+    }
+
+    /*
+     * The I/O hint (above): later blocks leave this instruction to a block
+     * of its own, and this one goes, so the next pass translates it again
+     * with the hint.  A replayed branch (n == 2) belongs with its delay slot
+     * and gets none.
+     */
+    if (n == 1 && tb_io_hint_add(cc->get_pc(cpu))) {
+        tb_phys_invalidate(tb, -1);
     }
 
     /*
