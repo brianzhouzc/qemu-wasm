@@ -32,9 +32,10 @@
  * WHAT THIS PUBLISHES is one record per drive, a stretch of time with the
  * pins routed and TOUT toggling at one period, once it is over: its period,
  * how long it lasted and how long the piezo was quiet before it, all in
- * QEMU_CLOCK_VIRTUAL, which is the firmware's clock.  The page plays a click
- * for a short drive and a tone of that period for a long one (iPodWasm's
- * src/effects.js).  Not the waveform, and not as it happens:
+ * QEMU_CLOCK_VIRTUAL, which is the firmware's clock, and the frame of the
+ * audio output it goes with.  The page makes the drive's sound from its
+ * edges (iPodWasm's src/effects.js).  Not the waveform, and not as it
+ * happens:
  *
  *   - Under -icount sleep=off virtual time is not host time.  A click's
  *     2 ms gate, waited for by an idle guest, passes in microseconds; a
@@ -44,6 +45,11 @@
  *     few virtual milliseconds after it starts: the delay is that.
  *   - The gap lets the page keep a sequence of tones that arrived together
  *     (the guest warped through them) apart as the firmware timed them.
+ *   - The frame is where the drive goes in the audio output's ring
+ *     (ipod_classic_audio_out_next(), taken as it starts): the page plays the
+ *     ring a queue behind, and plays the piezo when it plays that frame.  On
+ *     2.0.5 that is where the clicker's other click, in the headphones,
+ *     begins, and the two come out of the page's speakers as one.
  *
  * The record's layout is a contract with iPodWasm's src/page.html (32-bit
  * words; see `out` below).  One writer, any number of readers; a reader that
@@ -62,6 +68,7 @@
 #include "qemu/atomic.h"
 #include "qemu/timer.h"
 #include "hw/arm/ipod_classic/ipod_classic_piezo.h"
+#include "hw/arm/ipod_classic/ipod_classic_audio_out.h"
 
 #if defined(EMSCRIPTEN)
 #include <emscripten.h>
@@ -80,8 +87,11 @@ static struct {
      *   [1] how long it lasted, ns, saturating
      *   [2] how long the piezo was quiet before it, ns, saturating
      *       (0xffffffff: no drive before it since the machine started)
-     *   [3] n, written with the rest, so a reader can tell a record that
-     *       was overwritten while it read it
+     *   [3] n, written last, so a reader that reads it last can tell a
+     *       record that was overwritten while it read it
+     *   [4] the audio ring's frame count it goes with, wrapping
+     *   [5] how [4] was found: IPodAudioOutAhead, 0 when the I2S was not
+     *       sending and [4] means nothing
      */
     uint32_t ring[IPOD_PIEZO_RING][IPOD_PIEZO_WORDS];
 } out = {
@@ -95,6 +105,8 @@ static bool driving;
 static uint64_t drive_period;
 static int64_t drive_start;
 static uint32_t drive_gap;
+static uint32_t drive_frame;
+static uint32_t drive_kind;
 static bool ended_once;
 static int64_t last_end;
 
@@ -125,16 +137,20 @@ static void piezo_publish(uint32_t period, uint32_t duration, uint32_t gap)
     qatomic_set(&r[0], period);
     qatomic_set(&r[1], duration);
     qatomic_set(&r[2], gap);
-    qatomic_set(&r[3], n);
+    qatomic_set(&r[4], drive_frame);
+    qatomic_set(&r[5], drive_kind);
+    qatomic_store_release(&r[3], n);
     qatomic_store_release(&out.head, n);
 #if defined(EMSCRIPTEN)
     emscripten_futex_wake(&out.head, INT_MAX);
 #endif
     if (piezo_trace_on()) {
         fprintf(stderr, "PIEZOTRACE: drive %u: %.1f Hz for %.3f ms, "
-                "%.3f ms after the last\n", n,
+                "%.3f ms after the last, audio frame %u (%s)\n", n,
                 period ? 1e9 / period : 0.0, duration / 1e6,
-                gap == UINT32_MAX ? -1.0 : gap / 1e6);
+                gap == UINT32_MAX ? -1.0 : gap / 1e6, drive_frame,
+                drive_kind == IPOD_AUDIO_OUT_QUEUED ? "after the queue"
+                : drive_kind == IPOD_AUDIO_OUT_CLOCK ? "the clock" : "idle");
     }
 }
 
@@ -163,6 +179,7 @@ static void piezo_update(void)
         drive_period = want;
         drive_start = now;
         drive_gap = ended_once ? saturate32(now - last_end) : UINT32_MAX;
+        drive_kind = ipod_classic_audio_out_next(&drive_frame);
     }
     qatomic_set(&out.driving, driving ? saturate32(drive_period) : 0);
 }

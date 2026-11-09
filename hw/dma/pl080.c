@@ -437,6 +437,75 @@ uint32_t pl080_pace_request(PL080State *s, int line, uint32_t bytes)
     return bytes - left;
 }
 
+/*
+ * Descriptors pl080_line_queued_bytes() follows: a longer chain, or one that
+ * comes back to a descriptor other than the first, is a guest's garbage.
+ */
+#define PL080_QUEUE_LINKS 16
+
+static int pl080_line_of(pl080_channel *ch)
+{
+    int flow = (ch->conf >> 11) & 7;
+
+    return flow == 1 ? (ch->conf >> 6) & 0x1f
+         : flow == 2 ? (ch->conf >> 1) & 0x1f : -1;
+}
+
+static uint64_t pl080_ctrl_bytes(uint32_t ctrl)
+{
+    return (uint64_t)(ctrl & 0xfff) << ((ctrl >> 18) & 7);
+}
+
+bool pl080_line_queued_bytes(PL080State *s, int line, uint32_t *bytes)
+{
+    int c;
+
+    for (c = 0; c < s->nchannels; c++) {
+        pl080_channel *ch = &s->chan[c];
+        uint32_t seen[PL080_QUEUE_LINKS];
+        uint64_t total;
+        uint32_t lli;
+        int n = 0;
+        int i;
+
+        if (!(ch->conf & PL080_CCONF_E) || pl080_line_of(ch) != line) {
+            continue;
+        }
+        /* A completed-pending channel's count is 0, and its link is next. */
+        total = pl080_ctrl_bytes(ch->ctrl);
+        for (lli = ch->lli; lli; ) {
+            /*
+             * Back at the first: a ring of buffers, the one running now among
+             * them, and what the guest writes next comes out a whole lap of
+             * the ring after that one ends.  MEASURED on 2.0.5, whose audio
+             * is a ring of two 1,024-frame buffers: its clicker's click starts
+             * there on every detent (12 of 12, to the frame), a buffer later
+             * than the next one to come free, so it mixes a buffer ahead.
+             */
+            if (n > 0 && lli == seen[0]) {
+                break;
+            }
+            if (n == PL080_QUEUE_LINKS) {
+                return false;
+            }
+            for (i = 1; i < n; i++) {
+                if (seen[i] == lli) {
+                    return false;
+                }
+            }
+            seen[n++] = lli;
+            total += pl080_ctrl_bytes(
+                address_space_ldl_le(&s->downstream_as, lli + 12,
+                                     MEMTXATTRS_UNSPECIFIED, NULL));
+            lli = address_space_ldl_le(&s->downstream_as, lli + 8,
+                                       MEMTXATTRS_UNSPECIFIED, NULL);
+        }
+        *bytes = MIN(total, UINT32_MAX);
+        return true;
+    }
+    return false;
+}
+
 static uint64_t pl080_read_inner(void *opaque, hwaddr offset,
                            unsigned size)
 {
