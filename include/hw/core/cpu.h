@@ -280,6 +280,8 @@ typedef struct CPUTLBDesc {
     /* maximum number of entries observed in the window */
     size_t window_max_entries;
     size_t n_used_entries;
+    /* entries filled since the last flush: see tlb_mmu_grow_locked() */
+    size_t n_fills;
     /* The next index to use in the tlb victim table.  */
     size_t vindex;
     /* The tlb victim table, in two parts.  */
