@@ -279,6 +279,25 @@ static const uint8_t tcg_target_reg_index[TCG_TARGET_NB_REGS] = {
 #define TMP64_3_IDX 6
 #define TMP64_4_IDX 7
 
+/*
+ * TCG's registers R0-R13 are i64 locals of the block's function, from
+ * WASM_REG_LOCAL on; R14 (env), R15 (the call stack) and the block pointer
+ * are globals.  They were all globals once, and a global is a load or a
+ * store through the instance on every use, where V8 keeps a local in a
+ * machine register: a block body ran 1.4-2.1x slower on globals in a
+ * micro-benchmark of the shape this backend emits (iPodWasm's PERF_LOG).
+ *
+ * A global outlives the call, and that mattered in one place: a helper
+ * that unwinds (a fiber switch, Asyncify) leaves the function, and the
+ * rewind enters it again to resume after the call.  So the unwinding exit
+ * (tcg_wasm_out_unwind_exit()) leaves by the block around the loop, where
+ * tcg_gen_code() stores the locals to globals 0-13, and an entry without
+ * do_init (only a rewind) loads them back (mod_header_d).
+ */
+#define WASM_REG_LOCAL 8
+#define WASM_REG_LOCALS 14
+#define WASM_REG_RESTORE(r) 0x23, (r), 0x21, WASM_REG_LOCAL + (r)
+
 __thread bool env_cached = false;
 
 // function index
@@ -354,6 +373,17 @@ static void tcg_wasm_out_op_br(TCGContext *s, int i)
 {
     tcg_wasm_out8(s, 0x0c);
     tcg_wasm_out8(s, i);
+}
+
+/*
+ * Leave the function because the helper just called is unwinding: by the
+ * block around the loop, whose end keeps the register locals for the
+ * rewind (WASM_REG_LOCAL).  @ifs is how many ifs the exit sits in inside
+ * its block's own if: the loop is one further out, the block one more.
+ */
+static void tcg_wasm_out_unwind_exit(TCGContext *s, int ifs)
+{
+    tcg_wasm_out_op_br(s, ifs + 2);
 }
 
 static void tcg_wasm_out_op_if_noret(TCGContext *s)
@@ -468,6 +498,29 @@ static void tcg_wasm_out_op_global_set(TCGContext *s, uint8_t i)
     tcg_wasm_out_op_var(s, 0x24, i);
 }
 
+/* A register's value, from its local (R0-R13) or global (R14, R15). */
+static void tcg_wasm_out_op_global_get_r(TCGContext *s, TCGReg r0)
+{
+    int i = tcg_target_reg_index[r0];
+
+    if (i < WASM_REG_LOCALS) {
+        tcg_wasm_out_op_local_get(s, WASM_REG_LOCAL + i);
+    } else {
+        tcg_wasm_out_op_global_get(s, i);
+    }
+}
+
+static void tcg_wasm_out_op_global_set_r(TCGContext *s, TCGReg r0)
+{
+    int i = tcg_target_reg_index[r0];
+
+    if (i < WASM_REG_LOCALS) {
+        tcg_wasm_out_op_local_set(s, WASM_REG_LOCAL + i);
+    } else {
+        tcg_wasm_out_op_global_set(s, i);
+    }
+}
+
 static void tcg_wasm_out_op_global_get_r_i32(TCGContext *s, TCGReg r0)
 {
     if (r0 == TCG_REG_R14) {
@@ -481,18 +534,8 @@ static void tcg_wasm_out_op_global_get_r_i32(TCGContext *s, TCGReg r0)
         }
         return;
     }
-    tcg_wasm_out_op_global_get(s, tcg_target_reg_index[r0]);
+    tcg_wasm_out_op_global_get_r(s, r0);
     tcg_wasm_out_op_i32_wrap_i64(s);
-}
-
-static void tcg_wasm_out_op_global_get_r(TCGContext *s, TCGReg r0)
-{
-    tcg_wasm_out_op_global_get(s, tcg_target_reg_index[r0]);
-}
-
-static void tcg_wasm_out_op_global_set_r(TCGContext *s, TCGReg r0)
-{
-    tcg_wasm_out_op_global_set(s, tcg_target_reg_index[r0]);
 }
 
 static void tcg_wasm_out_op_i32_const(TCGContext *s, int32_t v)
@@ -2275,8 +2318,7 @@ static void tcg_wasm_out_call(TCGContext *s, const tcg_insn_unit *func,
     tcg_wasm_out_ctx_i32_load(s, UNWINDING_OFF);
     tcg_wasm_out_op_i32_eq(s);
     tcg_wasm_out_op_if_noret(s);
-    tcg_wasm_out_op_i32_const(s, 0);
-    tcg_wasm_out_op_return(s);
+    tcg_wasm_out_unwind_exit(s, 1);
     tcg_wasm_out_op_end(s);
 }
 
@@ -2543,8 +2585,7 @@ static void tcg_wasm_out_qemu_ld(TCGContext *s, const TCGArg *args, bool is_64,
     tcg_wasm_out_op_i32_eqz(s);
 
     tcg_wasm_out_op_if_noret(s);
-    tcg_wasm_out_op_i32_const(s, 0);
-    tcg_wasm_out_op_return(s);
+    tcg_wasm_out_unwind_exit(s, 2); /* in "if base == 0" too */
     tcg_wasm_out_op_end(s);
     tcg_wasm_out_op_end(s);
 }
@@ -2685,8 +2726,7 @@ static void tcg_wasm_out_qemu_st(TCGContext *s, const TCGArg *args, bool is_64,
     tcg_wasm_out_ctx_i32_load(s, DONE_FLAG_OFF);
     tcg_wasm_out_op_i32_eqz(s);
     tcg_wasm_out_op_if_noret(s);
-    tcg_wasm_out_op_i32_const(s, 0);
-    tcg_wasm_out_op_return(s);
+    tcg_wasm_out_unwind_exit(s, 2); /* in "if base == 0" too */
     tcg_wasm_out_op_end(s);
     tcg_wasm_out_op_end(s);
 }

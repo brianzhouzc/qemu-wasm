@@ -70,6 +70,12 @@ static int qemu_em_notify;
 
 static int64_t em_next_poll_ns;
 
+/*
+ * Told how long each of the main loop's sleeps was asked for and took, when
+ * a machine sets it: the iPod's latency trace (ipod_classic_lat.c) does.
+ */
+void (*qemu_em_wait_hook)(int64_t asked_ns, int64_t took_ns);
+
 static int64_t em_now_ns(void)
 {
     return (int64_t)(emscripten_get_now() * 1000000.0);
@@ -448,7 +454,13 @@ static int os_host_main_loop_wait(int64_t timeout)
             }
         }
         if (wait_ns > 0) {
+            void (*hook)(int64_t, int64_t) = qatomic_read(&qemu_em_wait_hook);
+            int64_t slept = hook ? em_now_ns() : 0;
+
             qemu_em_notify_wait(wait_ns, seen);
+            if (hook) {
+                hook(wait_ns, em_now_ns() - slept);
+            }
         }
     }
 #else

@@ -235,6 +235,7 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
 static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
 {
     desc->n_used_entries = 0;
+    desc->n_fills = 0;
     desc->large_page_addr = -1;
     desc->large_page_mask = -1;
     desc->vindex = 0;
@@ -250,6 +251,47 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
 
     tlb_mmu_resize_locked(desc, fast, now);
     tlb_mmu_flush_locked(desc, fast);
+}
+
+/*
+ * Grow a TLB that keeps missing without being flushed.  The resize above
+ * runs only when the guest flushes, and a guest that maps its memory once
+ * and then rarely flushes keeps the TLB at its first size for good.  On an
+ * ARMv5 core a TLB entry covers a 1 KB page (TARGET_PAGE_BITS is 10, for
+ * the tiny pages), so the first 256 entries cover 256 KB: stock 2.0.5
+ * flushes 8 times in a boot and took 1.6 million page table walks to reach
+ * its first screen, most of them in the same few megabytes of RAM.
+ *
+ * So when one mmu index has filled more than twice its size since its last
+ * flush, double it and flush it, up to TLB_GROW_MAX_BITS (16 MB of 1 KB
+ * pages).  Past that a thrashing guest is left to the misses, as before:
+ * a flush there would only add refills.  The tables are replaced while a
+ * block may be running, as a flush from a helper already does; the slow
+ * path reloads its index after a fill (mmu_lookup1's maybe_resized).
+ */
+#define TLB_GROW_MAX_BITS 14
+
+static void tlb_mmu_grow_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
+                                int64_t now)
+{
+    size_t new_size = tlb_n_entries(fast) * 2;
+    CPUTLBEntry *table = g_try_new(CPUTLBEntry, new_size);
+    CPUTLBEntryFull *fulltlb = g_try_new(CPUTLBEntryFull, new_size);
+
+    if (table && fulltlb) {
+        g_free(fast->table);
+        g_free(desc->fulltlb);
+        fast->table = table;
+        desc->fulltlb = fulltlb;
+        fast->mask = (new_size - 1) << CPU_TLB_ENTRY_BITS;
+        tlb_window_reset(desc, now, 0);
+        tlb_mmu_flush_locked(desc, fast);
+    } else {
+        /* Keep the old tables; try again after as many fills. */
+        g_free(table);
+        g_free(fulltlb);
+        desc->n_fills = 0;
+    }
 }
 
 static void tlb_mmu_init(CPUTLBDesc *desc, CPUTLBDescFast *fast, int64_t now)
@@ -1125,6 +1167,14 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     bool is_ram, is_romd;
 
     assert_cpu_is_self(cpu);
+
+    /* Before tlb_add_large_page(): growing flushes this index. */
+    if (unlikely(++desc->n_fills > 2 * tlb_n_entries(&tlb->f[mmu_idx])) &&
+        tlb_n_entries(&tlb->f[mmu_idx]) < (1 << TLB_GROW_MAX_BITS)) {
+        qemu_spin_lock(&tlb->c.lock);
+        tlb_mmu_grow_locked(desc, &tlb->f[mmu_idx], get_clock_realtime());
+        qemu_spin_unlock(&tlb->c.lock);
+    }
 
     if (full->lg_page_size <= TARGET_PAGE_BITS) {
         sz = TARGET_PAGE_SIZE;

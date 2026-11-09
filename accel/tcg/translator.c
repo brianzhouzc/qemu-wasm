@@ -146,6 +146,20 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     ops->init_disas_context(db, cpu);
     tcg_debug_assert(db->is_jmp == DISAS_NEXT);  /* no early exit */
 
+#ifndef CONFIG_USER_ONLY
+    /*
+     * The I/O hint (translate-all.c): an instruction that reached a device
+     * from the middle of a block runs as a block of its own, as it did
+     * after cpu_io_recompile(), so pending interrupts are taken just before
+     * it, where they were.  Ending the block at it instead, with the
+     * instructions before it, would be one boundary fewer but would move
+     * them; a boundary is a few nanoseconds.
+     */
+    if ((cflags & CF_USE_ICOUNT) && tb_io_hint_test(pc)) {
+        db->max_insns = 1;
+    }
+#endif
+
     /* Start translating.  */
     icount_start_insn = gen_tb_start(db, cflags);
     ops->tb_start(db, cpu);
@@ -199,6 +213,14 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
             db->is_jmp = DISAS_TOO_MANY;
             break;
         }
+
+#ifndef CONFIG_USER_ONLY
+        /* The next instruction gets a block of its own (above). */
+        if ((cflags & CF_USE_ICOUNT) && tb_io_hint_test(db->pc_next)) {
+            db->is_jmp = DISAS_TOO_MANY;
+            break;
+        }
+#endif
     }
 
     /* Emit code to exit the TB, as indicated by db->is_jmp.  */

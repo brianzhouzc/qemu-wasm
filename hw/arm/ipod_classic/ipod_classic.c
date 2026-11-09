@@ -27,6 +27,7 @@
 #include "hw/arm/exynos4210.h"
 #include "hw/dma/pl080.h"
 #include "hw/arm/ipod_classic/ipod_classic.h"
+#include "hw/arm/ipod_classic/ipod_classic_lat.h"
 #include "hw/arm/ipod_classic/ipod_classic_cs42l55.h"
 #include "hw/arm/ipod_classic/ipod_classic_spi.h"
 #include "hw/ssi/ssi.h"
@@ -1789,6 +1790,7 @@ static void ipod_classic_machine_init(MachineState *machine)
                                         -2000);
 
     qemu_register_reset(ipod_classic_cpu_reset, nms);
+    ipod_lat_init();
 }
 
 static void ipod_classic_machine_class_init(ObjectClass *klass, void *data)

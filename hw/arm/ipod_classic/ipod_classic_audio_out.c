@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qemu/atomic.h"
 #include "hw/arm/ipod_classic/ipod_classic_audio_out.h"
+#include "hw/arm/ipod_classic/ipod_classic_lat.h"
 
 #if defined(EMSCRIPTEN)
 #include <emscripten.h>
@@ -100,6 +101,7 @@ void ipod_classic_audio_out_flush(void)
 void ipod_classic_audio_out_note_tick(bool short_of_data)
 {
     qatomic_set(&out.ticks, qatomic_read(&out.ticks) + 1);
+    ipod_lat_mark2(IPOD_LAT_AUDIO, qatomic_read(&out.write), short_of_data);
     if (short_of_data) {
         qatomic_set(&out.short_ticks, qatomic_read(&out.short_ticks) + 1);
     }
