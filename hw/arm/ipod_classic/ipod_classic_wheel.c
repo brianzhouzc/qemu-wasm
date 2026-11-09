@@ -35,9 +35,11 @@
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "ui/console.h"
+#include "hw/core/cpu.h"
 #include "hw/arm/ipod_classic/ipod_classic_wheel.h"
 /* ipod_classic_wake_vcpu() / ipod_classic_input_wake(): see the machine header. */
 #include "hw/arm/ipod_classic/ipod_classic.h"
+#include "hw/arm/ipod_classic/ipod_classic_lat.h"
 
 /*
  * INSTRUMENTATION ONLY -- nothing below changes what the model does. Same
@@ -123,6 +125,7 @@ static void wheel_update_irq(IPodClassicWheelState *s)
     }
     if (level && !s->irq_level) {
         wheel_irq_raises++;
+        ipod_lat_mark(IPOD_LAT_IRQ, 0);
 #ifdef EMSCRIPTEN
         ipod_classic_wake_vcpu();
 #endif
@@ -145,6 +148,7 @@ static void wheel_fifo_push(IPodClassicWheelState *s, uint32_t word)
     s->fifo[(s->fifo_head + s->fifo_len) % S5L8702_WHEEL_FIFO_LEN] = word;
     s->fifo_len++;
     wheel_packets++;
+    ipod_lat_mark(IPOD_LAT_PUSH, word);
     if (wheel_packets == 1 && wheel_trace_on()) {
         fprintf(stderr, "WHEELTRACE first packet queued: 0x%08x\n", word);
     }
@@ -161,6 +165,7 @@ static uint32_t wheel_fifo_pop(IPodClassicWheelState *s)
     word = s->fifo[s->fifo_head];
     s->fifo_head = (s->fifo_head + 1) % S5L8702_WHEEL_FIFO_LEN;
     s->fifo_len--;
+    ipod_lat_mark(IPOD_LAT_POP, word);
 #ifdef EMSCRIPTEN
     if (s->wasm_release_timer &&
         timer_pending(s->wasm_release_timer) &&
@@ -334,6 +339,7 @@ static void wasm_release_timer_cb(void *opaque)
         return;
     }
     s->wasm_press_mask = 0;
+    ipod_lat_mark(IPOD_LAT_RELEASE, s->wasm_keycode);
     wheel_key_event(s, s->wasm_keycode | 0x80);
 }
 #endif
@@ -345,6 +351,12 @@ static void wheel_tick(void *opaque)
     bool busy;
 
     s->tick_rt_last = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT);
+    if (ipod_lat_on()) {
+        ipod_lat_mark2(IPOD_LAT_TICK, s->tick_from_rt,
+                       current_cpu ?
+                       CPU_GET_CLASS(current_cpu)->get_pc(current_cpu) : 0);
+    }
+    s->tick_from_rt = false;
 
     /*
      * If the guest has not drained what it already has, do not add to it.
@@ -434,6 +446,7 @@ static void wheel_tick_rt(void *opaque)
         return;
     }
     timer_del(s->tick);
+    s->tick_from_rt = true;
     wheel_tick(s);
 }
 
@@ -840,6 +853,7 @@ static void wasm_key_bh_fn(void *opaque)
             continue;
         }
         if (op == 1) {
+            ipod_lat_mark2(IPOD_LAT_KEY, arg, hold);
             wasm_key_do_press(s, arg, hold);
         }
         tail++;

@@ -50,6 +50,7 @@
 #include "qemu/module.h"
 #include "hw/irq.h"
 #include "qemu/timer.h"
+#include "hw/arm/ipod_classic/ipod_classic_lat.h"
 #include "migration/vmstate.h"
 #include "hw/core/cpu.h"
 #include "ui/console.h"
@@ -186,8 +187,15 @@ static void panel_params_done(IPodClassicLCDState *s)
     s->phase = S5L8702_PANEL_IDLE;
 }
 
+/* The latency trace: the port has had a pixel since the last frame. */
+static bool lat_pixels;
+
 static void panel_pixel(IPodClassicLCDState *s, uint16_t px)
 {
+    if (!lat_pixels && ipod_lat_on()) {
+        lat_pixels = true;
+        ipod_lat_mark(IPOD_LAT_PIXELS, 0);
+    }
     if (s->cur_y < S5L8702_PANEL_HEIGHT && s->cur_x < S5L8702_PANEL_WIDTH) {
         s->fb[s->cur_y * S5L8702_PANEL_WIDTH + s->cur_x] = px;
         s->dirty = true;
@@ -216,6 +224,7 @@ static void panel_pixel(IPodClassicLCDState *s, uint16_t px)
              * from clamping.
              */
             s->cur_y = s->win_y0;
+            ipod_lat_mark(IPOD_LAT_PIXELS_END, s->pixels_this_frame);
         } else {
             s->cur_y++;
         }
@@ -659,8 +668,17 @@ static void wasm_lcd_frame_tick(void *opaque)
      * spends holding the BQL against the vCPU; skipping dpy_gfx_update_full
      * keeps the timer off the console, which has no frontend here anyway.
      */
+    int64_t lat_t0 = ipod_lat_on() ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME)
+                                   : 0;
+
     ipod_classic_lcd_compose(s);
     frame = s->display_on ? s->fb : wasm_lcd_black;
+    if (lat_t0) {
+        ipod_lat_mark2(IPOD_LAT_COMPOSE, 0,
+                       (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - lat_t0) / 1000);
+        lat_pixels = false;
+        ipod_classic_disp_lat_frame();
+    }
 
     if (memcmp(frame, wasm_lcd_pub[cur], bytes) != 0) {
         int next = cur ^ 1;
@@ -670,6 +688,7 @@ static void wasm_lcd_frame_tick(void *opaque)
         qatomic_set(&wasm_lcd_pub_idx, next);
         qatomic_store_release(&s->wasm_seq,
                               qatomic_read(&s->wasm_seq) + 1);
+        ipod_lat_mark(IPOD_LAT_FRAME, qatomic_read(&s->wasm_seq));
     }
     timer_mod(s->wasm_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
                              NANOSECONDS_PER_SECOND / 30);

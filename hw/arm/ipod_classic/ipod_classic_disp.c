@@ -37,6 +37,7 @@
 #include "exec/address-spaces.h"
 #include "sysemu/cpu-timers.h"
 #include "hw/arm/ipod_classic/ipod_classic_disp.h"
+#include "hw/arm/ipod_classic/ipod_classic_lat.h"
 
 /*
  * INSTRUMENTATION ONLY -- nothing below changes what the model does. Same
@@ -151,11 +152,27 @@ static uint64_t ipod_classic_disp_read(void *opaque, hwaddr offset,
     return val;
 }
 
+/* The latency trace: the pipe has been written since the last frame. */
+static bool lat_layers;
+
+void ipod_classic_disp_lat_frame(void)
+{
+    lat_layers = false;
+}
+
 static void ipod_classic_disp_write(void *opaque, hwaddr offset,
                                     uint64_t value, unsigned size)
 {
     IPodClassicDispState *s = opaque;
     bool gamma = offset >= S5L8702_DISP_GAMMA0;
+
+    if (!lat_layers && ipod_lat_on()) {
+        lat_layers = true;
+        ipod_lat_mark2(IPOD_LAT_LAYERS, offset, value);
+    }
+    if (!gamma) {
+        ipod_lat_mark2(IPOD_LAT_DISP, offset, value);
+    }
 
     s->reg[offset >> 2] = value;
 
