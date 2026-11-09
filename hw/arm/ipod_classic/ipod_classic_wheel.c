@@ -399,6 +399,7 @@ static void wheel_tick(void *opaque)
         s->position = (s->position + step + S5L8702_WHEEL_POSITIONS)
                       % S5L8702_WHEEL_POSITIONS;
         s->pending_steps -= step;
+        s->untouch_rt_at = s->tick_rt_last + s->untouch_rt_ns;
         wheel_send_event(s);
         /*
          * The wheel keys do not change the button state, so the packet that
@@ -413,7 +414,8 @@ static void wheel_tick(void *opaque)
             s->wasm_consumed = qatomic_read(&s->wasm_consumed) + 1;
         }
 #endif
-    } else if (s->touched && now >= s->untouch_at) {
+    } else if (s->touched && now >= s->untouch_at &&
+               s->tick_rt_last >= s->untouch_rt_at) {
         /*
          * The finger comes off. This is not cosmetic: the ISR uses an
          * untouched packet to put the sensitivity threshold back to 6
@@ -559,6 +561,8 @@ static void wheel_key_event(void *opaque, int keycode)
                           ? (int32_t)s->key_step : -(int32_t)s->key_step;
         s->touched = true;
         s->untouch_at = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->untouch_ns;
+        s->untouch_rt_at = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT) +
+                           s->untouch_rt_ns;
         /*
          * Arm the gesture here instead of letting the first tick do it.
          *
@@ -766,6 +770,7 @@ static void ipod_classic_wheel_reset(DeviceState *dev)
     s->armed = false;
     s->pending_steps = 0;
     s->untouch_at = 0;
+    s->untouch_rt_at = 0;
     s->button_repeat_until = 0;
     s->sent_buttons = 0;
     s->irq_level = false;
@@ -979,6 +984,9 @@ static void ipod_classic_wheel_realize(DeviceState *dev, Error **errp)
     s->untouch_ns = 1000000LL * wheel_env_int("IPOD_WHEEL_UNTOUCH_MS",
                                               S5L8702_WHEEL_UNTOUCH_MS,
                                               10, 60000);
+    s->untouch_rt_ns = 1000000LL * wheel_env_int("IPOD_WHEEL_UNTOUCH_RT_MS",
+                                                 S5L8702_WHEEL_UNTOUCH_RT_MS,
+                                                 0, 60000);
     s->button_repeat_ns = 1000000LL * wheel_env_int("IPOD_WHEEL_BTN_REPEAT_MS",
                                                     S5L8702_WHEEL_BTN_REPEAT_MS,
                                                     0, 5000);

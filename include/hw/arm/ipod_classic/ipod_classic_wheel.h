@@ -243,6 +243,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicWheelState, IPOD_CLASSIC_WHEEL)
 #define S5L8702_WHEEL_UNTOUCH_MS    1500
 
 /*
+ * And the finger stays down this long in HOST time after the last step it
+ * paid out, whatever the guest's clock says.  The 1.5 s above is guest time,
+ * but the interface does not drain the delta on guest time alone: stock
+ * 2.0.5's scroll waits for its click's audio buffer to start, and the sample
+ * clock is host time.  An idle guest races through its 1.5 s in however much
+ * host time its timer interrupts take, and MEASURED on 2.0.5 at the main menu
+ * (perf/input-latency.js, single detents): 48-143 ms of host time with none
+ * lost, but 24-55 ms once those interrupts stopped rewinding every device
+ * access (qemu-wasm's I/O hint, accel/tcg/translate-all.c), and 5 to 7
+ * detents in 20 were read, never scrolled, and thrown away by the untouch.
+ * 250 ms is several of the slowest drains seen.  Tunable with
+ * IPOD_WHEEL_UNTOUCH_RT_MS.
+ */
+#define S5L8702_WHEEL_UNTOUCH_RT_MS 250
+
+/*
  * The tick's host-time backstop (wheel_kick()): a tick comes after this much
  * host time if the guest's 40 ms have not passed by then.  It was the tick's
  * own 40 ms, which on a guest too busy to warp was 40 ms of host time between
@@ -400,6 +416,12 @@ struct IPodClassicWheelState {
     int32_t pending_steps;  /* positions still owed to the guest, signed */
     int64_t untouch_at;     /* virtual ns at which the finger comes off */
     /*
+     * QEMU_CLOCK_VIRTUAL_RT ns before which it does not, for all that
+     * (S5L8702_WHEEL_UNTOUCH_RT_MS).  Host time, so not in the vmstate: a
+     * restored machine owes the finger nothing more.
+     */
+    int64_t untouch_rt_at;
+    /*
      * Virtual ns until which the button state keeps being REPEATED, one packet
      * per tick, instead of being sent once and forgotten. See
      * S5L8702_WHEEL_BTN_REPEAT_MS: without it a whole press can vanish.
@@ -417,6 +439,7 @@ struct IPodClassicWheelState {
     int64_t tick_ns;
     int64_t tick_rt_ns;     /* the backstop's period: S5L8702_WHEEL_TICK_RT_MS */
     int64_t untouch_ns;
+    int64_t untouch_rt_ns;  /* S5L8702_WHEEL_UNTOUCH_RT_MS */
     int64_t button_repeat_ns;
     bool irq_level;
 
