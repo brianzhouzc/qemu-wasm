@@ -7,7 +7,7 @@
 #define HW_ARM_IPOD_CLASSIC_PIEZO_H
 
 #define IPOD_PIEZO_RING     16u     /* drives the page can fall behind by */
-#define IPOD_PIEZO_WORDS    4u      /* 32-bit words per drive */
+#define IPOD_PIEZO_WORDS    6u      /* 32-bit words per drive */
 
 /*
  * Whether GPIO 0.6 or 0.7 is set to carry timer A's output (functions 3 and
