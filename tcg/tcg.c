@@ -6035,8 +6035,12 @@ static const uint8_t mod_header_d[] = {
     0x80, 0x80, 0x80, 0x80, 0x00,
     0x80, 0x80, 0x80, 0x80, 0x00,
 
-    0x2, 0x2, 0x7f, 0x5, 0x7e,
-    
+    /*
+     * locals: 1-2 i32, 3-7 i64 temporaries, then TCG's R0-R13 as i64
+     * from WASM_REG_LOCAL (tcg-target.c.inc)
+     */
+    0x2, 0x2, 0x7f, 5 + WASM_REG_LOCALS, 0x7e,
+
     // initialize the instance
     0x20, 0x0,               // local.get $ctx
     0x28, 0, DO_INIT_OFF,    // i32.load do_init_ptr
@@ -6063,8 +6067,15 @@ static const uint8_t mod_header_d[] = {
     0x36, 0x00, DO_INIT_OFF, // i32.store do_init
     0x42, 0x00,              // i64.const 0
     0x24, 16,                // global.set $block_ptr
+    0x05,                    // else: a rewind; the registers as they were
+    WASM_REG_RESTORE(0), WASM_REG_RESTORE(1), WASM_REG_RESTORE(2),
+    WASM_REG_RESTORE(3), WASM_REG_RESTORE(4), WASM_REG_RESTORE(5),
+    WASM_REG_RESTORE(6), WASM_REG_RESTORE(7), WASM_REG_RESTORE(8),
+    WASM_REG_RESTORE(9), WASM_REG_RESTORE(10), WASM_REG_RESTORE(11),
+    WASM_REG_RESTORE(12), WASM_REG_RESTORE(13),
     0x0b,                    // end
 
+    0x02, 0x40,              // block: a helper unwinding leaves through it
     0x03, 0x40,              // loop
     0x23, 16,                // global.get $block_ptr
     0x50,                    // i64.eqz
@@ -6088,7 +6099,8 @@ static void write_wasm_export_section_size(TCGContext *s, void *header_c_ptr, ui
     fill_uint32_leb128((uintptr_t)header_c_ptr + 142, startidx);
 }
 static void write_wasm_code_size(TCGContext *s, void *header_d_ptr, int code_size, int code_nums) {
-    code_size = code_size + 66;
+    /* the section from its count on: the header past its size, the body */
+    code_size = code_size + sizeof(mod_header_d) - 6;
     fill_uint32_leb128((uintptr_t)header_d_ptr + 1, code_size);
     fill_uint32_leb128((uintptr_t)header_d_ptr + 6, code_nums);
     fill_uint32_leb128((uintptr_t)header_d_ptr + 11, code_size - 10);
@@ -6536,6 +6548,19 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     tcg_sub_out8(s, 0x0b); //end if
     tcg_sub_out8(s, 0x0b); //end loop
     tcg_sub_out8(s, 0x0); // unreachable
+    tcg_sub_out8(s, 0x0b); //end block
+    /*
+     * A helper is unwinding (tcg_wasm_out_unwind_exit()): keep the
+     * registers for the rewind, which restores them on entry.
+     */
+    for (int r = 0; r < WASM_REG_LOCALS; r++) {
+        tcg_sub_out8(s, 0x20); // local.get
+        tcg_sub_out8(s, WASM_REG_LOCAL + r);
+        tcg_sub_out8(s, 0x24); // global.set
+        tcg_sub_out8(s, r);
+    }
+    tcg_sub_out8(s, 0x41); // i32.const 0
+    tcg_sub_out8(s, 0x00);
     tcg_sub_out8(s, 0x0b); //end func
 
     // fill blocks
