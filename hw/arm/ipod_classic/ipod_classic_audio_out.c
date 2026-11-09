@@ -105,6 +105,40 @@ void ipod_classic_audio_out_note_tick(bool short_of_data)
     }
 }
 
+/*
+ * Where in this ring a sound made now by other means belongs: the piezo's.
+ * The page plays the ring a queue behind (180 ms, and the browser's own
+ * latency on top), so a sound that does not go through it has to be told
+ * which frame it goes with to come out with it.
+ *
+ * The frame is where what the guest writes next will come out, behind what
+ * the DMA already holds (pl080_line_queued_bytes()), which is where a
+ * firmware puts a sound it decides on now.  MEASURED on 2.0.5: its clicker
+ * plays on the piezo and, mixed into its audio, in the headphones, and the
+ * headphones' click starts at this frame on every detent (12 of 12, to the
+ * frame), 13 to 39 ms after the sample clock's position.  When the DMA's
+ * queue cannot be read the frame is where the sample clock is, which is when
+ * the sound would be heard on the iPod.
+ */
+static IPodAudioOutAheadFn *ahead_fn;
+static void *ahead_opaque;
+
+void ipod_classic_audio_out_set_ahead(IPodAudioOutAheadFn *fn, void *opaque)
+{
+    ahead_fn = fn;
+    ahead_opaque = opaque;
+}
+
+IPodAudioOutAhead ipod_classic_audio_out_next(uint32_t *frame)
+{
+    uint32_t ahead = 0;
+    IPodAudioOutAhead kind = ahead_fn ? ahead_fn(ahead_opaque, &ahead)
+                                      : IPOD_AUDIO_OUT_IDLE;
+
+    *frame = (uint32_t)(out_samples / 2) + (kind ? ahead : 0);
+    return kind;
+}
+
 #if defined(EMSCRIPTEN)
 EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_audio_ptr(void)
 {
