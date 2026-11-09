@@ -190,6 +190,8 @@ static void panel_params_done(IPodClassicLCDState *s)
 /* The latency trace: the port has had a pixel since the last frame. */
 static bool lat_pixels;
 
+static void lcd_window_done(IPodClassicLCDState *s);
+
 static void panel_pixel(IPodClassicLCDState *s, uint16_t px)
 {
     if (!lat_pixels && ipod_lat_on()) {
@@ -225,6 +227,7 @@ static void panel_pixel(IPodClassicLCDState *s, uint16_t px)
              */
             s->cur_y = s->win_y0;
             ipod_lat_mark(IPOD_LAT_PIXELS_END, s->pixels_this_frame);
+            lcd_window_done(s);
         } else {
             s->cur_y++;
         }
@@ -616,14 +619,15 @@ static const GraphicHwOps ipod_classic_lcd_gfx_ops = {
 
 #ifdef EMSCRIPTEN
 #include <emscripten.h>
+#include <emscripten/threading.h>
 
 /*
  * The browser build runs with -display none, so no UI frontend drives the
  * console's refresh and the composed frame would never be made (the panel's
  * framebuffer is filled by ipod_classic_lcd_gfx_update, which the refresh
- * loop calls).  Compose at 30 Hz from a real-time timer instead -- it runs
+ * loop calls).  Compose at 60 Hz from a real-time timer instead -- it runs
  * with the BQL held, like the vCPU's device accesses -- and publish the
- * 320x240 RGB565 frame to the page, which polls the sequence number.
+ * 320x240 RGB565 frame to the page, which waits for the sequence number.
  *
  * The compose target (s->fb) is not what the page reads: two published
  * buffers are compared with the new frame and one is only replaced when the
@@ -637,6 +641,38 @@ static const GraphicHwOps ipod_classic_lcd_gfx_ops = {
 static IPodClassicLCDState *wasm_lcd_state;
 static uint16_t *wasm_lcd_pub[2];
 static int wasm_lcd_pub_idx;
+/* Frames published: the page reads it, and is woken on it. */
+static uint32_t wasm_lcd_seq;
+
+/*
+ * How often the frame is composed, and how soon after the guest has pushed a
+ * whole window through the port.
+ *
+ * A frame waits for the next compose before the page can draw it, so the
+ * period is latency on everything the guest shows: at 30 Hz a Rockbox
+ * detent's frame was published 23 ms after the press (median, 48 ms p90) when
+ * the guest had finished drawing it at 6 (iPodWasm's perf/input-latency.js).
+ * 60 Hz halves that wait for 2.0.5, whose layers can change at any time, for
+ * 0.15 ms of compose a frame (measured in this build).
+ *
+ * Rockbox draws through the port, and a window filling up is the end of an
+ * update, so it is composed 1 ms later rather than at the next tick.  The
+ * millisecond lets an update made of two windows (the list and the status
+ * bar, back to back) go out as one frame.  Not 2.0.5's layers: composing on
+ * their source-address writes was measured worse, the write coming before
+ * the pixels it points at (docs/OPTIMIZATION_BACKLOG.md, item 8).
+ */
+#define WASM_LCD_PERIOD_NS      (NANOSECONDS_PER_SECOND / 60)
+#define WASM_LCD_WINDOW_NS      (1 * SCALE_MS)
+
+static void lcd_window_done(IPodClassicLCDState *s)
+{
+    if (s->wasm_timer) {
+        timer_mod_anticipate(s->wasm_timer,
+                             qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                             WASM_LCD_WINDOW_NS);
+    }
+}
 
 /*
  * What the page sees while the guest has the panel off.  Rockbox sends Display
@@ -664,9 +700,8 @@ static void wasm_lcd_frame_tick(void *opaque)
     const uint16_t *frame;
 
     /*
-     * 30 Hz is enough for a 320x240 panel and halves the time the compose
-     * spends holding the BQL against the vCPU; skipping dpy_gfx_update_full
-     * keeps the timer off the console, which has no frontend here anyway.
+     * WASM_LCD_PERIOD_NS says why 60 Hz; skipping dpy_gfx_update_full keeps
+     * the timer off the console, which has no frontend here anyway.
      */
     int64_t lat_t0 = ipod_lat_on() ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME)
                                    : 0;
@@ -686,12 +721,13 @@ static void wasm_lcd_frame_tick(void *opaque)
         wasm_lcd_pub_boot_screen[next] =
             qatomic_read(&s->boot_screen_active);
         qatomic_set(&wasm_lcd_pub_idx, next);
-        qatomic_store_release(&s->wasm_seq,
-                              qatomic_read(&s->wasm_seq) + 1);
-        ipod_lat_mark(IPOD_LAT_FRAME, qatomic_read(&s->wasm_seq));
+        qatomic_store_release(&wasm_lcd_seq, qatomic_read(&wasm_lcd_seq) + 1);
+        ipod_lat_mark(IPOD_LAT_FRAME, qatomic_read(&wasm_lcd_seq));
+        /* The page waits for it with Atomics.waitAsync (ipod_wasm_lcd_seq_ptr). */
+        emscripten_futex_wake(&wasm_lcd_seq, INT_MAX);
     }
     timer_mod(s->wasm_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
-                             NANOSECONDS_PER_SECOND / 30);
+                             WASM_LCD_PERIOD_NS);
 }
 
 EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_lcd_width(void)
@@ -711,7 +747,18 @@ EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_lcd_stride(void)
 
 EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_lcd_seq(void)
 {
-    return wasm_lcd_state ? qatomic_read(&wasm_lcd_state->wasm_seq) : 0;
+    return qatomic_read(&wasm_lcd_seq);
+}
+
+/*
+ * Where the sequence number is, for a page that would rather be woken than
+ * poll: every publish wakes Atomics.waitAsync on it.  Static, so that it is
+ * there from the moment the module is: the page starts its screen before
+ * the machine has made its panel.
+ */
+EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_lcd_seq_ptr(void)
+{
+    return (uint32_t)(uintptr_t)&wasm_lcd_seq;
 }
 
 /*
@@ -741,6 +788,11 @@ EMSCRIPTEN_KEEPALIVE uint32_t ipod_wasm_lcd_ptr(void)
     }
     idx = qatomic_read(&wasm_lcd_pub_idx);
     return (uint32_t)(uintptr_t)wasm_lcd_pub[idx];
+}
+#else
+static void lcd_window_done(IPodClassicLCDState *s)
+{
+    /* The console's refresh composes: nothing to bring forward. */
 }
 #endif
 
@@ -820,7 +872,7 @@ static void ipod_classic_lcd_realize(DeviceState *dev, Error **errp)
     wasm_lcd_pub_idx = 0;
     s->wasm_timer = timer_new_ns(QEMU_CLOCK_REALTIME, wasm_lcd_frame_tick, s);
     timer_mod(s->wasm_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
-                             NANOSECONDS_PER_SECOND / 30);
+                             WASM_LCD_PERIOD_NS);
 #endif
 }
 
