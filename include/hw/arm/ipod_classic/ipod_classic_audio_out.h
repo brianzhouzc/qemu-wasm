@@ -27,4 +27,29 @@ void ipod_classic_audio_out_flush(void);
 /* A tick of the sample clock, and whether the guest had less than it asked. */
 void ipod_classic_audio_out_note_tick(bool short_of_data);
 
+/*
+ * What the transmitter knows about the frames it will send next: nothing (it
+ * is not sending), only where its sample clock is, or how much the guest has
+ * already queued for it.
+ */
+typedef enum {
+    IPOD_AUDIO_OUT_IDLE = 0,
+    IPOD_AUDIO_OUT_CLOCK = 1,
+    IPOD_AUDIO_OUT_QUEUED = 2,
+} IPodAudioOutAhead;
+
+/*
+ * The transmitter's answer: frames that will come out before the next one
+ * the guest has not handed over yet (QUEUED), or that the clock has used
+ * since the last were written (CLOCK).
+ */
+typedef IPodAudioOutAhead IPodAudioOutAheadFn(void *opaque, uint32_t *frames);
+void ipod_classic_audio_out_set_ahead(IPodAudioOutAheadFn *fn, void *opaque);
+
+/*
+ * The ring's frame count at which what the guest writes next will come out
+ * (QUEUED), or at which the sample clock is now (CLOCK).  See the .c file.
+ */
+IPodAudioOutAhead ipod_classic_audio_out_next(uint32_t *frame);
+
 #endif

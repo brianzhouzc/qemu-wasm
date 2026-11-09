@@ -128,4 +128,13 @@ void pl080_set_paced_line(PL080State *s, int line, PL080PacedSink *sink,
  */
 uint32_t pl080_pace_request(PL080State *s, int line, uint32_t bytes);
 
+/*
+ * What a line will take before what the guest writes next, in bytes: the rest
+ * of the descriptor running now and every one linked after it, or, for a ring
+ * of buffers, a whole lap of the ring after it (see pl080.c).  False when that
+ * is not known: no enabled channel serves the line, or its chain runs past 16
+ * descriptors or comes back to one other than the first.
+ */
+bool pl080_line_queued_bytes(PL080State *s, int line, uint32_t *bytes);
+
 #endif

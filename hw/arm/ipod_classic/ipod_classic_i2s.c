@@ -390,6 +390,30 @@ static void i2s_pace_update(IPodClassicI2SState *s, bool was_sending)
     }
 }
 
+/*
+ * For ipod_classic_audio_out_next(): frames still to come out before what
+ * the guest writes next, which the DMA's descriptors say, or else those the
+ * clock has used since the last drain, not yet in the ring.
+ */
+static IPodAudioOutAhead i2s_ahead(void *opaque, uint32_t *frames)
+{
+    IPodClassicI2SState *s = opaque;
+    uint32_t bytes;
+    int64_t elapsed;
+
+    if (!i2s_sending(s) || !s->dmac0) {
+        return IPOD_AUDIO_OUT_IDLE;
+    }
+    if (pl080_line_queued_bytes(s->dmac0, S5L8702_I2S_DMA_IIS0_TX, &bytes)) {
+        *frames = bytes / I2S_FRAME_BYTES;
+        return IPOD_AUDIO_OUT_QUEUED;
+    }
+    elapsed = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT) - s->pace_last_ns;
+    elapsed = MAX(0, MIN(elapsed, I2S_PACE_BACKLOG_NS));
+    *frames = muldiv64(elapsed, i2s_sample_rate(s), NANOSECONDS_PER_SECOND);
+    return IPOD_AUDIO_OUT_CLOCK;
+}
+
 void ipod_classic_i2s_set_dmac0(IPodClassicI2SState *s, PL080State *dmac0)
 {
     s->dmac0 = dmac0;
@@ -551,6 +575,7 @@ static void ipod_classic_i2s_realize(DeviceState *dev, Error **errp)
 
     s->drain_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL_RT,
                                   ipod_classic_i2s_drain, s);
+    ipod_classic_audio_out_set_ahead(i2s_ahead, s);
 }
 
 /*
