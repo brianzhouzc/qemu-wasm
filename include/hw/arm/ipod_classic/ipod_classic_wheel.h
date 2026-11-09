@@ -252,11 +252,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodClassicWheelState, IPOD_CLASSIC_WHEEL)
  * (perf/input-latency.js, single detents): 48-143 ms of host time with none
  * lost, but 24-55 ms once those interrupts stopped rewinding every device
  * access (qemu-wasm's I/O hint, accel/tcg/translate-all.c), and 5 to 7
- * detents in 20 were read, never scrolled, and thrown away by the untouch.
- * 250 ms is several of the slowest drains seen.  Tunable with
+ * detents in 20 were read, never scrolled, and thrown away by the untouch
+ * (one lost at 77 ms).
+ *
+ * Not longer, though: the games want the finger off between the detents of a
+ * burst as before.  At 250 ms the four detents perf/stock-games.js turns in
+ * a game's menu moved nothing in one of the three games in 2 runs of 3 (iPod
+ * Quiz once, Klondike once); at 100 ms all three moved in 4 runs of 4.  100
+ * ms puts the untouch where the slower emulator had it.  Tunable with
  * IPOD_WHEEL_UNTOUCH_RT_MS.
  */
-#define S5L8702_WHEEL_UNTOUCH_RT_MS 250
+#define S5L8702_WHEEL_UNTOUCH_RT_MS 100
 
 /*
  * The tick's host-time backstop (wheel_kick()): a tick comes after this much
